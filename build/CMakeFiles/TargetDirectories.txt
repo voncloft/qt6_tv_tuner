@@ -1,5 +1,0 @@
-/home/von/qt6 projects/tv_tuner_gui/build/CMakeFiles/tv_tuner_gui.dir
-/home/von/qt6 projects/tv_tuner_gui/build/CMakeFiles/edit_cache.dir
-/home/von/qt6 projects/tv_tuner_gui/build/CMakeFiles/rebuild_cache.dir
-/home/von/qt6 projects/tv_tuner_gui/build/CMakeFiles/tv_tuner_gui_autogen_timestamp_deps.dir
-/home/von/qt6 projects/tv_tuner_gui/build/CMakeFiles/tv_tuner_gui_autogen.dir
