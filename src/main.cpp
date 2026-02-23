@@ -2,6 +2,7 @@
 #include <QDateTime>
 #include <QDir>
 #include <QFile>
+#include <QIcon>
 #include <QLoggingCategory>
 #include <QTextStream>
 
@@ -88,12 +89,15 @@ int main(int argc, char *argv[])
 
     QCoreApplication::setAttribute(Qt::AA_UseSoftwareOpenGL);
     QApplication app(argc, argv);
+    const QIcon appIcon(":/assets/tv-icon.svg");
+    app.setWindowIcon(appIcon);
     qInfo() << "Startup env:"
             << "QT_QPA_PLATFORM=" << qEnvironmentVariable("QT_QPA_PLATFORM")
             << "QT_XCB_GL_INTEGRATION=" << qEnvironmentVariable("QT_XCB_GL_INTEGRATION")
             << "QT_MEDIA_BACKEND=" << qEnvironmentVariable("QT_MEDIA_BACKEND")
             << "QT_FFMPEG_DECODING_HW_DEVICE_TYPES=" << qEnvironmentVariable("QT_FFMPEG_DECODING_HW_DEVICE_TYPES");
     MainWindow window;
+    window.setWindowIcon(appIcon);
     window.show();
     return app.exec();
 }

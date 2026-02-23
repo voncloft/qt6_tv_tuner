@@ -14,6 +14,7 @@ add_executable(tv_tuner_gui
     src/main.cpp
     src/MainWindow.cpp
     include/MainWindow.h
+    resources.qrc
 )
 
 target_include_directories(tv_tuner_gui PRIVATE include)
