@@ -1,0 +1,2 @@
+set(__QT_DEPLOY_TARGET_tv_tuner_gui_FILE /home/von/qt6 projects/tv_tuner_gui/build/tv_tuner_gui)
+set(__QT_DEPLOY_TARGET_tv_tuner_gui_TYPE EXECUTABLE)

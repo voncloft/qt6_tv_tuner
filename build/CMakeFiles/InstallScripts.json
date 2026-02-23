@@ -1,0 +1,7 @@
+{
+	"InstallScripts" : 
+	[
+		"/home/von/qt6 projects/tv_tuner_gui/build/cmake_install.cmake"
+	],
+	"Parallel" : false
+}
