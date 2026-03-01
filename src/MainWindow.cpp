@@ -5,6 +5,7 @@
 #include <QComboBox>
 #include <QCloseEvent>
 #include <QDateTime>
+#include <QAction>
 #include <QDir>
 #include <QEvent>
 #include <QFile>
@@ -20,6 +21,9 @@
 #include <QLineEdit>
 #include <QListWidgetItem>
 #include <QMediaPlayer>
+#include <QKeySequence>
+#include <QMenu>
+#include <QMenuBar>
 #include <QMessageBox>
 #include <QPlainTextEdit>
 #include <QProcess>
@@ -47,6 +51,42 @@
 #include <functional>
 
 namespace {
+QString quoteArg(const QString &arg)
+{
+    QString escaped = arg;
+    escaped.replace('\'', "'\\''");
+    return "'" + escaped + "'";
+}
+
+QString formatCommandLine(const QString &program, const QStringList &arguments)
+{
+    QStringList parts;
+    parts << quoteArg(program);
+    for (const QString &arg : arguments) {
+        parts << quoteArg(arg);
+    }
+    return parts.join(' ');
+}
+
+QString processErrorToString(QProcess::ProcessError error)
+{
+    switch (error) {
+    case QProcess::FailedToStart:
+        return "FailedToStart";
+    case QProcess::Crashed:
+        return "Crashed";
+    case QProcess::Timedout:
+        return "Timedout";
+    case QProcess::ReadError:
+        return "ReadError";
+    case QProcess::WriteError:
+        return "WriteError";
+    case QProcess::UnknownError:
+    default:
+        return "UnknownError";
+    }
+}
+
 QString normalizeZapLine(const QString &line)
 {
     const QStringList parts = line.split(':');
@@ -67,11 +107,21 @@ QString normalizeZapLine(const QString &line)
 
 QString resolveProjectLogPath()
 {
-    QDir dir(QDir::currentPath());
-    if (dir.dirName() == "build") {
-        dir.cdUp();
+    const QString envPath = qEnvironmentVariable("TV_TUNER_GUI_LOG_PATH");
+    if (!envPath.isEmpty()) {
+        return envPath;
     }
-    return dir.filePath("tv_tuner_gui.log");
+
+    QDir sourceDir(QStringLiteral(TV_TUNER_GUI_SOURCE_DIR));
+    if (sourceDir.exists()) {
+        return sourceDir.filePath("tv_tuner_gui.log");
+    }
+
+    QDir cwdDir(QDir::currentPath());
+    if (cwdDir.dirName() == "build") {
+        cwdDir.cdUp();
+    }
+    return cwdDir.filePath("tv_tuner_gui.log");
 }
 }
 
@@ -98,6 +148,14 @@ MainWindow::MainWindow(QWidget *parent)
     connect(scanProcess_, &QProcess::finished, this, &MainWindow::processFinished);
     connect(zapProcess_, &QProcess::readyReadStandardError, this, &MainWindow::handleZapStdErr);
     connect(zapProcess_, &QProcess::finished, this, &MainWindow::handleZapFinished);
+    connect(zapProcess_, &QProcess::errorOccurred, this, [this](QProcess::ProcessError error) {
+        appendLog(QString("zap: errorOccurred=%1 (%2)")
+                      .arg(processErrorToString(error), zapProcess_->errorString()));
+    });
+    connect(streamBridgeProcess_, &QProcess::errorOccurred, this, [this](QProcess::ProcessError error) {
+        appendLog(QString("ffmpeg bridge: errorOccurred=%1 (%2)")
+                      .arg(processErrorToString(error), streamBridgeProcess_->errorString()));
+    });
     connect(streamBridgeProcess_, &QProcess::readyReadStandardError, this, [this]() {
         const QString err = QString::fromUtf8(streamBridgeProcess_->readAllStandardError()).trimmed();
         if (!err.isEmpty()) {
@@ -111,9 +169,10 @@ MainWindow::MainWindow(QWidget *parent)
         }
     });
     connect(streamBridgeProcess_, &QProcess::finished, this, [this](int exitCode, QProcess::ExitStatus status) {
-        appendLog(QString("ffmpeg bridge exited (code=%1, status=%2)")
+        appendLog(QString("ffmpeg bridge exited (code=%1, status=%2, error=%3)")
                       .arg(exitCode)
-                      .arg(status == QProcess::NormalExit ? "normal" : "crash"));
+                      .arg(status == QProcess::NormalExit ? "normal" : "crash")
+                      .arg(streamBridgeProcess_->errorString()));
         if (!suppressBridgeExitReconnect_ && !userStoppedWatching_ && !currentChannelName_.isEmpty()) {
             if (tryDynamicBridgeFallback("Live stream bridge exited")) {
                 return;
@@ -240,8 +299,19 @@ void MainWindow::stopProcess(QProcess *process, int timeoutMs)
 
 void MainWindow::buildUi()
 {
-    setWindowTitle("TV Tuner Watcher");
+    setWindowTitle("Voncloft TV Tuner");
     resize(1320, 840);
+
+    QMenu *fileMenu = menuBar()->addMenu("File");
+    QAction *aboutAction = fileMenu->addAction("About");
+    aboutAction->setShortcut(QKeySequence(Qt::Key_F1));
+    aboutAction->setShortcutContext(Qt::ApplicationShortcut);
+    connect(aboutAction, &QAction::triggered, this, [this]() {
+        QMessageBox::about(
+            this,
+            "About",
+            QString("Created by Voncloft\nVersion %1").arg(QStringLiteral(TV_TUNER_GUI_VERSION)));
+    });
 
     auto *root = new QWidget(this);
     auto *mainLayout = new QVBoxLayout(root);
@@ -788,9 +858,11 @@ bool MainWindow::startWatchingChannel(const QString &channelName, bool reconnect
 
     args << channelName;
 
+    appendLog("zap: launch " + formatCommandLine(zapExe, args));
     zapProcess_->start(zapExe, args);
     if (!zapProcess_->waitForStarted(2000)) {
-        appendLog("Failed to start dvbv5-zap for " + channelName);
+        appendLog(QString("Failed to start dvbv5-zap for %1 (%2)")
+                      .arg(channelName, zapProcess_->errorString()));
         scheduleReconnect("Failed to start tuner process");
         return false;
     }
@@ -966,12 +1038,14 @@ void MainWindow::startPlaybackFromDvr(const QString &dvrPath)
                    << QString("udp://127.0.0.1:%1?pkt_size=1316").arg(23000 + adapterSpin_->value());
     }
 
+    appendLog("ffmpeg bridge: launch " + formatCommandLine(ffmpegExe, ffmpegArgs));
     streamBridgeProcess_->setProgram(ffmpegExe);
     streamBridgeProcess_->setArguments(ffmpegArgs);
     streamBridgeProcess_->setProcessChannelMode(QProcess::SeparateChannels);
     streamBridgeProcess_->start();
     if (!streamBridgeProcess_->waitForStarted(2000)) {
-        appendLog("player: Failed to start ffmpeg bridge for " + dvrPath);
+        appendLog(QString("player: Failed to start ffmpeg bridge for %1 (%2)")
+                      .arg(dvrPath, streamBridgeProcess_->errorString()));
         scheduleReconnect("Could not start ffmpeg bridge");
         return;
     }
@@ -1042,7 +1116,9 @@ void MainWindow::watchFavoriteItem(QListWidgetItem *item)
 void MainWindow::handleZapFinished(int exitCode, QProcess::ExitStatus exitStatus)
 {
     if (exitStatus != QProcess::NormalExit) {
-        appendLog("zap: tuner process crashed");
+        appendLog(QString("zap: tuner process crashed (code=%1, error=%2)")
+                      .arg(exitCode)
+                      .arg(zapProcess_->errorString()));
     }
     if (!suppressZapExitReconnect_ && exitCode != 0 && !userStoppedWatching_ && !currentChannelName_.isEmpty()) {
         scheduleReconnect(QString("Tuner process exited (%1)").arg(exitCode));

@@ -18,5 +18,9 @@ add_executable(tv_tuner_gui
 )
 
 target_include_directories(tv_tuner_gui PRIVATE include)
+target_compile_definitions(tv_tuner_gui PRIVATE
+    TV_TUNER_GUI_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
+    TV_TUNER_GUI_VERSION="${PROJECT_VERSION}"
+)
 target_link_libraries(tv_tuner_gui PRIVATE Qt6::Widgets)
 target_link_libraries(tv_tuner_gui PRIVATE Qt6::Multimedia Qt6::MultimediaWidgets)
