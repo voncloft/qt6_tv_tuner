@@ -16,6 +16,7 @@
 #include <QFileDialog>
 #include <QFileInfo>
 #include <QFormLayout>
+#include <QGridLayout>
 #include <QGuiApplication>
 #include <QGroupBox>
 #include <QHeaderView>
@@ -70,6 +71,9 @@
 #include <vector>
 
 namespace {
+constexpr auto kChannelSidebarSplitterStateSetting = "watch/channel_sidebar_splitter_state";
+constexpr auto kLastPlayedChannelSetting = "watch/last_played_channel";
+
 QString quoteArg(const QString &arg)
 {
     QString escaped = arg;
@@ -319,6 +323,27 @@ QString guideEntryToolTipText(const TvGuideEntry &entry)
              entry.endUtc.toLocalTime().toString("ddd h:mm AP"));
 }
 
+QString summarizeGuideEntries(const QList<TvGuideEntry> &entries, int maxItems = 4)
+{
+    if (entries.isEmpty()) {
+        return "none";
+    }
+
+    QStringList parts;
+    const int limit = std::min(maxItems, static_cast<int>(entries.size()));
+    for (int i = 0; i < limit; ++i) {
+        const TvGuideEntry &entry = entries.at(i);
+        parts << QString("%1 [%2-%3]")
+                     .arg(entry.title,
+                          entry.startUtc.toLocalTime().toString("h:mm AP"),
+                          entry.endUtc.toLocalTime().toString("h:mm AP"));
+    }
+    if (entries.size() > limit) {
+        parts << QString("... +%1 more").arg(entries.size() - limit);
+    }
+    return parts.join(" | ");
+}
+
 struct GuideChannelInfo {
     QString name;
     qint64 frequencyHz{0};
@@ -331,6 +356,48 @@ struct RawGuideEvent {
     QDateTime endUtc;
     QString title;
 };
+
+QString formatSourceToProgramMap(const QHash<int, int> &sourceToProgram)
+{
+    if (sourceToProgram.isEmpty()) {
+        return "none";
+    }
+
+    QList<int> sourceIds = sourceToProgram.keys();
+    std::sort(sourceIds.begin(), sourceIds.end());
+
+    QStringList pairs;
+    for (int sourceId : sourceIds) {
+        pairs << QString("%1->%2").arg(sourceId).arg(sourceToProgram.value(sourceId));
+    }
+    return pairs.join(", ");
+}
+
+QString summarizeRawGuideEvents(const QList<RawGuideEvent> &events,
+                                const QHash<int, int> &sourceToProgram,
+                                int maxItems = 8)
+{
+    if (events.isEmpty()) {
+        return "none";
+    }
+
+    QStringList parts;
+    const int limit = std::min(maxItems, static_cast<int>(events.size()));
+    for (int i = 0; i < limit; ++i) {
+        const RawGuideEvent &event = events.at(i);
+        const int mappedServiceId = sourceToProgram.value(event.serviceId, event.serviceId);
+        parts << QString("%1->%2 %3 [%4-%5]")
+                     .arg(event.serviceId)
+                     .arg(mappedServiceId)
+                     .arg(event.title,
+                          event.startUtc.toLocalTime().toString("h:mm AP"),
+                          event.endUtc.toLocalTime().toString("h:mm AP"));
+    }
+    if (events.size() > limit) {
+        parts << QString("... +%1 more").arg(events.size() - limit);
+    }
+    return parts.join(" | ");
+}
 
 struct SectionAssembler {
     QByteArray bytes;
@@ -1353,8 +1420,10 @@ MainWindow::MainWindow(QWidget *parent)
     audioOutput_ = new QAudioOutput(this);
     reconnectTimer_ = new QTimer(this);
     currentShowTimer_ = new QTimer(this);
+    playbackAttachTimer_ = new QTimer(this);
     reconnectTimer_->setSingleShot(true);
     currentShowTimer_->setSingleShot(true);
+    playbackAttachTimer_->setSingleShot(true);
 
     mediaPlayer_->setAudioOutput(audioOutput_);
     mediaPlayer_->setVideoOutput(videoWidget_);
@@ -1383,6 +1452,13 @@ MainWindow::MainWindow(QWidget *parent)
             for (const QString &line : lines) {
                 const QString trimmed = line.trimmed();
                 if (!trimmed.isEmpty()) {
+                    const QString lowerTrimmed = trimmed.toLower();
+                    if (lowerTrimmed.contains("could not find codec parameters")
+                        || lowerTrimmed.contains("could not write header")
+                        || lowerTrimmed.contains("sample rate not set")
+                        || lowerTrimmed.contains("invalid frame dimensions 0x0")) {
+                        bridgeSawCodecParameterFailure_ = true;
+                    }
                     appendLog("ffmpeg: " + trimmed);
                 }
             }
@@ -1432,8 +1508,18 @@ MainWindow::MainWindow(QWidget *parent)
     });
     connect(reconnectTimer_, &QTimer::timeout, this, &MainWindow::triggerReconnect);
     connect(currentShowTimer_, &QTimer::timeout, this, &MainWindow::refreshCurrentShowStatus);
+    connect(playbackAttachTimer_, &QTimer::timeout, this, [this]() {
+        if (!waitingForDvrReady_ || pendingDvrPath_.isEmpty()) {
+            return;
+        }
+        appendLog("player: DVR ready signal timeout; attempting playback anyway.");
+        startPlaybackFromDvr(pendingDvrPath_);
+    });
     connect(volumeSlider_, &QSlider::valueChanged, this, &MainWindow::handleVolumeChanged);
     connect(muteButton_, &QPushButton::toggled, this, &MainWindow::handleMuteToggled);
+    connect(contentSplitter_, &QSplitter::splitterMoved, this, [this](int, int) {
+        saveChannelSidebarSizing();
+    });
 
     logFilePath_ = resolveProjectLogPath();
     loadFavorites();
@@ -1442,6 +1528,11 @@ MainWindow::MainWindow(QWidget *parent)
     refreshQuickButtons();
     playbackStatusLabel_->setText(playbackStatusText());
     setCurrentShowStatus("NO EIT DATA");
+
+    QTimer::singleShot(0, this, [this]() {
+        restoreChannelSidebarSizing();
+        restoreLastPlayedChannel();
+    });
 }
 
 MainWindow::~MainWindow()
@@ -1454,6 +1545,9 @@ MainWindow::~MainWindow()
     }
     if (currentShowTimer_ != nullptr) {
         currentShowTimer_->stop();
+    }
+    if (playbackAttachTimer_ != nullptr) {
+        playbackAttachTimer_->stop();
     }
     if (mediaPlayer_ != nullptr) {
         mediaPlayer_->stop();
@@ -1475,6 +1569,7 @@ void MainWindow::closeEvent(QCloseEvent *event)
 {
     appendLog("Application closing: releasing tuner resources.");
     exitFullscreen();
+    saveChannelSidebarSizing();
     stopWatching();
     stopProcess(scanProcess_, 1200);
     QMainWindow::closeEvent(event);
@@ -1629,6 +1724,7 @@ void MainWindow::buildUi()
     playbackStatusLabel_->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Preferred);
     currentShowLabel_->setMinimumWidth(160);
     currentShowLabel_->setSizePolicy(QSizePolicy::MinimumExpanding, QSizePolicy::Preferred);
+    currentShowLabel_->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
     currentShowLabel_->setTextInteractionFlags(Qt::TextSelectableByMouse);
 
     watchControlsRow->addWidget(watchButton_);
@@ -1674,20 +1770,25 @@ void MainWindow::buildUi()
     favoritesControlsRow->setSpacing(8);
     favoritesControlsRow->addWidget(addFavoriteButton_);
     favoritesControlsRow->addWidget(removeFavoriteButton_);
-    favoritesControlsRow->addSpacing(8);
-    favoritesControlsRow->addWidget(new QLabel("Favorites:", watchPage_));
-    for (int i = 0; i < 8; ++i) {
+    favoritesControlsRow->addStretch(1);
+    auto *favoritesLabel = new QLabel("Favorites:", watchPage_);
+
+    auto *favoritesButtonsGrid = new QGridLayout();
+    favoritesButtonsGrid->setContentsMargins(0, 0, 0, 0);
+    favoritesButtonsGrid->setHorizontalSpacing(8);
+    favoritesButtonsGrid->setVerticalSpacing(6);
+    for (int i = 0; i < kQuickFavoriteCount; ++i) {
         quickFavoriteButtons_[i] = new QPushButton(QString::number(i + 1), watchPage_);
         quickFavoriteButtons_[i]->setEnabled(false);
-        quickFavoriteButtons_[i]->setMinimumWidth(56);
-        quickFavoriteButtons_[i]->setMaximumWidth(110);
-        quickFavoriteButtons_[i]->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Fixed);
-        favoritesControlsRow->addWidget(quickFavoriteButtons_[i]);
+        quickFavoriteButtons_[i]->setMinimumWidth(150);
+        quickFavoriteButtons_[i]->setMinimumHeight(32);
+        quickFavoriteButtons_[i]->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
+        favoritesButtonsGrid->addWidget(quickFavoriteButtons_[i], i / 5, i % 5);
         connect(quickFavoriteButtons_[i], &QPushButton::clicked, this, &MainWindow::triggerQuickFavorite);
     }
-    favoritesControlsRow->addStretch(1);
 
-    auto *statusRow = new QHBoxLayout();
+    statusContainer_ = new QWidget(watchPage_);
+    auto *statusRow = new QHBoxLayout(statusContainer_);
     statusRow->setContentsMargins(0, 0, 0, 0);
     statusRow->setSpacing(8);
     statusRow->addWidget(playbackStatusLabel_);
@@ -1695,11 +1796,13 @@ void MainWindow::buildUi()
     statusRow->addWidget(currentShowLabel_, 1);
 
     favoritesLayout->addLayout(favoritesControlsRow);
-    favoritesLayout->addLayout(statusRow);
+    favoritesLayout->addWidget(favoritesLabel);
+    favoritesLayout->addLayout(favoritesButtonsGrid);
 
     watchLayout->addWidget(watchControlsContainer_);
     watchLayout->addWidget(contentSplitter_, 1);
     watchLayout->addWidget(favoritesContainer_);
+    watchLayout->addWidget(statusContainer_);
 
     logOutput_ = new QPlainTextEdit(logsPage);
     logOutput_->setReadOnly(true);
@@ -2439,7 +2542,7 @@ void MainWindow::refreshTvGuide()
 
     guideEntriesCache_ = entriesByChannel;
     applyCurrentShowStatusFromGuideCache();
-    tvGuideDialog_->setGuideData(channelOrder, entriesByChannel, windowStartUtc, slotMinutes, slotCount, statusText);
+    tvGuideDialog_->setGuideData(channelOrder, favorites_, entriesByChannel, windowStartUtc, slotMinutes, slotCount, statusText);
     statusBar()->showMessage(statusText.section('\n', 0, 0));
 }
 
@@ -2482,33 +2585,95 @@ bool MainWindow::applyCurrentShowStatusFromGuideCache()
         return false;
     }
 
-    TvGuideEntry entry;
-    bool isCurrent = false;
-    if (!findCurrentOrNextGuideEntry(guideEntriesCache_.value(currentChannelName_),
-                                     QDateTime::currentDateTimeUtc(),
-                                     entry,
-                                     isCurrent)) {
+    const QList<TvGuideEntry> entries = guideEntriesCache_.value(currentChannelName_);
+    const QDateTime nowUtc = QDateTime::currentDateTimeUtc();
+    TvGuideEntry currentEntry;
+    TvGuideEntry nextEntry;
+    bool foundCurrent = false;
+    bool foundNext = false;
+
+    for (const TvGuideEntry &entry : entries) {
+        if (!entry.startUtc.isValid() || !entry.endUtc.isValid() || entry.endUtc <= entry.startUtc) {
+            continue;
+        }
+        if (entry.startUtc <= nowUtc && entry.endUtc > nowUtc) {
+            if (!foundCurrent || entry.startUtc > currentEntry.startUtc) {
+                currentEntry = entry;
+                foundCurrent = true;
+            }
+            continue;
+        }
+        if (entry.startUtc > nowUtc && (!foundNext || entry.startUtc < nextEntry.startUtc)) {
+            nextEntry = entry;
+            foundNext = true;
+        }
+    }
+
+    if (!foundCurrent && !foundNext) {
         if (currentShowTimer_ != nullptr) {
             currentShowTimer_->stop();
         }
         return false;
     }
 
-    const QString label = isCurrent ? entry.title : QString("Next: %1").arg(entry.title);
-    setCurrentShowStatus(label, guideEntryToolTipText(entry));
-    scheduleCurrentShowRefresh((isCurrent ? entry.endUtc : entry.startUtc).addSecs(1));
+    QStringList lines;
+    QStringList toolTips;
+    QDateTime refreshUtc;
+
+    if (foundCurrent) {
+        lines << QString("Current: %1").arg(currentEntry.title);
+        toolTips << guideEntryToolTipText(currentEntry);
+        refreshUtc = currentEntry.endUtc.addSecs(1);
+    } else {
+        lines << "Current: NO EIT DATA";
+    }
+
+    if (foundNext) {
+        lines << QString("Next: %1").arg(nextEntry.title);
+        toolTips << guideEntryToolTipText(nextEntry);
+        if (!refreshUtc.isValid()) {
+            refreshUtc = nextEntry.startUtc.addSecs(1);
+        }
+    }
+
+    setCurrentShowStatus(lines.join('\n'), toolTips.join("\n\n"));
+    scheduleCurrentShowRefresh(refreshUtc);
     return true;
 }
 
-void MainWindow::probeCurrentShowBeforePlayback(const QString &channelName, int programId)
+void MainWindow::probeCurrentShowBeforePlayback(const QString &channelName,
+                                                int programId,
+                                                bool reconnectAttempt,
+                                                int lookupSerial)
 {
     currentShowTimer_->stop();
+    const QList<TvGuideEntry> cachedEntriesForChannel = guideEntriesCache_.value(channelName);
+    const auto lookupStillCurrent = [this, &channelName, lookupSerial]() {
+        return lookupSerial == currentShowLookupSerial_ && currentChannelName_ == channelName;
+    };
 
-    if (applyCurrentShowStatusFromGuideCache()) {
+    appendLog(QString("current-show: probe-start channel=%1 program=%2 reconnect=%3 serial=%4 cached=%5")
+                  .arg(channelName)
+                  .arg(programId)
+                  .arg(reconnectAttempt ? "true" : "false")
+                  .arg(lookupSerial)
+                  .arg(cachedEntriesForChannel.size()));
+    if (!cachedEntriesForChannel.isEmpty()) {
+        appendLog(QString("current-show: cached-entries channel=%1 %2")
+                      .arg(channelName, summarizeGuideEntries(cachedEntriesForChannel)));
+    }
+
+    if (!reconnectAttempt) {
+        noAutoCurrentShowLookupChannels_.remove(channelName);
+        setCurrentShowStatus("Current: Detecting...\nNext: ...",
+                             QString("Checking EIT for %1 before playback").arg(channelName));
+    }
+
+    if (reconnectAttempt && applyCurrentShowStatusFromGuideCache()) {
         appendLog(QString("current-show: using cached EIT for %1 before playback").arg(channelName));
         return;
     }
-    if (noAutoCurrentShowLookupChannels_.contains(channelName)) {
+    if (reconnectAttempt && noAutoCurrentShowLookupChannels_.contains(channelName)) {
         setCurrentShowStatus("NO EIT DATA", "Auto EIT lookup disabled after a prior no-data result for this channel.");
         appendLog(QString("current-show: skipping pre-playback EIT probe for %1 (previous no-data result)").arg(channelName));
         return;
@@ -2526,13 +2691,28 @@ void MainWindow::probeCurrentShowBeforePlayback(const QString &channelName, int 
                                                                 frontendSpin_->value(),
                                                                 lookupFrontend);
     if (lookupAdapter < 0 || lookupFrontend < 0) {
+        if (!lookupStillCurrent()) {
+            return;
+        }
+        appendLog(QString("current-show: no separate guide tuner for %1; lookup serial=%2 cached=%3")
+                      .arg(channelName)
+                      .arg(lookupSerial)
+                      .arg(cachedEntriesForChannel.size()));
+        if (!cachedEntriesForChannel.isEmpty()) {
+            guideEntriesCache_.insert(channelName, cachedEntriesForChannel);
+            if (applyCurrentShowStatusFromGuideCache()) {
+                appendLog(QString("current-show: using cached EIT for %1 (no separate guide tuner)").arg(channelName));
+                return;
+            }
+        }
         currentShowTimer_->stop();
         setCurrentShowStatus("NO EIT DATA", "No separate EIT tuner is available before playback.");
         appendLog(QString("current-show: no separate guide tuner available for %1 before playback").arg(channelName));
         return;
     }
 
-    setCurrentShowStatus("Detecting...", QString("Checking EIT on adapter%1/frontend%2 before playback").arg(lookupAdapter).arg(lookupFrontend));
+    setCurrentShowStatus("Current: Detecting...\nNext: ...",
+                         QString("Checking EIT on adapter%1/frontend%2 before playback").arg(lookupAdapter).arg(lookupFrontend));
     statusBar()->showMessage(QString("Checking EIT on adapter%1 before playback...").arg(lookupAdapter));
     QCoreApplication::processEvents(QEventLoop::ExcludeUserInputEvents);
 
@@ -2555,8 +2735,31 @@ void MainWindow::probeCurrentShowBeforePlayback(const QString &channelName, int 
                                                        errorText);
     QApplication::restoreOverrideCursor();
 
+    if (!lookupStillCurrent()) {
+        appendLog(QString("current-show: discarding stale EIT lookup for %1").arg(channelName));
+        return;
+    }
+
+    appendLog(QString("current-show: probe-capture channel=%1 serial=%2 captured=%3 raw-events=%4 tables=%5 source-map=%6")
+                  .arg(channelName)
+                  .arg(lookupSerial)
+                  .arg(captured ? "yes" : "no")
+                  .arg(events.size())
+                  .arg(formatTableIdSet(psipTableIds).isEmpty() ? "none" : formatTableIdSet(psipTableIds))
+                  .arg(formatSourceToProgramMap(atscSourceToProgram)));
+    appendLog(QString("current-show: probe-raw channel=%1 %2")
+                  .arg(channelName, summarizeRawGuideEvents(events, atscSourceToProgram)));
+
     QList<TvGuideEntry> entries;
+    const bool missingAtscSourceMap = !psipTableIds.isEmpty() && atscSourceToProgram.isEmpty();
+    if (missingAtscSourceMap) {
+        appendLog(QString("current-show: probe-ignore channel=%1 ignoring ATSC EIT events without source-map")
+                      .arg(channelName));
+    }
     for (const RawGuideEvent &event : events) {
+        if (missingAtscSourceMap) {
+            continue;
+        }
         int mappedServiceId = event.serviceId;
         if (atscSourceToProgram.contains(mappedServiceId)) {
             mappedServiceId = atscSourceToProgram.value(mappedServiceId);
@@ -2586,13 +2789,24 @@ void MainWindow::probeCurrentShowBeforePlayback(const QString &channelName, int 
                   .arg(formatTableIdSet(psipTableIds).isEmpty() ? "none" : formatTableIdSet(psipTableIds)));
 
     if (!entries.isEmpty()) {
+        appendLog(QString("current-show: probe-mapped channel=%1 %2")
+                      .arg(channelName, summarizeGuideEntries(entries)));
         noAutoCurrentShowLookupChannels_.remove(channelName);
         guideEntriesCache_.insert(channelName, entries);
         if (!applyCurrentShowStatusFromGuideCache()) {
             const TvGuideEntry &entry = entries.first();
-            setCurrentShowStatus(entry.title, guideEntryToolTipText(entry));
+            setCurrentShowStatus(QString("Current: %1").arg(entry.title), guideEntryToolTipText(entry));
         }
         return;
+    }
+
+    if (!cachedEntriesForChannel.isEmpty()) {
+        appendLog(QString("current-show: probe-fallback-cache channel=%1 after no-data result").arg(channelName));
+        guideEntriesCache_.insert(channelName, cachedEntriesForChannel);
+        if (applyCurrentShowStatusFromGuideCache()) {
+            appendLog(QString("current-show: using cached EIT for %1 after probe returned no data").arg(channelName));
+            return;
+        }
     }
 
     noAutoCurrentShowLookupChannels_.insert(channelName);
@@ -2648,10 +2862,18 @@ bool MainWindow::startWatchingChannel(const QString &channelName, bool reconnect
 
     userStoppedWatching_ = false;
     reconnectTimer_->stop();
+    if (playbackAttachTimer_ != nullptr) {
+        playbackAttachTimer_->stop();
+    }
+    waitingForDvrReady_ = false;
+    pendingDvrPath_.clear();
+    ++playbackStartSerial_;
     if (!reconnectAttempt) {
         reconnectAttemptCount_ = 0;
         useResilientBridgeMode_ = false;
         resilientBridgeTried_ = false;
+        useVideoOnlyBridgeMode_ = false;
+        videoOnlyBridgeTried_ = false;
     }
 
     if (streamBridgeProcess_ != nullptr && streamBridgeProcess_->state() != QProcess::NotRunning) {
@@ -2673,22 +2895,38 @@ bool MainWindow::startWatchingChannel(const QString &channelName, bool reconnect
     currentProgramId_ = programIdForChannel(channelName);
     currentShowTimer_->stop();
     ++currentShowLookupSerial_;
-    probeCurrentShowBeforePlayback(channelName, currentProgramId_.toInt());
+    probeCurrentShowBeforePlayback(channelName, currentProgramId_.toInt(), reconnectAttempt, currentShowLookupSerial_);
 
     QStringList args;
     args << "-I" << "ZAP"
          << "-c" << channelsFilePath_
          << "-a" << QString::number(adapterSpin_->value())
          << "-f" << QString::number(frontendSpin_->value())
-         << "-o" << "-"
+         << "-r"
+         << "-P"
          << "-p";
 
     args << channelName;
     appendLog(QString("Tuning channel: %1 (program=%2)")
                   .arg(channelName, currentProgramId_.isEmpty() ? "unknown" : currentProgramId_));
-    if (!startPlaybackPipeline(zapExe, args)) {
+    appendLog("zap: launch " + formatCommandLine(zapExe, args));
+    zapProcess_->start(zapExe, args);
+    if (!zapProcess_->waitForStarted(2000)) {
+        appendLog(QString("Failed to start dvbv5-zap for %1 (%2)")
+                      .arg(currentChannelName_, zapProcess_->errorString()));
+        scheduleReconnect("Failed to start tuner process");
         return false;
     }
+
+    pendingDvrPath_ = QString("/dev/dvb/adapter%1/dvr0").arg(adapterSpin_->value());
+    waitingForDvrReady_ = true;
+    appendLog(QString("player: Waiting for DVR device readiness on %1.").arg(pendingDvrPath_));
+    if (playbackAttachTimer_ != nullptr) {
+        playbackAttachTimer_->start(3500);
+    }
+
+    QSettings settings("tv_tuner_gui", "watcher");
+    settings.setValue(kLastPlayedChannelSetting, channelName);
 
     stopWatchButton_->setEnabled(true);
     playbackStatusLabel_->setText(playbackStatusText());
@@ -2702,10 +2940,19 @@ void MainWindow::stopWatching()
     userStoppedWatching_ = true;
     reconnectTimer_->stop();
     currentShowTimer_->stop();
+    if (playbackAttachTimer_ != nullptr) {
+        playbackAttachTimer_->stop();
+    }
     ++currentShowLookupSerial_;
+    ++playbackStartSerial_;
+    waitingForDvrReady_ = false;
+    pendingDvrPath_.clear();
     reconnectAttemptCount_ = 0;
     useResilientBridgeMode_ = false;
     resilientBridgeTried_ = false;
+    useVideoOnlyBridgeMode_ = false;
+    videoOnlyBridgeTried_ = false;
+    bridgeSawCodecParameterFailure_ = false;
     currentChannelName_.clear();
     currentProgramId_.clear();
     if (mediaPlayer_ != nullptr) {
@@ -2745,17 +2992,38 @@ void MainWindow::handleZapStdErr()
         const QString trimmed = line.trimmed();
         if (!trimmed.isEmpty()) {
             appendLog("zap: " + trimmed);
+            if (waitingForDvrReady_
+                && trimmed.contains("DVR interface")
+                && trimmed.contains("can now be opened")) {
+                QString detectedPath = pendingDvrPath_;
+                const QRegularExpression re("'([^']+/dvr0)'");
+                const auto match = re.match(trimmed);
+                if (match.hasMatch()) {
+                    detectedPath = match.captured(1);
+                }
+                appendLog("player: DVR ready path detected: " + detectedPath);
+                startPlaybackFromDvr(detectedPath);
+            }
         }
     }
 }
 
-bool MainWindow::startPlaybackPipeline(const QString &zapExe, const QStringList &zapArgs)
+void MainWindow::startPlaybackFromDvr(const QString &dvrPath)
 {
+    if (dvrPath.isEmpty()) {
+        return;
+    }
+    if (playbackAttachTimer_ != nullptr) {
+        playbackAttachTimer_->stop();
+    }
+    waitingForDvrReady_ = false;
+    pendingDvrPath_.clear();
+
     const QString ffmpegExe = QStandardPaths::findExecutable("ffmpeg");
     if (ffmpegExe.isEmpty()) {
         appendLog("player: ffmpeg not found in PATH for live DVB bridge.");
         scheduleReconnect("Missing ffmpeg for live stream");
-        return false;
+        return;
     }
 
     if (streamBridgeProcess_ != nullptr && streamBridgeProcess_->state() != QProcess::NotRunning) {
@@ -2765,7 +3033,32 @@ bool MainWindow::startPlaybackPipeline(const QString &zapExe, const QStringList 
     }
 
     QStringList ffmpegArgs;
-    if (useResilientBridgeMode_) {
+    bridgeSawCodecParameterFailure_ = false;
+    if (useVideoOnlyBridgeMode_) {
+        ffmpegArgs << "-hide_banner"
+                   << "-nostdin"
+                   << "-loglevel" << "warning"
+                   << "-fflags" << "+genpts+discardcorrupt"
+                   << "-err_detect" << "ignore_err"
+                   << "-analyzeduration" << "12M"
+                   << "-probesize" << "12M"
+                   << "-f" << "mpegts"
+                   << "-i" << dvrPath;
+        if (!currentProgramId_.isEmpty()) {
+            ffmpegArgs << "-map" << QString("0:p:%1?").arg(currentProgramId_);
+        } else {
+            ffmpegArgs << "-map" << "0:v:0?";
+        }
+        ffmpegArgs << "-an"
+                   << "-sn"
+                   << "-dn"
+                   << "-c:v" << "mpeg2video"
+                   << "-q:v" << "3"
+                   << "-mpegts_flags" << "+resend_headers+pat_pmt_at_frames"
+                   << "-flush_packets" << "1"
+                   << "-f" << "mpegts"
+                   << QString("udp://127.0.0.1:%1?pkt_size=1316").arg(23000 + adapterSpin_->value());
+    } else if (useResilientBridgeMode_) {
         ffmpegArgs << "-hide_banner"
                    << "-nostdin"
                    << "-loglevel" << "warning"
@@ -2774,10 +3067,14 @@ bool MainWindow::startPlaybackPipeline(const QString &zapExe, const QStringList 
                    << "-analyzeduration" << "4M"
                    << "-probesize" << "4M"
                    << "-f" << "mpegts"
-                   << "-i" << "pipe:0"
-                   << "-map" << "0:v:0?"
-                   << "-map" << "0:a:0?"
-                   << "-sn"
+                   << "-i" << dvrPath;
+        if (!currentProgramId_.isEmpty()) {
+            ffmpegArgs << "-map" << QString("0:p:%1?").arg(currentProgramId_);
+        } else {
+            ffmpegArgs << "-map" << "0:v:0?"
+                       << "-map" << "0:a:0?";
+        }
+        ffmpegArgs << "-sn"
                    << "-dn"
                    << "-c:v" << "mpeg2video"
                    << "-q:v" << "3"
@@ -2795,11 +3092,13 @@ bool MainWindow::startPlaybackPipeline(const QString &zapExe, const QStringList 
                    << "-analyzeduration" << "2M"
                    << "-probesize" << "2M"
                    << "-f" << "mpegts"
-                   << "-i" << "pipe:0"
-                   << "-map" << "0:v:0?"
-                   << "-map" << "0:a:0?"
-                   << "-sn"
-                   << "-dn"
+                   << "-i" << dvrPath;
+        if (!currentProgramId_.isEmpty()) {
+            ffmpegArgs << "-map" << QString("0:p:%1?").arg(currentProgramId_);
+        } else {
+            ffmpegArgs << "-map" << "0";
+        }
+        ffmpegArgs
                    << "-c" << "copy"
                    << "-mpegts_flags" << "+resend_headers+pat_pmt_at_frames"
                    << "-flush_packets" << "1"
@@ -2808,35 +3107,24 @@ bool MainWindow::startPlaybackPipeline(const QString &zapExe, const QStringList 
     }
 
     appendLog("ffmpeg bridge: launch " + formatCommandLine(ffmpegExe, ffmpegArgs));
-    zapProcess_->setStandardOutputProcess(streamBridgeProcess_);
     streamBridgeProcess_->setProgram(ffmpegExe);
     streamBridgeProcess_->setArguments(ffmpegArgs);
     streamBridgeProcess_->setProcessChannelMode(QProcess::SeparateChannels);
     streamBridgeProcess_->start();
     if (!streamBridgeProcess_->waitForStarted(2000)) {
-        appendLog(QString("player: Failed to start ffmpeg bridge (%1)")
-                      .arg(streamBridgeProcess_->errorString()));
+        appendLog(QString("player: Failed to start ffmpeg bridge for %1 (%2)")
+                      .arg(dvrPath, streamBridgeProcess_->errorString()));
         scheduleReconnect("Could not start ffmpeg bridge");
-        return false;
+        return;
     }
 
-    appendLog("zap: launch " + formatCommandLine(zapExe, zapArgs));
-    zapProcess_->start(zapExe, zapArgs);
-    if (!zapProcess_->waitForStarted(2000)) {
-        appendLog(QString("Failed to start dvbv5-zap for %1 (%2)")
-                      .arg(currentChannelName_, zapProcess_->errorString()));
-        suppressBridgeExitReconnect_ = true;
-        stopProcess(streamBridgeProcess_, 1000);
-        suppressBridgeExitReconnect_ = false;
-        scheduleReconnect("Failed to start tuner process");
-        return false;
-    }
-
+    const int attachSerial = playbackStartSerial_;
     const int udpPort = 23000 + adapterSpin_->value();
     const QUrl liveUrl(QString("udp://127.0.0.1:%1").arg(udpPort));
-    appendLog(QString("player: Starting playback from zap stdout via %1 (mode=%2, program=%3)")
-                  .arg(liveUrl.toString(),
-                       useResilientBridgeMode_ ? "resilient" : "normal",
+    appendLog(QString("player: Starting playback from DVR %1 via %2 (mode=%3, program=%4)")
+                  .arg(dvrPath,
+                       liveUrl.toString(),
+                       useVideoOnlyBridgeMode_ ? "video-only" : (useResilientBridgeMode_ ? "resilient" : "normal"),
                        currentProgramId_.isEmpty() ? "unknown" : currentProgramId_));
     mediaPlayer_->setAudioOutput(audioOutput_);
     currentShowTimer_->stop();
@@ -2845,7 +3133,10 @@ bool MainWindow::startPlaybackPipeline(const QString &zapExe, const QStringList 
     } else if (noAutoCurrentShowLookupChannels_.contains(currentChannelName_)) {
         setCurrentShowStatus("NO EIT DATA", "EIT was checked before playback and no data was found for this channel.");
     }
-    QTimer::singleShot(3000, this, [this, liveUrl]() {
+    QTimer::singleShot(450, this, [this, liveUrl, attachSerial]() {
+        if (attachSerial != playbackStartSerial_) {
+            return;
+        }
         if (streamBridgeProcess_ == nullptr || streamBridgeProcess_->state() != QProcess::Running) {
             appendLog("player: ffmpeg bridge exited before media attach.");
             return;
@@ -2854,7 +3145,6 @@ bool MainWindow::startPlaybackPipeline(const QString &zapExe, const QStringList 
         mediaPlayer_->setSource(liveUrl);
         mediaPlayer_->play();
     });
-    return true;
 }
 
 void MainWindow::addSelectedFavorite()
@@ -2958,7 +3248,7 @@ void MainWindow::handlePlayerError(const QString &errorText)
     }
     appendLog("player: " + errorText.trimmed());
     if (!userStoppedWatching_ && !currentChannelName_.isEmpty()) {
-        if (tryDynamicBridgeFallback("Player error")) {
+        if (tryDynamicBridgeFallback(QString("Player error: %1").arg(errorText.trimmed()))) {
             return;
         }
         scheduleReconnect("Player error");
@@ -2970,12 +3260,29 @@ bool MainWindow::tryDynamicBridgeFallback(const QString &reason)
     if (userStoppedWatching_ || currentChannelName_.isEmpty()) {
         return false;
     }
+
+    const bool shouldTryVideoOnly =
+        bridgeSawCodecParameterFailure_
+        || reason.contains("Could not open file", Qt::CaseInsensitive)
+        || useResilientBridgeMode_;
+
+    if (shouldTryVideoOnly && !videoOnlyBridgeTried_ && !useVideoOnlyBridgeMode_) {
+        videoOnlyBridgeTried_ = true;
+        useVideoOnlyBridgeMode_ = true;
+        useResilientBridgeMode_ = false;
+        reconnectTimer_->stop();
+        reconnectAttemptCount_ = 0;
+        appendLog(QString("player: %1; retrying with video-only bridge mode").arg(reason));
+        startWatchingChannel(currentChannelName_, true);
+        return true;
+    }
+
     if (resilientBridgeTried_ || useResilientBridgeMode_) {
         return false;
     }
-
     resilientBridgeTried_ = true;
     useResilientBridgeMode_ = true;
+    useVideoOnlyBridgeMode_ = false;
     reconnectTimer_->stop();
     reconnectAttemptCount_ = 0;
     appendLog(QString("player: %1; retrying with resilient bridge mode").arg(reason));
@@ -3039,6 +3346,56 @@ void MainWindow::handleVolumeChanged(int value)
     settings.setValue("volume_percent", value);
 }
 
+void MainWindow::saveChannelSidebarSizing()
+{
+    if (contentSplitter_ == nullptr || channelsTable_ == nullptr || fullscreenActive_ || !channelsTable_->isVisible()) {
+        return;
+    }
+
+    QSettings settings("tv_tuner_gui", "watcher");
+    settings.setValue(kChannelSidebarSplitterStateSetting, contentSplitter_->saveState());
+}
+
+void MainWindow::restoreChannelSidebarSizing()
+{
+    if (contentSplitter_ == nullptr) {
+        return;
+    }
+
+    QSettings settings("tv_tuner_gui", "watcher");
+    const QByteArray splitterState = settings.value(kChannelSidebarSplitterStateSetting).toByteArray();
+    if (!splitterState.isEmpty()) {
+        contentSplitter_->restoreState(splitterState);
+    }
+}
+
+void MainWindow::restoreLastPlayedChannel()
+{
+    if (channelsTable_ == nullptr || channelsTable_->rowCount() == 0) {
+        return;
+    }
+
+    QSettings settings("tv_tuner_gui", "watcher");
+    const QString lastChannelName = settings.value(kLastPlayedChannelSetting).toString().trimmed();
+    if (lastChannelName.isEmpty()) {
+        return;
+    }
+
+    for (int row = 0; row < channelsTable_->rowCount(); ++row) {
+        QTableWidgetItem *channelItem = channelsTable_->item(row, 1);
+        if (channelItem == nullptr || channelItem->text().trimmed() != lastChannelName) {
+            continue;
+        }
+
+        channelsTable_->setCurrentCell(row, 1);
+        channelsTable_->scrollToItem(channelItem, QAbstractItemView::PositionAtCenter);
+        startWatchingChannel(lastChannelName, false);
+        return;
+    }
+
+    appendLog("Saved last channel was not found in the current channel list: " + lastChannelName);
+}
+
 void MainWindow::toggleFullscreen()
 {
     if (fullscreenActive_) {
@@ -3082,6 +3439,9 @@ void MainWindow::enterFullscreen()
     tabs_->setCurrentWidget(watchPage_);
     watchControlsContainer_->hide();
     favoritesContainer_->hide();
+    if (statusContainer_ != nullptr) {
+        statusContainer_->hide();
+    }
     channelsTable_->hide();
     tabs_->tabBar()->hide();
     menuBar()->hide();
@@ -3123,6 +3483,9 @@ void MainWindow::exitFullscreen()
     if (favoritesContainer_ != nullptr) {
         favoritesContainer_->show();
     }
+    if (statusContainer_ != nullptr) {
+        statusContainer_->show();
+    }
     if (channelsTable_ != nullptr) {
         channelsTable_->show();
     }
@@ -3153,18 +3516,14 @@ void MainWindow::exitFullscreen()
 
 void MainWindow::refreshQuickButtons()
 {
-    for (int i = 0; i < 8; ++i) {
+    for (int i = 0; i < kQuickFavoriteCount; ++i) {
         auto *button = quickFavoriteButtons_[i];
         if (button == nullptr) {
             continue;
         }
         if (i < favorites_.size()) {
             const QString channel = favorites_.at(i);
-            QString label = channel;
-            if (label.size() > 18) {
-                label = label.left(15) + "...";
-            }
-            button->setText(QString("%1 %2").arg(i + 1).arg(label));
+            button->setText(QString("%1 %2").arg(i + 1).arg(channel));
             button->setToolTip(channel);
             button->setProperty("channelName", channel);
             button->setEnabled(scanProcess_ == nullptr || scanProcess_->state() == QProcess::NotRunning);

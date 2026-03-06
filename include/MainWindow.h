@@ -66,6 +66,8 @@ private slots:
     void refreshTvGuide();
 
 private:
+    static constexpr int kQuickFavoriteCount = 10;
+
     void buildUi();
     void setScanningState(bool running);
     void appendLog(const QString &line);
@@ -77,14 +79,14 @@ private:
     void loadFavorites();
     void loadXspfChannelHints();
     void loadChannelsFileIfPresent();
-    bool startPlaybackPipeline(const QString &zapExe, const QStringList &zapArgs);
+    void startPlaybackFromDvr(const QString &dvrPath);
     void scheduleReconnect(const QString &reason);
     bool tryDynamicBridgeFallback(const QString &reason);
     QString playbackStatusText() const;
     QStringList makeArguments() const;
     QString selectedChannelNameFromTable() const;
     QString programIdForChannel(const QString &channelName) const;
-    void probeCurrentShowBeforePlayback(const QString &channelName, int programId);
+    void probeCurrentShowBeforePlayback(const QString &channelName, int programId, bool reconnectAttempt, int lookupSerial);
     void refreshCurrentShowStatus();
     void scheduleCurrentShowRefresh(const QDateTime &refreshUtc);
     void setCurrentShowStatus(const QString &text, const QString &toolTip = QString());
@@ -92,6 +94,9 @@ private:
     void stopProcess(QProcess *process, int timeoutMs);
     void enterFullscreen();
     void exitFullscreen();
+    void saveChannelSidebarSizing();
+    void restoreChannelSidebarSizing();
+    void restoreLastPlayedChannel();
 
     QComboBox *frontendTypeCombo_{};
     QLineEdit *countryEdit_{};
@@ -106,7 +111,7 @@ private:
     QPushButton *openFileButton_{};
     QPushButton *addFavoriteButton_{};
     QPushButton *removeFavoriteButton_{};
-    QPushButton *quickFavoriteButtons_[8]{};
+    QPushButton *quickFavoriteButtons_[kQuickFavoriteCount]{};
     QPushButton *muteButton_{};
     QPushButton *fullscreenButton_{};
     QPlainTextEdit *logOutput_{};
@@ -119,6 +124,7 @@ private:
     QWidget *watchPage_{};
     QWidget *watchControlsContainer_{};
     QWidget *favoritesContainer_{};
+    QWidget *statusContainer_{};
     QSplitter *contentSplitter_{};
 
     QProcess *scanProcess_{};
@@ -136,6 +142,7 @@ private:
     QHash<QString, QString> xspfProgramByChannel_;
     QString currentChannelName_;
     QString currentProgramId_;
+    QString pendingDvrPath_;
     QHash<QString, QList<TvGuideEntry>> guideEntriesCache_;
     QSet<QString> noAutoCurrentShowLookupChannels_;
     int reconnectAttemptCount_{0};
@@ -145,6 +152,10 @@ private:
     bool suppressBridgeExitReconnect_{false};
     bool useResilientBridgeMode_{false};
     bool resilientBridgeTried_{false};
+    bool useVideoOnlyBridgeMode_{false};
+    bool videoOnlyBridgeTried_{false};
+    bool bridgeSawCodecParameterFailure_{false};
+    bool waitingForDvrReady_{false};
     bool fullscreenActive_{false};
     bool wasMaximizedBeforeFullscreen_{false};
     bool menuBarWasVisibleBeforeFullscreen_{true};
@@ -156,6 +167,8 @@ private:
     QByteArray windowGeometryBeforeFullscreen_;
     QTimer *reconnectTimer_{};
     QTimer *currentShowTimer_{};
+    QTimer *playbackAttachTimer_{};
     TvGuideDialog *tvGuideDialog_{};
     int currentShowLookupSerial_{0};
+    int playbackStartSerial_{0};
 };

@@ -10,8 +10,9 @@
 class QCheckBox;
 class QPlainTextEdit;
 class QPushButton;
+class QScrollArea;
 class QTabWidget;
-class QTableWidget;
+class QWidget;
 
 struct TvGuideEntry {
     QDateTime startUtc;
@@ -28,6 +29,7 @@ public:
 
     void setLoadingState(const QString &message);
     void setGuideData(const QStringList &channelOrder,
+                      const QStringList &favoriteChannels,
                       const QHash<QString, QList<TvGuideEntry>> &entriesByChannel,
                       const QDateTime &windowStartUtc,
                       int slotMinutes,
@@ -44,11 +46,18 @@ private:
     void renderGuideTable();
 
     QCheckBox *hideNoEitCheckBox_{};
+    QCheckBox *showFavoritesOnlyCheckBox_{};
     QPlainTextEdit *logsView_{};
     QPushButton *refreshButton_{};
     QTabWidget *tabs_{};
-    QTableWidget *table_{};
+    QWidget *guideHeaderViewport_{};
+    QWidget *guideHeaderContent_{};
+    QWidget *guideChannelsViewport_{};
+    QWidget *guideChannelsContent_{};
+    QScrollArea *guideScrollArea_{};
+    QWidget *guideContent_{};
     QStringList channelOrder_;
+    QStringList favoriteChannels_;
     QHash<QString, QList<TvGuideEntry>> entriesByChannel_;
     QDateTime windowStartUtc_;
     int slotMinutes_{30};
