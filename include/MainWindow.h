@@ -2,10 +2,12 @@
 
 #include "TvGuideDialog.h"
 
+#include <QByteArray>
 #include <QMainWindow>
 #include <QMediaPlayer>
 #include <QProcess>
 #include <QHash>
+#include <QList>
 #include <QSet>
 
 class QComboBox;
@@ -23,6 +25,8 @@ class QTimer;
 class QFile;
 class QCloseEvent;
 class QWidget;
+class QSplitter;
+class QTabWidget;
 
 class MainWindow : public QMainWindow
 {
@@ -111,8 +115,11 @@ private:
     QLabel *playbackStatusLabel_{};
     QLabel *currentShowLabel_{};
     QSlider *volumeSlider_{};
-    QWidget *fullscreenWindow_{};
-    QVideoWidget *fullscreenVideoWidget_{};
+    QTabWidget *tabs_{};
+    QWidget *watchPage_{};
+    QWidget *watchControlsContainer_{};
+    QWidget *favoritesContainer_{};
+    QSplitter *contentSplitter_{};
 
     QProcess *scanProcess_{};
     QProcess *zapProcess_{};
@@ -125,6 +132,7 @@ private:
     QString logFilePath_;
     QStringList channelLines_;
     QStringList favorites_;
+    QHash<QString, QString> xspfNumberByTuneKey_;
     QHash<QString, QString> xspfProgramByChannel_;
     QString currentChannelName_;
     QString currentProgramId_;
@@ -138,6 +146,14 @@ private:
     bool useResilientBridgeMode_{false};
     bool resilientBridgeTried_{false};
     bool fullscreenActive_{false};
+    bool wasMaximizedBeforeFullscreen_{false};
+    bool menuBarWasVisibleBeforeFullscreen_{true};
+    bool statusBarWasVisibleBeforeFullscreen_{true};
+    bool tabBarWasVisibleBeforeFullscreen_{true};
+    int previousTabIndex_{0};
+    int splitterHandleWidthBeforeFullscreen_{-1};
+    QList<int> splitterSizesBeforeFullscreen_;
+    QByteArray windowGeometryBeforeFullscreen_;
     QTimer *reconnectTimer_{};
     QTimer *currentShowTimer_{};
     TvGuideDialog *tvGuideDialog_{};

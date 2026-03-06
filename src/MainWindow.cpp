@@ -41,6 +41,7 @@
 #include <QSplitter>
 #include <QStandardPaths>
 #include <QStatusBar>
+#include <QTabBar>
 #include <QTabWidget>
 #include <QTableWidget>
 #include <QTextCursor>
@@ -140,6 +141,46 @@ QString resolveProjectLogPath()
         cwdDir.cdUp();
     }
     return cwdDir.filePath("tv_tuner_gui.log");
+}
+
+QScreen *screenForWidget(QWidget *widget)
+{
+    if (widget == nullptr) {
+        return nullptr;
+    }
+
+    if (QScreen *screen = widget->screen()) {
+        return screen;
+    }
+
+    const QPoint center = widget->mapToGlobal(widget->rect().center());
+    if (QScreen *screen = QGuiApplication::screenAt(center)) {
+        return screen;
+    }
+
+    if (QWidget *window = widget->window()) {
+        return window->screen();
+    }
+
+    return nullptr;
+}
+
+QString tuneKey(const QString &frequency, const QString &program)
+{
+    const QString trimmedFrequency = frequency.trimmed();
+    const QString trimmedProgram = program.trimmed();
+    if (trimmedFrequency.isEmpty() || trimmedProgram.isEmpty()) {
+        return {};
+    }
+    return trimmedFrequency + "|" + trimmedProgram;
+}
+
+QString tuneKeyForParts(const QStringList &parts)
+{
+    if (parts.size() < 6) {
+        return {};
+    }
+    return tuneKey(parts[1], parts[5]);
 }
 
 int firstAvailableFrontendForAdapter(int adapter, int preferredFrontend)
@@ -1317,7 +1358,10 @@ MainWindow::MainWindow(QWidget *parent)
 
     mediaPlayer_->setAudioOutput(audioOutput_);
     mediaPlayer_->setVideoOutput(videoWidget_);
-    audioOutput_->setVolume(0.85);
+    QSettings settings("tv_tuner_gui", "watcher");
+    const int savedVolume = std::clamp(settings.value("volume_percent", 85).toInt(), 0, 100);
+    audioOutput_->setVolume(static_cast<float>(savedVolume) / 100.0f);
+    volumeSlider_->setValue(savedVolume);
 
     connect(scanProcess_, &QProcess::readyReadStandardOutput, this, &MainWindow::handleStdOut);
     connect(scanProcess_, &QProcess::readyReadStandardError, this, &MainWindow::handleStdErr);
@@ -1439,12 +1483,7 @@ void MainWindow::closeEvent(QCloseEvent *event)
 bool MainWindow::eventFilter(QObject *watched, QEvent *event)
 {
     if (watched == videoWidget_ && event->type() == QEvent::MouseButtonDblClick) {
-        enterFullscreen();
-        return true;
-    }
-
-    if (watched == fullscreenVideoWidget_ && event->type() == QEvent::MouseButtonDblClick) {
-        exitFullscreen();
+        toggleFullscreen();
         return true;
     }
 
@@ -1496,17 +1535,22 @@ void MainWindow::buildUi()
 
     auto *root = new QWidget(this);
     auto *mainLayout = new QVBoxLayout(root);
+    mainLayout->setContentsMargins(0, 0, 0, 0);
+    mainLayout->setSpacing(0);
 
-    auto *tabs = new QTabWidget(root);
-    tabs->setTabPosition(QTabWidget::North);
+    tabs_ = new QTabWidget(root);
+    tabs_->setTabPosition(QTabWidget::North);
+    tabs_->setDocumentMode(true);
+    tabs_->setStyleSheet("QTabWidget::pane { border: 0; }");
 
-    auto *watchPage = new QWidget(tabs);
-    auto *watchLayout = new QVBoxLayout(watchPage);
+    watchPage_ = new QWidget(tabs_);
+    auto *watchLayout = new QVBoxLayout(watchPage_);
+    watchLayout->setContentsMargins(0, 0, 0, 0);
 
-    auto *tuningPage = new QWidget(tabs);
+    auto *tuningPage = new QWidget(tabs_);
     auto *tuningLayout = new QVBoxLayout(tuningPage);
 
-    auto *logsPage = new QWidget(tabs);
+    auto *logsPage = new QWidget(tabs_);
     auto *logsLayout = new QVBoxLayout(logsPage);
 
     auto *scanGroup = new QGroupBox("Scan Settings", tuningPage);
@@ -1559,26 +1603,32 @@ void MainWindow::buildUi()
     tuningLayout->addLayout(scanActionsRow);
     tuningLayout->addStretch(1);
 
-    auto *watchControlsRow = new QHBoxLayout();
-    watchButton_ = new QPushButton("Watch Selected", watchPage);
-    stopWatchButton_ = new QPushButton("Stop Watching", watchPage);
-    openFileButton_ = new QPushButton("Open File", watchPage);
-    fullscreenButton_ = new QPushButton("Fullscreen", watchPage);
-    muteButton_ = new QPushButton("Mute", watchPage);
-    volumeSlider_ = new QSlider(Qt::Horizontal, watchPage);
-    playbackStatusLabel_ = new QLabel("Idle", watchPage);
-    currentShowLabel_ = new QLabel("NO EIT DATA", watchPage);
-    addFavoriteButton_ = new QPushButton("Add Favorite", watchPage);
-    removeFavoriteButton_ = new QPushButton("Remove Favorite", watchPage);
+    watchControlsContainer_ = new QWidget(watchPage_);
+    auto *watchControlsRow = new QHBoxLayout(watchControlsContainer_);
+    watchControlsRow->setContentsMargins(0, 0, 0, 0);
+    watchControlsRow->setSpacing(8);
+    watchButton_ = new QPushButton("Watch Selected", watchPage_);
+    stopWatchButton_ = new QPushButton("Stop Watching", watchPage_);
+    openFileButton_ = new QPushButton("Open File", watchPage_);
+    fullscreenButton_ = new QPushButton("Fullscreen", watchPage_);
+    muteButton_ = new QPushButton("Mute", watchPage_);
+    volumeSlider_ = new QSlider(Qt::Horizontal, watchPage_);
+    playbackStatusLabel_ = new QLabel("Idle", watchPage_);
+    currentShowLabel_ = new QLabel("NO EIT DATA", watchPage_);
+    addFavoriteButton_ = new QPushButton("Add Favorite", watchPage_);
+    removeFavoriteButton_ = new QPushButton("Remove Favorite", watchPage_);
 
     stopButton_->setEnabled(false);
     stopWatchButton_->setEnabled(false);
     muteButton_->setCheckable(true);
     volumeSlider_->setRange(0, 100);
     volumeSlider_->setValue(85);
-    volumeSlider_->setFixedWidth(220);
-    playbackStatusLabel_->setMinimumWidth(260);
-    currentShowLabel_->setMinimumWidth(320);
+    volumeSlider_->setMinimumWidth(120);
+    volumeSlider_->setMaximumWidth(220);
+    playbackStatusLabel_->setMinimumWidth(100);
+    playbackStatusLabel_->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Preferred);
+    currentShowLabel_->setMinimumWidth(160);
+    currentShowLabel_->setSizePolicy(QSizePolicy::MinimumExpanding, QSizePolicy::Preferred);
     currentShowLabel_->setTextInteractionFlags(Qt::TextSelectableByMouse);
 
     watchControlsRow->addWidget(watchButton_);
@@ -1586,52 +1636,70 @@ void MainWindow::buildUi()
     watchControlsRow->addWidget(openFileButton_);
     watchControlsRow->addWidget(fullscreenButton_);
     watchControlsRow->addSpacing(12);
-    watchControlsRow->addWidget(new QLabel("Volume:", watchPage));
+    watchControlsRow->addWidget(new QLabel("Volume:", watchPage_));
     watchControlsRow->addWidget(volumeSlider_);
     watchControlsRow->addWidget(muteButton_);
-    watchControlsRow->addSpacing(12);
-    watchControlsRow->addWidget(new QLabel("Playback:", watchPage));
-    watchControlsRow->addWidget(playbackStatusLabel_);
-    watchControlsRow->addSpacing(12);
-    watchControlsRow->addWidget(new QLabel("Watching Now:", watchPage));
-    watchControlsRow->addWidget(currentShowLabel_);
     watchControlsRow->addStretch(1);
 
-    auto *contentSplitter = new QSplitter(Qt::Horizontal, watchPage);
-    videoWidget_ = new QVideoWidget(contentSplitter);
-    videoWidget_->setMinimumSize(640, 360);
+    contentSplitter_ = new QSplitter(Qt::Horizontal, watchPage_);
+    videoWidget_ = new QVideoWidget(contentSplitter_);
+    videoWidget_->setMinimumHeight(360);
     videoWidget_->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
     videoWidget_->setStyleSheet("background: #000;");
 
-    channelsTable_ = new QTableWidget(contentSplitter);
+    channelsTable_ = new QTableWidget(contentSplitter_);
     channelsTable_->setColumnCount(3);
-    channelsTable_->setHorizontalHeaderLabels({"Channel", "Provider", "Raw line"});
+    channelsTable_->setHorizontalHeaderLabels({"Number", "Channel", "Raw line"});
     channelsTable_->horizontalHeader()->setSectionResizeMode(0, QHeaderView::ResizeToContents);
-    channelsTable_->horizontalHeader()->setSectionResizeMode(1, QHeaderView::ResizeToContents);
-    channelsTable_->horizontalHeader()->setSectionResizeMode(2, QHeaderView::Stretch);
+    channelsTable_->horizontalHeader()->setSectionResizeMode(1, QHeaderView::Stretch);
+    channelsTable_->setColumnHidden(2, true);
     channelsTable_->setAlternatingRowColors(true);
+    channelsTable_->setShowGrid(false);
+    channelsTable_->verticalHeader()->setVisible(false);
     channelsTable_->setSelectionBehavior(QAbstractItemView::SelectRows);
+    channelsTable_->setSelectionMode(QAbstractItemView::SingleSelection);
     channelsTable_->setEditTriggers(QAbstractItemView::NoEditTriggers);
-    contentSplitter->setStretchFactor(0, 5);
-    contentSplitter->setStretchFactor(1, 3);
+    channelsTable_->setMinimumWidth(260);
+    channelsTable_->setSortingEnabled(true);
+    channelsTable_->sortByColumn(0, Qt::AscendingOrder);
+    contentSplitter_->setChildrenCollapsible(false);
+    contentSplitter_->setStretchFactor(0, 6);
+    contentSplitter_->setStretchFactor(1, 2);
 
+    favoritesContainer_ = new QWidget(watchPage_);
+    auto *favoritesLayout = new QVBoxLayout(favoritesContainer_);
+    favoritesLayout->setContentsMargins(0, 0, 0, 0);
+    favoritesLayout->setSpacing(6);
     auto *favoritesControlsRow = new QHBoxLayout();
+    favoritesControlsRow->setSpacing(8);
     favoritesControlsRow->addWidget(addFavoriteButton_);
     favoritesControlsRow->addWidget(removeFavoriteButton_);
     favoritesControlsRow->addSpacing(8);
-    favoritesControlsRow->addWidget(new QLabel("Favorites:", watchPage));
+    favoritesControlsRow->addWidget(new QLabel("Favorites:", watchPage_));
     for (int i = 0; i < 8; ++i) {
-        quickFavoriteButtons_[i] = new QPushButton(QString::number(i + 1), watchPage);
+        quickFavoriteButtons_[i] = new QPushButton(QString::number(i + 1), watchPage_);
         quickFavoriteButtons_[i]->setEnabled(false);
-        quickFavoriteButtons_[i]->setMinimumWidth(120);
+        quickFavoriteButtons_[i]->setMinimumWidth(56);
+        quickFavoriteButtons_[i]->setMaximumWidth(110);
+        quickFavoriteButtons_[i]->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Fixed);
         favoritesControlsRow->addWidget(quickFavoriteButtons_[i]);
         connect(quickFavoriteButtons_[i], &QPushButton::clicked, this, &MainWindow::triggerQuickFavorite);
     }
     favoritesControlsRow->addStretch(1);
 
-    watchLayout->addLayout(watchControlsRow);
-    watchLayout->addWidget(contentSplitter, 1);
-    watchLayout->addLayout(favoritesControlsRow);
+    auto *statusRow = new QHBoxLayout();
+    statusRow->setContentsMargins(0, 0, 0, 0);
+    statusRow->setSpacing(8);
+    statusRow->addWidget(playbackStatusLabel_);
+    statusRow->addStretch(1);
+    statusRow->addWidget(currentShowLabel_, 1);
+
+    favoritesLayout->addLayout(favoritesControlsRow);
+    favoritesLayout->addLayout(statusRow);
+
+    watchLayout->addWidget(watchControlsContainer_);
+    watchLayout->addWidget(contentSplitter_, 1);
+    watchLayout->addWidget(favoritesContainer_);
 
     logOutput_ = new QPlainTextEdit(logsPage);
     logOutput_->setReadOnly(true);
@@ -1639,27 +1707,13 @@ void MainWindow::buildUi()
     logOutput_->setPlaceholderText("w_scan2 and tuning output will appear here...");
     logsLayout->addWidget(logOutput_);
 
-    tabs->addTab(watchPage, "Video");
-    tabs->addTab(tuningPage, "Tuning");
-    tabs->addTab(logsPage, "Logs");
-    mainLayout->addWidget(tabs, 1);
+    tabs_->addTab(watchPage_, "Video");
+    tabs_->addTab(tuningPage, "Tuning");
+    tabs_->addTab(logsPage, "Logs");
+    mainLayout->addWidget(tabs_, 1);
     setCentralWidget(root);
 
-    fullscreenWindow_ = new QWidget(nullptr, Qt::Window | Qt::FramelessWindowHint);
-    fullscreenWindow_->setWindowFlag(Qt::WindowStaysOnTopHint, true);
-    auto *fullscreenLayout = new QVBoxLayout(fullscreenWindow_);
-    fullscreenLayout->setContentsMargins(0, 0, 0, 0);
-    fullscreenLayout->setSpacing(0);
-    fullscreenVideoWidget_ = new QVideoWidget(fullscreenWindow_);
-    fullscreenVideoWidget_->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
-    fullscreenVideoWidget_->setStyleSheet("background: #000;");
-    fullscreenVideoWidget_->setAspectRatioMode(Qt::IgnoreAspectRatio);
-    fullscreenLayout->addWidget(fullscreenVideoWidget_);
-    fullscreenWindow_->hide();
-
     videoWidget_->installEventFilter(this);
-    fullscreenWindow_->installEventFilter(this);
-    fullscreenVideoWidget_->installEventFilter(this);
 
     statusBar()->showMessage("Ready");
 
@@ -1845,19 +1899,25 @@ void MainWindow::parseAndStoreLine(const QString &line)
         channelLines_.append(normalizedLine);
     }
 
-    QString provider = "Unknown";
-    if (parts.size() > 10) {
-        provider = parts[10].trimmed();
-        if (provider.isEmpty()) {
-            provider = "Unknown";
-        }
+    const QString channelNumber = xspfNumberByTuneKey_.value(tuneKeyForParts(parts), parts[5].trimmed());
+    const bool sortingEnabled = channelsTable_->isSortingEnabled();
+    const int sortColumn = channelsTable_->horizontalHeader()->sortIndicatorSection();
+    const Qt::SortOrder sortOrder = channelsTable_->horizontalHeader()->sortIndicatorOrder();
+
+    if (sortingEnabled) {
+        channelsTable_->setSortingEnabled(false);
     }
 
     const int row = channelsTable_->rowCount();
     channelsTable_->insertRow(row);
-    channelsTable_->setItem(row, 0, new QTableWidgetItem(channelName));
-    channelsTable_->setItem(row, 1, new QTableWidgetItem(provider));
+    channelsTable_->setItem(row, 0, new QTableWidgetItem(channelNumber));
+    channelsTable_->setItem(row, 1, new QTableWidgetItem(channelName));
     channelsTable_->setItem(row, 2, new QTableWidgetItem(normalizedLine));
+
+    if (sortingEnabled) {
+        channelsTable_->setSortingEnabled(true);
+        channelsTable_->sortItems(sortColumn >= 0 ? sortColumn : 0, sortOrder);
+    }
 }
 
 bool MainWindow::persistChannelsFile()
@@ -1901,7 +1961,7 @@ QString MainWindow::selectedChannelNameFromTable() const
         return {};
     }
     const int row = rows.first().row();
-    const auto *item = channelsTable_->item(row, 0);
+    const auto *item = channelsTable_->item(row, 1);
     if (item == nullptr) {
         return {};
     }
@@ -1992,7 +2052,7 @@ void MainWindow::openMediaFile()
 
     appendLog("player: Opened local media file: " + filePath);
     playbackStatusLabel_->setText(playbackStatusText());
-    statusBar()->showMessage("Playing local file: " + QFileInfo(filePath).fileName());
+    statusBar()->showMessage("Opening local file...");
 }
 
 void MainWindow::openTvGuide()
@@ -2632,7 +2692,7 @@ bool MainWindow::startWatchingChannel(const QString &channelName, bool reconnect
 
     stopWatchButton_->setEnabled(true);
     playbackStatusLabel_->setText(playbackStatusText());
-    statusBar()->showMessage("Watching: " + channelName);
+    statusBar()->showMessage("Starting live playback...");
     return true;
 }
 
@@ -2860,13 +2920,23 @@ QString MainWindow::playbackStatusText() const
     }
 
     const QString stateText = (mediaPlayer_->playbackState() == QMediaPlayer::PlayingState) ? "Playing" : "Buffering";
-    return QString("%1 (%2)").arg(stateText, currentChannelName_);
+    return QString("%1: %2").arg(stateText, currentChannelName_);
 }
 
 void MainWindow::handleMediaStatusChanged(QMediaPlayer::MediaStatus status)
 {
     appendLog(QString("player: mediaStatusChanged=%1").arg(static_cast<int>(status)));
     playbackStatusLabel_->setText(playbackStatusText());
+    if (!currentChannelName_.isEmpty()) {
+        const bool isLocalFile = currentChannelName_.startsWith("File: ");
+        if (status == QMediaPlayer::InvalidMedia) {
+            statusBar()->showMessage(isLocalFile ? "Local file error" : "Playback error");
+        } else if (mediaPlayer_->playbackState() == QMediaPlayer::PlayingState) {
+            statusBar()->showMessage(isLocalFile ? "Playing local file" : "Watching");
+        } else {
+            statusBar()->showMessage(isLocalFile ? "Opening local file..." : "Starting live playback...");
+        }
+    }
     if (!currentChannelName_.isEmpty() && status == QMediaPlayer::InvalidMedia && !userStoppedWatching_) {
         if (tryDynamicBridgeFallback("Media stream became invalid")) {
             return;
@@ -2933,7 +3003,7 @@ void MainWindow::scheduleReconnect(const QString &reason)
     }
     if (reconnectAttemptCount_ >= maxReconnectAttempts_) {
         appendLog("Reconnect failed after maximum attempts.");
-        statusBar()->showMessage("Reconnect failed for " + currentChannelName_);
+        statusBar()->showMessage("Reconnect failed");
         return;
     }
 
@@ -2944,7 +3014,7 @@ void MainWindow::scheduleReconnect(const QString &reason)
                   .arg(maxReconnectAttempts_)
                   .arg(delayMs)
                   .arg(reason));
-    statusBar()->showMessage(QString("Reconnecting to %1...").arg(currentChannelName_));
+    statusBar()->showMessage("Reconnecting...");
     reconnectTimer_->start(delayMs);
 }
 
@@ -2965,6 +3035,8 @@ void MainWindow::handleMuteToggled(bool checked)
 void MainWindow::handleVolumeChanged(int value)
 {
     audioOutput_->setVolume(static_cast<float>(value) / 100.0f);
+    QSettings settings("tv_tuner_gui", "watcher");
+    settings.setValue("volume_percent", value);
 }
 
 void MainWindow::toggleFullscreen()
@@ -2983,14 +3055,11 @@ void MainWindow::handleFullscreenChanged(bool fullScreen)
 
 void MainWindow::enterFullscreen()
 {
-    if (fullscreenActive_ || fullscreenWindow_ == nullptr || fullscreenVideoWidget_ == nullptr) {
+    if (fullscreenActive_ || tabs_ == nullptr || contentSplitter_ == nullptr) {
         return;
     }
 
-    QScreen *targetScreen = nullptr;
-    if (videoWidget_ != nullptr && videoWidget_->windowHandle() != nullptr) {
-        targetScreen = videoWidget_->windowHandle()->screen();
-    }
+    QScreen *targetScreen = screenForWidget(this);
     if (targetScreen == nullptr) {
         targetScreen = QGuiApplication::screenAt(QCursor::pos());
     }
@@ -3001,17 +3070,33 @@ void MainWindow::enterFullscreen()
         return;
     }
 
-    if (fullscreenWindow_->windowHandle() != nullptr) {
-        fullscreenWindow_->windowHandle()->setScreen(targetScreen);
-    }
-    fullscreenWindow_->setGeometry(targetScreen->geometry());
+    wasMaximizedBeforeFullscreen_ = isMaximized();
+    menuBarWasVisibleBeforeFullscreen_ = menuBar()->isVisible();
+    statusBarWasVisibleBeforeFullscreen_ = statusBar()->isVisible();
+    tabBarWasVisibleBeforeFullscreen_ = tabs_->tabBar()->isVisible();
+    previousTabIndex_ = tabs_->currentIndex();
+    splitterHandleWidthBeforeFullscreen_ = contentSplitter_->handleWidth();
+    splitterSizesBeforeFullscreen_ = contentSplitter_->sizes();
+    windowGeometryBeforeFullscreen_ = saveGeometry();
 
-    mediaPlayer_->setVideoOutput(fullscreenVideoWidget_);
-    fullscreenVideoWidget_->setAspectRatioMode(Qt::IgnoreAspectRatio);
-    fullscreenWindow_->showFullScreen();
-    fullscreenWindow_->raise();
-    fullscreenWindow_->activateWindow();
-    fullscreenVideoWidget_->setFocus(Qt::ActiveWindowFocusReason);
+    tabs_->setCurrentWidget(watchPage_);
+    watchControlsContainer_->hide();
+    favoritesContainer_->hide();
+    channelsTable_->hide();
+    tabs_->tabBar()->hide();
+    menuBar()->hide();
+    statusBar()->hide();
+    contentSplitter_->setHandleWidth(0);
+    contentSplitter_->setSizes({1, 0});
+    videoWidget_->setAspectRatioMode(Qt::IgnoreAspectRatio);
+
+    if (windowHandle() != nullptr) {
+        windowHandle()->setScreen(targetScreen);
+    }
+    showFullScreen();
+    raise();
+    activateWindow();
+    videoWidget_->setFocus(Qt::ActiveWindowFocusReason);
     fullscreenActive_ = true;
     handleFullscreenChanged(true);
 }
@@ -3023,10 +3108,43 @@ void MainWindow::exitFullscreen()
     }
 
     fullscreenActive_ = false;
-    if (fullscreenWindow_ != nullptr) {
-        fullscreenWindow_->hide();
+
+    showNormal();
+    if (!windowGeometryBeforeFullscreen_.isEmpty()) {
+        restoreGeometry(windowGeometryBeforeFullscreen_);
     }
-    mediaPlayer_->setVideoOutput(videoWidget_);
+    if (wasMaximizedBeforeFullscreen_) {
+        showMaximized();
+    }
+
+    if (watchControlsContainer_ != nullptr) {
+        watchControlsContainer_->show();
+    }
+    if (favoritesContainer_ != nullptr) {
+        favoritesContainer_->show();
+    }
+    if (channelsTable_ != nullptr) {
+        channelsTable_->show();
+    }
+    if (tabs_ != nullptr) {
+        if (tabBarWasVisibleBeforeFullscreen_) {
+            tabs_->tabBar()->show();
+        }
+        tabs_->setCurrentIndex(previousTabIndex_);
+    }
+    if (menuBarWasVisibleBeforeFullscreen_) {
+        menuBar()->show();
+    }
+    if (statusBarWasVisibleBeforeFullscreen_) {
+        statusBar()->show();
+    }
+    if (!splitterSizesBeforeFullscreen_.isEmpty()) {
+        contentSplitter_->setSizes(splitterSizesBeforeFullscreen_);
+    }
+    if (splitterHandleWidthBeforeFullscreen_ >= 0) {
+        contentSplitter_->setHandleWidth(splitterHandleWidthBeforeFullscreen_);
+    }
+
     videoWidget_->setAspectRatioMode(Qt::KeepAspectRatio);
     videoWidget_->updateGeometry();
     videoWidget_->update();
@@ -3074,6 +3192,7 @@ void MainWindow::loadFavorites()
 
 void MainWindow::loadXspfChannelHints()
 {
+    xspfNumberByTuneKey_.clear();
     xspfProgramByChannel_.clear();
 
     const QString xspfPath = QDir::home().filePath("Desktop/tv.xspf");
@@ -3090,11 +3209,12 @@ void MainWindow::loadXspfChannelHints()
     QXmlStreamReader xml(&file);
     QString currentTitle;
     QString currentProgram;
+    QString currentFrequency;
     bool inTrack = false;
     bool inVlcOption = false;
     QString optionText;
 
-    auto flushTrack = [this, &currentTitle, &currentProgram]() {
+    auto flushTrack = [this, &currentTitle, &currentProgram, &currentFrequency]() {
         if (currentTitle.isEmpty() || currentProgram.isEmpty()) {
             return;
         }
@@ -3102,8 +3222,12 @@ void MainWindow::loadXspfChannelHints()
         if (firstSpace <= 0 || firstSpace >= currentTitle.size() - 1) {
             return;
         }
+        const QString channelNumber = currentTitle.left(firstSpace).trimmed();
         const QString channelName = currentTitle.mid(firstSpace + 1).trimmed();
         if (!channelName.isEmpty()) {
+            if (!channelNumber.isEmpty() && !currentFrequency.isEmpty()) {
+                xspfNumberByTuneKey_.insert(tuneKey(currentFrequency, currentProgram), channelNumber);
+            }
             xspfProgramByChannel_.insert(channelName, currentProgram);
         }
     };
@@ -3116,8 +3240,13 @@ void MainWindow::loadXspfChannelHints()
                 inTrack = true;
                 currentTitle.clear();
                 currentProgram.clear();
+                currentFrequency.clear();
             } else if (inTrack && name == u"title") {
                 currentTitle = xml.readElementText(QXmlStreamReader::SkipChildElements).trimmed();
+            } else if (inTrack && name == u"location") {
+                const QString location = xml.readElementText(QXmlStreamReader::SkipChildElements).trimmed();
+                const QRegularExpressionMatch match = QRegularExpression(QStringLiteral("frequency=(\\d+)")).match(location);
+                currentFrequency = match.hasMatch() ? match.captured(1) : QString();
             } else if (inTrack && name == u"option" && xml.namespaceUri().toString().contains("videolan.org")) {
                 inVlcOption = true;
                 optionText.clear();
@@ -3138,12 +3267,14 @@ void MainWindow::loadXspfChannelHints()
                 inTrack = false;
                 currentTitle.clear();
                 currentProgram.clear();
+                currentFrequency.clear();
             }
         }
     }
 
     if (xml.hasError()) {
         appendLog("Failed to parse XSPF playlist: " + xml.errorString());
+        xspfNumberByTuneKey_.clear();
         xspfProgramByChannel_.clear();
         return;
     }
