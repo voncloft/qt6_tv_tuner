@@ -1,13 +1,17 @@
 #include "MainWindow.h"
+#include "TvGuideDialog.h"
 
 #include <QAbstractItemView>
+#include <QApplication>
 #include <QAudioOutput>
 #include <QComboBox>
 #include <QCloseEvent>
 #include <QDateTime>
 #include <QAction>
 #include <QDir>
+#include <QElapsedTimer>
 #include <QEvent>
+#include <QEventLoop>
 #include <QFile>
 #include <QFileDialog>
 #include <QFileInfo>
@@ -26,6 +30,7 @@
 #include <QMenuBar>
 #include <QMessageBox>
 #include <QPlainTextEdit>
+#include <QProgressDialog>
 #include <QProcess>
 #include <QPushButton>
 #include <QRegularExpression>
@@ -40,6 +45,7 @@
 #include <QTableWidget>
 #include <QTextCursor>
 #include <QTimer>
+#include <QTimeZone>
 #include <QUrl>
 #include <QXmlStreamReader>
 #include <QVBoxLayout>
@@ -48,7 +54,19 @@
 #include <QScreen>
 #include <QWindow>
 #include <QCursor>
+#include <QSet>
+#include <linux/dvb/dmx.h>
+#include <fcntl.h>
+#include <poll.h>
+#include <sys/ioctl.h>
+#include <unistd.h>
+#include <algorithm>
+#include <cmath>
+#include <cerrno>
+#include <cstring>
 #include <functional>
+#include <thread>
+#include <vector>
 
 namespace {
 QString quoteArg(const QString &arg)
@@ -123,6 +141,1162 @@ QString resolveProjectLogPath()
     }
     return cwdDir.filePath("tv_tuner_gui.log");
 }
+
+int firstAvailableFrontendForAdapter(int adapter, int preferredFrontend)
+{
+    const auto frontendPath = [adapter](int frontend) {
+        return QString("/dev/dvb/adapter%1/frontend%2").arg(adapter).arg(frontend);
+    };
+
+    if (preferredFrontend >= 0 && QFileInfo::exists(frontendPath(preferredFrontend))) {
+        return preferredFrontend;
+    }
+
+    for (int frontend = 0; frontend <= 7; ++frontend) {
+        if (QFileInfo::exists(frontendPath(frontend))) {
+            return frontend;
+        }
+    }
+
+    return -1;
+}
+
+bool adapterHasGuideDevices(int adapter)
+{
+    return QFileInfo::exists(QString("/dev/dvb/adapter%1/demux0").arg(adapter))
+           && QFileInfo::exists(QString("/dev/dvb/adapter%1/dvr0").arg(adapter));
+}
+
+int findPreferredGuideAdapter(int preferredFrontend, int &guideFrontend)
+{
+    const QList<int> preferredAdapters = {1, 0};
+    for (int adapter : preferredAdapters) {
+        if (!adapterHasGuideDevices(adapter)) {
+            continue;
+        }
+        const int frontend = firstAvailableFrontendForAdapter(adapter, preferredFrontend);
+        if (frontend >= 0) {
+            guideFrontend = frontend;
+            return adapter;
+        }
+    }
+
+    for (int adapter = 0; adapter <= 32; ++adapter) {
+        if (!adapterHasGuideDevices(adapter)) {
+            continue;
+        }
+        const int frontend = firstAvailableFrontendForAdapter(adapter, preferredFrontend);
+        if (frontend < 0) {
+            continue;
+        }
+        guideFrontend = frontend;
+        return adapter;
+    }
+
+    guideFrontend = -1;
+    return -1;
+}
+
+int findPreferredSeparateGuideAdapter(int currentAdapter, int preferredFrontend, int &guideFrontend)
+{
+    const QList<int> preferredAdapters = {1, 0};
+    for (int adapter : preferredAdapters) {
+        if (adapter == currentAdapter || !adapterHasGuideDevices(adapter)) {
+            continue;
+        }
+        const int frontend = firstAvailableFrontendForAdapter(adapter, preferredFrontend);
+        if (frontend < 0) {
+            continue;
+        }
+        guideFrontend = frontend;
+        return adapter;
+    }
+
+    for (int adapter = 0; adapter <= 32; ++adapter) {
+        if (adapter == currentAdapter || !adapterHasGuideDevices(adapter)) {
+            continue;
+        }
+        const int frontend = firstAvailableFrontendForAdapter(adapter, preferredFrontend);
+        if (frontend < 0) {
+            continue;
+        }
+        guideFrontend = frontend;
+        return adapter;
+    }
+
+    guideFrontend = -1;
+    return -1;
+}
+
+bool findCurrentOrNextGuideEntry(const QList<TvGuideEntry> &entries,
+                                 const QDateTime &momentUtc,
+                                 TvGuideEntry &entry,
+                                 bool &isCurrent)
+{
+    bool foundCurrent = false;
+    bool foundNext = false;
+    TvGuideEntry nextEntry;
+
+    for (const TvGuideEntry &candidate : entries) {
+        if (!candidate.startUtc.isValid() || !candidate.endUtc.isValid() || candidate.endUtc <= candidate.startUtc) {
+            continue;
+        }
+
+        if (candidate.startUtc <= momentUtc && candidate.endUtc > momentUtc) {
+            if (!foundCurrent || candidate.startUtc > entry.startUtc) {
+                entry = candidate;
+                foundCurrent = true;
+            }
+            continue;
+        }
+
+        if (candidate.startUtc > momentUtc) {
+            if (!foundNext || candidate.startUtc < nextEntry.startUtc) {
+                nextEntry = candidate;
+                foundNext = true;
+            }
+        }
+    }
+
+    if (foundCurrent) {
+        isCurrent = true;
+        return true;
+    }
+    if (foundNext) {
+        entry = nextEntry;
+        isCurrent = false;
+        return true;
+    }
+    return false;
+}
+
+QString guideEntryToolTipText(const TvGuideEntry &entry)
+{
+    return QString("%1\n%2 - %3")
+        .arg(entry.title,
+             entry.startUtc.toLocalTime().toString("ddd h:mm AP"),
+             entry.endUtc.toLocalTime().toString("ddd h:mm AP"));
+}
+
+struct GuideChannelInfo {
+    QString name;
+    qint64 frequencyHz{0};
+    int serviceId{-1};
+};
+
+struct RawGuideEvent {
+    int serviceId{-1};
+    QDateTime startUtc;
+    QDateTime endUtc;
+    QString title;
+};
+
+struct SectionAssembler {
+    QByteArray bytes;
+    int expectedLength{-1};
+};
+
+struct ParsedGuideData {
+    QList<RawGuideEvent> events;
+    QHash<int, int> atscSourceToProgram;
+    QSet<int> atscPsipTableIds;
+};
+
+struct DemuxSectionReader {
+    int pid{-1};
+    int fd{-1};
+};
+
+QSet<int> mappedProgramIdsFromParsedGuideData(const ParsedGuideData &parsed);
+bool hasCoverageForAllExpectedServices(const ParsedGuideData &parsed, const QSet<int> &expectedServiceIds);
+
+constexpr int kAtscPsipPid = 0x1ffb;
+constexpr int kDvbEitPid = 0x0012;
+constexpr qint64 kGpsEpochToUnixOffset = 315964800;
+constexpr qint64 kDefaultGpsUtcOffset = 18;
+constexpr int kTsPacketSize = 188;
+constexpr int kGuideCaptureMinMs = 1000;
+constexpr int kGuideCaptureMaxMs = 3600;
+constexpr int kGuideLookupTotalMaxMs = 4000;
+constexpr int kGuideProbeIntervalMs = 350;
+constexpr int kGuideCapturePacketCount = 60000;
+
+quint8 byteAt(const QByteArray &data, int index)
+{
+    return static_cast<quint8>(data.at(index));
+}
+
+QString cleanGuideText(const QString &input)
+{
+    QString text = input;
+    text.replace('\n', ' ');
+    text.replace('\r', ' ');
+    text.remove(QRegularExpression(QStringLiteral("[\\x00-\\x1F\\x7F]")));
+    return text.simplified();
+}
+
+QString decodeAtscMultipleString(const QByteArray &payload)
+{
+    if (payload.isEmpty()) {
+        return {};
+    }
+
+    int offset = 0;
+    const int numberStrings = byteAt(payload, offset++);
+    QStringList fragments;
+
+    for (int i = 0; i < numberStrings && offset < payload.size(); ++i) {
+        if (offset + 4 > payload.size()) {
+            break;
+        }
+        offset += 3; // ISO-639 language code
+        const int segmentCount = byteAt(payload, offset++);
+        QString composed;
+
+        for (int segment = 0; segment < segmentCount && offset < payload.size(); ++segment) {
+            if (offset + 3 > payload.size()) {
+                offset = payload.size();
+                break;
+            }
+
+            const int compressionType = byteAt(payload, offset++);
+            const int mode = byteAt(payload, offset++);
+            const int length = byteAt(payload, offset++);
+            if (offset + length > payload.size()) {
+                offset = payload.size();
+                break;
+            }
+
+            const QByteArray segmentBytes = payload.mid(offset, length);
+            offset += length;
+            if (compressionType != 0) {
+                continue;
+            }
+
+            QString decoded;
+            if (mode == 0x00 || mode == 0x3f || mode == 0x3e) {
+                decoded = QString::fromLatin1(segmentBytes);
+            } else {
+                decoded = QString::fromUtf8(segmentBytes);
+                if (decoded.contains(QChar::ReplacementCharacter)) {
+                    decoded = QString::fromLatin1(segmentBytes);
+                }
+            }
+            composed += decoded;
+        }
+
+        composed = cleanGuideText(composed);
+        if (!composed.isEmpty()) {
+            fragments << composed;
+        }
+    }
+
+    if (fragments.isEmpty()) {
+        return cleanGuideText(QString::fromLatin1(payload));
+    }
+    return fragments.join(" / ");
+}
+
+int bcdToInt(quint8 value)
+{
+    return ((value >> 4) & 0x0f) * 10 + (value & 0x0f);
+}
+
+QDateTime atscGpsToUtc(quint32 gpsSeconds)
+{
+    const qint64 unixSeconds = static_cast<qint64>(gpsSeconds) + kGpsEpochToUnixOffset - kDefaultGpsUtcOffset;
+    return QDateTime::fromSecsSinceEpoch(unixSeconds, QTimeZone::UTC);
+}
+
+QDate mjdToDate(int mjd)
+{
+    const int y = static_cast<int>((mjd - 15078.2) / 365.25);
+    const int m = static_cast<int>((mjd - 14956.1 - static_cast<int>(y * 365.25)) / 30.6001);
+    const int d = mjd - 14956 - static_cast<int>(y * 365.25) - static_cast<int>(m * 30.6001);
+    const int k = (m == 14 || m == 15) ? 1 : 0;
+    const int year = y + k + 1900;
+    const int month = m - 1 - (k * 12);
+    return QDate(year, month, d);
+}
+
+QDateTime decodeDvbUtcTime(const QByteArray &eventData)
+{
+    if (eventData.size() < 5) {
+        return {};
+    }
+    if (byteAt(eventData, 0) == 0xff && byteAt(eventData, 1) == 0xff) {
+        return {};
+    }
+
+    const int mjd = (byteAt(eventData, 0) << 8) | byteAt(eventData, 1);
+    const QDate date = mjdToDate(mjd);
+    const QTime time(bcdToInt(byteAt(eventData, 2)),
+                     bcdToInt(byteAt(eventData, 3)),
+                     bcdToInt(byteAt(eventData, 4)));
+    if (!date.isValid() || !time.isValid()) {
+        return {};
+    }
+    return QDateTime(date, time, QTimeZone::UTC);
+}
+
+QString decodeDvbText(const QByteArray &data)
+{
+    if (data.isEmpty()) {
+        return {};
+    }
+
+    int offset = 0;
+    if (byteAt(data, 0) < 0x20) {
+        offset = 1;
+    }
+    const QByteArray payload = data.mid(offset);
+    QString text = QString::fromUtf8(payload);
+    if (text.contains(QChar::ReplacementCharacter)) {
+        text = QString::fromLatin1(payload);
+    }
+    return cleanGuideText(text);
+}
+
+QString formatTableIdSet(const QSet<int> &tableIds)
+{
+    if (tableIds.isEmpty()) {
+        return {};
+    }
+
+    QList<int> sorted = tableIds.values();
+    std::sort(sorted.begin(), sorted.end());
+
+    QStringList labels;
+    for (int id : sorted) {
+        labels << QString("0x%1").arg(id, 2, 16, QChar('0')).toUpper();
+    }
+    return labels.join(", ");
+}
+
+void appendAtscSourceMapFromVctSection(const QByteArray &section, QHash<int, int> &sourceToProgram)
+{
+    if (section.size() < 16) {
+        return;
+    }
+    const quint8 tableId = byteAt(section, 0);
+    if (tableId != 0xc8 && tableId != 0xc9) {
+        return;
+    }
+
+    const int sectionLength = ((byteAt(section, 1) & 0x0f) << 8) | byteAt(section, 2);
+    const int payloadEnd = 3 + sectionLength - 4; // Exclude CRC32
+    if (payloadEnd <= 10 || payloadEnd > section.size()) {
+        return;
+    }
+
+    const int numberChannels = byteAt(section, 9);
+    int offset = 10;
+
+    for (int i = 0; i < numberChannels; ++i) {
+        if (offset + 42 > payloadEnd) {
+            break;
+        }
+
+        const int programNumber = (byteAt(section, offset + 24) << 8) | byteAt(section, offset + 25);
+        const int sourceId = (byteAt(section, offset + 28) << 8) | byteAt(section, offset + 29);
+        const int descriptorsLength = ((byteAt(section, offset + 30) & 0x03) << 8) | byteAt(section, offset + 31);
+        const int nextOffset = offset + 32 + descriptorsLength;
+        if (nextOffset > payloadEnd) {
+            break;
+        }
+
+        if (sourceId > 0 && programNumber > 0 && !sourceToProgram.contains(sourceId)) {
+            sourceToProgram.insert(sourceId, programNumber);
+        }
+        offset = nextOffset;
+    }
+}
+
+void appendAtscPsipPidsFromMgtSection(const QByteArray &section, QSet<int> &atscPsipPids)
+{
+    if (section.size() < 16 || byteAt(section, 0) != 0xc7) {
+        return;
+    }
+
+    const int sectionLength = ((byteAt(section, 1) & 0x0f) << 8) | byteAt(section, 2);
+    const int payloadEnd = 3 + sectionLength - 4; // Exclude CRC32
+    if (payloadEnd <= 11 || payloadEnd > section.size()) {
+        return;
+    }
+
+    const int tablesDefined = (byteAt(section, 9) << 8) | byteAt(section, 10);
+    int offset = 11;
+
+    for (int i = 0; i < tablesDefined; ++i) {
+        if (offset + 11 > payloadEnd) {
+            break;
+        }
+
+        const int tablePid = ((byteAt(section, offset + 2) & 0x1f) << 8) | byteAt(section, offset + 3);
+        const int descriptorsLength = ((byteAt(section, offset + 9) & 0x0f) << 8) | byteAt(section, offset + 10);
+        const int nextOffset = offset + 11 + descriptorsLength;
+        if (nextOffset > payloadEnd) {
+            break;
+        }
+
+        if (tablePid > 0 && tablePid < 8192) {
+            atscPsipPids.insert(tablePid);
+        }
+        offset = nextOffset;
+    }
+}
+
+void appendAtscEventsFromSection(const QByteArray &section, QList<RawGuideEvent> &events, QSet<QString> &dedupe)
+{
+    if (section.size() < 14 || byteAt(section, 0) != 0xcb) {
+        return;
+    }
+
+    const int sectionLength = ((byteAt(section, 1) & 0x0f) << 8) | byteAt(section, 2);
+    const int payloadEnd = 3 + sectionLength - 4; // Exclude CRC32
+    if (payloadEnd <= 10 || payloadEnd > section.size()) {
+        return;
+    }
+
+    const int sourceId = (byteAt(section, 3) << 8) | byteAt(section, 4);
+    const int numberEvents = byteAt(section, 9);
+    int offset = 10;
+
+    for (int i = 0; i < numberEvents && offset + 12 <= payloadEnd; ++i) {
+        const quint32 startGps = (static_cast<quint32>(byteAt(section, offset + 2)) << 24)
+                                 | (static_cast<quint32>(byteAt(section, offset + 3)) << 16)
+                                 | (static_cast<quint32>(byteAt(section, offset + 4)) << 8)
+                                 | static_cast<quint32>(byteAt(section, offset + 5));
+        const int durationSeconds = ((byteAt(section, offset + 6) & 0x0f) << 16)
+                                    | (byteAt(section, offset + 7) << 8)
+                                    | byteAt(section, offset + 8);
+        const int titleLength = byteAt(section, offset + 9);
+        offset += 10;
+
+        if (offset + titleLength > payloadEnd) {
+            break;
+        }
+        const QString title = decodeAtscMultipleString(section.mid(offset, titleLength));
+        offset += titleLength;
+
+        if (offset + 2 > payloadEnd) {
+            break;
+        }
+        const int descriptorsLength = ((byteAt(section, offset) & 0x0f) << 8) | byteAt(section, offset + 1);
+        offset += 2;
+        if (offset + descriptorsLength > payloadEnd) {
+            break;
+        }
+        offset += descriptorsLength;
+
+        const QDateTime startUtc = atscGpsToUtc(startGps);
+        const QDateTime endUtc = startUtc.addSecs(durationSeconds);
+        const QString cleanedTitle = cleanGuideText(title);
+        if (!startUtc.isValid() || !endUtc.isValid() || endUtc <= startUtc || cleanedTitle.isEmpty()) {
+            continue;
+        }
+
+        const QString key = QString("%1|%2|%3")
+                                .arg(sourceId)
+                                .arg(startUtc.toSecsSinceEpoch())
+                                .arg(cleanedTitle);
+        if (dedupe.contains(key)) {
+            continue;
+        }
+        dedupe.insert(key);
+
+        RawGuideEvent event;
+        event.serviceId = sourceId;
+        event.startUtc = startUtc;
+        event.endUtc = endUtc;
+        event.title = cleanedTitle;
+        events.append(event);
+    }
+}
+
+void appendDvbEventsFromSection(const QByteArray &section, QList<RawGuideEvent> &events, QSet<QString> &dedupe)
+{
+    if (section.size() < 18) {
+        return;
+    }
+
+    const quint8 tableId = byteAt(section, 0);
+    if (tableId < 0x4e || tableId > 0x6f) {
+        return;
+    }
+
+    const int sectionLength = ((byteAt(section, 1) & 0x0f) << 8) | byteAt(section, 2);
+    const int payloadEnd = 3 + sectionLength - 4; // Exclude CRC32
+    if (payloadEnd <= 14 || payloadEnd > section.size()) {
+        return;
+    }
+
+    const int serviceId = (byteAt(section, 3) << 8) | byteAt(section, 4);
+    int offset = 14;
+
+    while (offset + 12 <= payloadEnd) {
+        const QDateTime startUtc = decodeDvbUtcTime(section.mid(offset + 2, 5));
+        const int durationSeconds = bcdToInt(byteAt(section, offset + 7)) * 3600
+                                    + bcdToInt(byteAt(section, offset + 8)) * 60
+                                    + bcdToInt(byteAt(section, offset + 9));
+        const int descriptorsLength = ((byteAt(section, offset + 10) & 0x0f) << 8) | byteAt(section, offset + 11);
+        const int descriptorsStart = offset + 12;
+        const int descriptorsEnd = descriptorsStart + descriptorsLength;
+        if (descriptorsEnd > payloadEnd) {
+            break;
+        }
+
+        QString title;
+        int descriptorOffset = descriptorsStart;
+        while (descriptorOffset + 2 <= descriptorsEnd) {
+            const quint8 descriptorTag = byteAt(section, descriptorOffset);
+            const int descriptorLength = byteAt(section, descriptorOffset + 1);
+            const int descriptorPayloadOffset = descriptorOffset + 2;
+            const int descriptorEnd = descriptorPayloadOffset + descriptorLength;
+            if (descriptorEnd > descriptorsEnd) {
+                break;
+            }
+
+            if (descriptorTag == 0x4d && descriptorLength >= 5) {
+                const int eventNameLength = byteAt(section, descriptorPayloadOffset + 3);
+                const int eventNameOffset = descriptorPayloadOffset + 4;
+                if (eventNameOffset + eventNameLength <= descriptorEnd) {
+                    title = decodeDvbText(section.mid(eventNameOffset, eventNameLength));
+                }
+            }
+            descriptorOffset = descriptorEnd;
+        }
+
+        if (!title.isEmpty() && startUtc.isValid() && durationSeconds > 0) {
+            const QDateTime endUtc = startUtc.addSecs(durationSeconds);
+            const QString key = QString("%1|%2|%3")
+                                    .arg(serviceId)
+                                    .arg(startUtc.toSecsSinceEpoch())
+                                    .arg(title);
+            if (!dedupe.contains(key)) {
+                dedupe.insert(key);
+                RawGuideEvent event;
+                event.serviceId = serviceId;
+                event.startUtc = startUtc;
+                event.endUtc = endUtc;
+                event.title = title;
+                events.append(event);
+            }
+        }
+
+        offset = descriptorsEnd;
+    }
+}
+
+ParsedGuideData parseGuideEventsFromTransport(const QByteArray &transport)
+{
+    ParsedGuideData parsed;
+    QSet<QString> dedupe;
+    QHash<int, SectionAssembler> sectionsByPid;
+    QSet<int> atscPsipPids;
+    atscPsipPids.insert(kAtscPsipPid);
+
+    auto processSection = [&](int pid, const QByteArray &section) {
+        if (section.size() < 3) {
+            return;
+        }
+
+        if (atscPsipPids.contains(pid)) {
+            parsed.atscPsipTableIds.insert(byteAt(section, 0));
+            appendAtscPsipPidsFromMgtSection(section, atscPsipPids);
+            appendAtscSourceMapFromVctSection(section, parsed.atscSourceToProgram);
+            appendAtscEventsFromSection(section, parsed.events, dedupe);
+        } else if (pid == kDvbEitPid) {
+            appendDvbEventsFromSection(section, parsed.events, dedupe);
+        }
+    };
+
+    auto drainAssembler = [&](int pid, SectionAssembler &assembler) {
+        while (true) {
+            while (!assembler.bytes.isEmpty() && byteAt(assembler.bytes, 0) == 0xff) {
+                assembler.bytes.remove(0, 1);
+                assembler.expectedLength = -1;
+            }
+
+            if (assembler.bytes.size() < 3) {
+                return;
+            }
+
+            if (assembler.expectedLength < 0) {
+                const int sectionLength = ((byteAt(assembler.bytes, 1) & 0x0f) << 8)
+                                          | byteAt(assembler.bytes, 2);
+                assembler.expectedLength = 3 + sectionLength;
+                if (assembler.expectedLength <= 0 || assembler.expectedLength > 4096) {
+                    assembler.bytes.clear();
+                    assembler.expectedLength = -1;
+                    return;
+                }
+            }
+
+            if (assembler.bytes.size() < assembler.expectedLength) {
+                return;
+            }
+
+            const QByteArray section = assembler.bytes.left(assembler.expectedLength);
+            assembler.bytes.remove(0, assembler.expectedLength);
+            assembler.expectedLength = -1;
+            processSection(pid, section);
+        }
+    };
+
+    for (int offset = 0; offset + kTsPacketSize <= transport.size(); offset += kTsPacketSize) {
+        const auto *packet = reinterpret_cast<const unsigned char *>(transport.constData() + offset);
+        if (packet[0] != 0x47) {
+            continue;
+        }
+
+        const int pid = ((packet[1] & 0x1f) << 8) | packet[2];
+        if (pid != kDvbEitPid && !atscPsipPids.contains(pid)) {
+            continue;
+        }
+
+        const bool payloadUnitStart = (packet[1] & 0x40) != 0;
+        const int adaptationControl = (packet[3] >> 4) & 0x03;
+        if (adaptationControl == 0 || adaptationControl == 2) {
+            continue;
+        }
+
+        int payloadOffset = 4;
+        if (adaptationControl == 3) {
+            payloadOffset += 1 + packet[4];
+        }
+        if (payloadOffset >= kTsPacketSize) {
+            continue;
+        }
+
+        QByteArray payload(reinterpret_cast<const char *>(packet + payloadOffset),
+                           kTsPacketSize - payloadOffset);
+        SectionAssembler &assembler = sectionsByPid[pid];
+        if (payload.isEmpty()) {
+            continue;
+        }
+
+        if (payloadUnitStart) {
+            const int pointerField = byteAt(payload, 0);
+            const int continuationLength = std::min(pointerField, static_cast<int>(payload.size()) - 1);
+            if (continuationLength > 0) {
+                assembler.bytes.append(payload.mid(1, continuationLength));
+                drainAssembler(pid, assembler);
+            }
+
+            const int payloadStart = 1 + pointerField;
+            if (payloadStart >= payload.size()) {
+                continue;
+            }
+            payload = payload.mid(payloadStart);
+            assembler.bytes.append(payload);
+            drainAssembler(pid, assembler);
+            continue;
+        }
+
+        assembler.bytes.append(payload);
+        drainAssembler(pid, assembler);
+    }
+
+    return parsed;
+}
+
+void processGuideSectionForPid(int pid,
+                               const QByteArray &section,
+                               ParsedGuideData &parsed,
+                               QSet<QString> &dedupe,
+                               QSet<int> &atscPsipPids)
+{
+    if (section.size() < 3) {
+        return;
+    }
+
+    if (atscPsipPids.contains(pid)) {
+        parsed.atscPsipTableIds.insert(byteAt(section, 0));
+        appendAtscPsipPidsFromMgtSection(section, atscPsipPids);
+        appendAtscSourceMapFromVctSection(section, parsed.atscSourceToProgram);
+        appendAtscEventsFromSection(section, parsed.events, dedupe);
+    } else if (pid == kDvbEitPid) {
+        appendDvbEventsFromSection(section, parsed.events, dedupe);
+    }
+}
+
+int openDemuxSectionFilter(const QString &demuxPath, int pid, QString &errorText)
+{
+    const QByteArray pathBytes = QFile::encodeName(demuxPath);
+    const int fd = ::open(pathBytes.constData(), O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+    if (fd < 0) {
+        errorText = QString("Failed to open %1 for PID 0x%2 (%3)")
+                        .arg(demuxPath)
+                        .arg(pid, 0, 16)
+                        .arg(QString::fromLocal8Bit(std::strerror(errno)));
+        return -1;
+    }
+
+    const int bufferSize = 256 * 1024;
+    ::ioctl(fd, DMX_SET_BUFFER_SIZE, bufferSize);
+
+    dmx_sct_filter_params params{};
+    params.pid = static_cast<__u16>(pid);
+    params.timeout = 0;
+    params.flags = DMX_IMMEDIATE_START;
+    if (::ioctl(fd, DMX_SET_FILTER, &params) < 0) {
+        errorText = QString("Failed to start demux section filter on %1 for PID 0x%2 (%3)")
+                        .arg(demuxPath)
+                        .arg(pid, 0, 16)
+                        .arg(QString::fromLocal8Bit(std::strerror(errno)));
+        ::close(fd);
+        return -1;
+    }
+
+    return fd;
+}
+
+bool captureGuideEventsFromDemux(int adapter,
+                                 const QString &contextName,
+                                 const QSet<int> &expectedServiceIds,
+                                 QList<RawGuideEvent> &events,
+                                 QHash<int, int> &atscSourceToProgram,
+                                 QSet<int> &atscPsipTableIds,
+                                 QString &errorText,
+                                 int maxCaptureMs = kGuideCaptureMaxMs)
+{
+    events.clear();
+    atscSourceToProgram.clear();
+    atscPsipTableIds.clear();
+    errorText.clear();
+
+    const int effectiveCaptureMaxMs = std::max(250, maxCaptureMs);
+    const int captureMinMs = std::min(kGuideCaptureMinMs, effectiveCaptureMaxMs);
+
+    const QString demuxPath = QString("/dev/dvb/adapter%1/demux0").arg(adapter);
+    QList<DemuxSectionReader> readers;
+    QSet<int> activePids;
+    ParsedGuideData parsed;
+    QSet<QString> dedupe;
+    QSet<int> discoveredAtscPids{ kAtscPsipPid };
+    int sectionsRead = 0;
+
+    auto closeReaders = [&readers]() {
+        for (const DemuxSectionReader &reader : readers) {
+            if (reader.fd >= 0) {
+                ::close(reader.fd);
+            }
+        }
+    };
+
+    auto ensureReader = [&](int pid) {
+        if (activePids.contains(pid)) {
+            return true;
+        }
+        QString openError;
+        const int fd = openDemuxSectionFilter(demuxPath, pid, openError);
+        if (fd < 0) {
+            if (errorText.isEmpty()) {
+                errorText = openError;
+            }
+            return false;
+        }
+        DemuxSectionReader reader;
+        reader.pid = pid;
+        reader.fd = fd;
+        readers.append(reader);
+        activePids.insert(pid);
+        return true;
+    };
+
+    ensureReader(kAtscPsipPid);
+    ensureReader(kDvbEitPid);
+
+    QElapsedTimer captureTimer;
+    captureTimer.start();
+    qint64 lastProgressMs = 0;
+    int bestMappedServiceCount = 0;
+
+    while (captureTimer.elapsed() < effectiveCaptureMaxMs) {
+        const QList<int> pendingAtscPids = discoveredAtscPids.values();
+        for (int pid : pendingAtscPids) {
+            ensureReader(pid);
+        }
+        if (readers.isEmpty()) {
+            break;
+        }
+
+        std::vector<pollfd> pollFds;
+        pollFds.reserve(static_cast<size_t>(readers.size()));
+        for (const DemuxSectionReader &reader : readers) {
+            pollfd pfd{};
+            pfd.fd = reader.fd;
+            pfd.events = POLLIN;
+            pollFds.push_back(pfd);
+        }
+
+        const qint64 remainingMs = effectiveCaptureMaxMs - captureTimer.elapsed();
+        const int pollTimeoutMs = static_cast<int>(std::max<qint64>(1, std::min<qint64>(kGuideProbeIntervalMs, remainingMs)));
+        const int pollResult = ::poll(pollFds.data(),
+                                      static_cast<nfds_t>(pollFds.size()),
+                                      pollTimeoutMs);
+        if (pollResult < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            errorText = QString("Demux poll failed for %1 (%2)")
+                            .arg(contextName, QString::fromLocal8Bit(std::strerror(errno)));
+            break;
+        }
+
+        bool sawNewSection = false;
+        if (pollResult > 0) {
+            for (int i = 0; i < readers.size(); ++i) {
+                if ((pollFds[static_cast<size_t>(i)].revents & POLLIN) == 0) {
+                    continue;
+                }
+
+                while (true) {
+                    char buffer[4096];
+                    const ssize_t bytesRead = ::read(readers.at(i).fd, buffer, sizeof(buffer));
+                    if (bytesRead <= 0) {
+                        if (bytesRead < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+                            errorText = QString("Demux read failed for %1 on PID 0x%2 (%3)")
+                                            .arg(contextName)
+                                            .arg(readers.at(i).pid, 0, 16)
+                                            .arg(QString::fromLocal8Bit(std::strerror(errno)));
+                        }
+                        break;
+                    }
+
+                    ++sectionsRead;
+                    sawNewSection = true;
+                    processGuideSectionForPid(readers.at(i).pid,
+                                              QByteArray(buffer, static_cast<int>(bytesRead)),
+                                              parsed,
+                                              dedupe,
+                                              discoveredAtscPids);
+                }
+            }
+        }
+
+        const qint64 elapsedMs = captureTimer.elapsed();
+        if (sawNewSection || elapsedMs >= captureMinMs) {
+            const int mappedServiceCount = mappedProgramIdsFromParsedGuideData(parsed).size();
+            if (mappedServiceCount > bestMappedServiceCount
+                || !parsed.atscSourceToProgram.isEmpty()
+                || !parsed.events.isEmpty()) {
+                bestMappedServiceCount = std::max(bestMappedServiceCount, mappedServiceCount);
+                lastProgressMs = elapsedMs;
+            }
+
+            if (hasCoverageForAllExpectedServices(parsed, expectedServiceIds)) {
+                break;
+            }
+
+            if (!parsed.events.isEmpty()
+                && !parsed.atscSourceToProgram.isEmpty()
+                && elapsedMs >= 2200
+                && elapsedMs - lastProgressMs >= 900) {
+                break;
+            }
+        }
+    }
+
+    closeReaders();
+
+    events = parsed.events;
+    atscSourceToProgram = parsed.atscSourceToProgram;
+    atscPsipTableIds = parsed.atscPsipTableIds;
+
+    if (sectionsRead == 0) {
+        if (errorText.isEmpty()) {
+            errorText = QString("No PSI/EIT sections read from %1 for %2").arg(demuxPath, contextName);
+        }
+        return false;
+    }
+
+    if (events.isEmpty()) {
+        const QString tables = formatTableIdSet(atscPsipTableIds);
+        errorText = QString("No EIT events decoded for %1 from demux0 (PSIP tables seen: %2)")
+                        .arg(contextName, tables.isEmpty() ? "none" : tables);
+    }
+
+    return true;
+}
+
+QSet<int> mappedProgramIdsFromParsedGuideData(const ParsedGuideData &parsed)
+{
+    QSet<int> mappedPrograms;
+    for (const RawGuideEvent &event : parsed.events) {
+        int mappedServiceId = event.serviceId;
+        if (parsed.atscSourceToProgram.contains(mappedServiceId)) {
+            mappedServiceId = parsed.atscSourceToProgram.value(mappedServiceId);
+        }
+        if (mappedServiceId > 0) {
+            mappedPrograms.insert(mappedServiceId);
+        }
+    }
+    return mappedPrograms;
+}
+
+bool hasCoverageForAllExpectedServices(const ParsedGuideData &parsed, const QSet<int> &expectedServiceIds)
+{
+    if (expectedServiceIds.isEmpty()) {
+        return false;
+    }
+    const QSet<int> mappedPrograms = mappedProgramIdsFromParsedGuideData(parsed);
+    for (int expectedServiceId : expectedServiceIds) {
+        if (!mappedPrograms.contains(expectedServiceId)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+QVector<GuideChannelInfo> parseGuideChannels(const QStringList &channelLines)
+{
+    QVector<GuideChannelInfo> channels;
+    QSet<QString> dedupe;
+
+    for (const QString &line : channelLines) {
+        const QStringList parts = line.split(':');
+        if (parts.size() < 6) {
+            continue;
+        }
+
+        const QString name = parts[0].trimmed();
+        bool freqOk = false;
+        bool serviceOk = false;
+        const qint64 frequencyHz = parts[1].trimmed().toLongLong(&freqOk);
+        const int serviceId = parts[5].trimmed().toInt(&serviceOk, 0);
+        if (name.isEmpty() || !freqOk || frequencyHz <= 0 || !serviceOk || serviceId <= 0) {
+            continue;
+        }
+
+        const QString key = QString("%1|%2|%3").arg(name).arg(frequencyHz).arg(serviceId);
+        if (dedupe.contains(key)) {
+            continue;
+        }
+        dedupe.insert(key);
+
+        GuideChannelInfo info;
+        info.name = name;
+        info.frequencyHz = frequencyHz;
+        info.serviceId = serviceId;
+        channels.append(info);
+    }
+
+    return channels;
+}
+
+bool captureGuideEventsFromDvr(const QString &dvrPath,
+                               const QString &contextName,
+                               const QSet<int> &expectedServiceIds,
+                               bool dvrReadyObserved,
+                               QList<RawGuideEvent> &events,
+                               QHash<int, int> &atscSourceToProgram,
+                               QSet<int> &atscPsipTableIds,
+                               QString &errorText)
+{
+    events.clear();
+    atscSourceToProgram.clear();
+    atscPsipTableIds.clear();
+    errorText.clear();
+
+    const QString timeoutExe = QStandardPaths::findExecutable("timeout");
+    const QString ddExe = QStandardPaths::findExecutable("dd");
+    if (timeoutExe.isEmpty() || ddExe.isEmpty()) {
+        errorText = "The guide capture path requires timeout and dd in PATH.";
+        return false;
+    }
+
+    QByteArray transport;
+    transport.reserve(10 * 1024 * 1024);
+    ParsedGuideData parsed;
+    QProcess captureProcess;
+    captureProcess.setProcessChannelMode(QProcess::SeparateChannels);
+    QStringList captureArgs;
+    captureArgs << QString::number(std::max(1, kGuideCaptureMaxMs / 1000)) + "s"
+                << ddExe
+                << QString("if=%1").arg(dvrPath)
+                << QString("bs=%1").arg(kTsPacketSize)
+                << QString("count=%1").arg(kGuideCapturePacketCount)
+                << "status=none";
+    captureProcess.start(timeoutExe, captureArgs);
+    if (!captureProcess.waitForStarted(1200)) {
+        errorText = QString("Failed to start capture process for %1 (%2)")
+                        .arg(contextName, captureProcess.errorString());
+        return false;
+    }
+
+    auto stopCapture = [&captureProcess]() {
+        if (captureProcess.state() == QProcess::NotRunning) {
+            return;
+        }
+        captureProcess.terminate();
+        if (!captureProcess.waitForFinished(800)) {
+            captureProcess.kill();
+            captureProcess.waitForFinished(800);
+        }
+    };
+
+    QElapsedTimer captureTimer;
+    captureTimer.start();
+    qint64 lastProbeMs = 0;
+    qint64 lastProgressMs = 0;
+    int bestMappedServiceCount = 0;
+    while (captureTimer.elapsed() < kGuideCaptureMaxMs && captureProcess.state() != QProcess::NotRunning) {
+        captureProcess.waitForReadyRead(220);
+        const QByteArray chunk = captureProcess.readAllStandardOutput();
+        if (!chunk.isEmpty()) {
+            transport.append(chunk);
+            if (transport.size() >= 28 * 1024 * 1024) {
+                break;
+            }
+        }
+
+        const qint64 elapsedMs = captureTimer.elapsed();
+        if (elapsedMs >= kGuideCaptureMinMs
+            && elapsedMs - lastProbeMs >= kGuideProbeIntervalMs
+            && transport.size() >= 188 * 1200) {
+            lastProbeMs = elapsedMs;
+            parsed = parseGuideEventsFromTransport(transport);
+            const int mappedServiceCount = mappedProgramIdsFromParsedGuideData(parsed).size();
+            if (mappedServiceCount > bestMappedServiceCount || parsed.atscSourceToProgram.size() > 0) {
+                bestMappedServiceCount = std::max(bestMappedServiceCount, mappedServiceCount);
+                lastProgressMs = elapsedMs;
+            }
+
+            if (hasCoverageForAllExpectedServices(parsed, expectedServiceIds)) {
+                break;
+            }
+
+            if (!parsed.events.isEmpty()
+                && !parsed.atscSourceToProgram.isEmpty()
+                && elapsedMs >= 2200
+                && elapsedMs - lastProgressMs >= 900) {
+                break;
+            }
+        }
+    }
+
+    transport.append(captureProcess.readAllStandardOutput());
+    const QString captureErrors = QString::fromUtf8(captureProcess.readAllStandardError());
+    stopCapture();
+
+    if (transport.isEmpty()) {
+        errorText = QString("No transport data read from %1 for %2")
+                        .arg(dvrPath, contextName);
+        if (!captureErrors.trimmed().isEmpty()) {
+            errorText += QString(" (%1)").arg(captureErrors.trimmed());
+        }
+        return false;
+    }
+
+    if (parsed.events.isEmpty() && parsed.atscSourceToProgram.isEmpty() && parsed.atscPsipTableIds.isEmpty()) {
+        parsed = parseGuideEventsFromTransport(transport);
+    }
+    events = parsed.events;
+    atscSourceToProgram = parsed.atscSourceToProgram;
+    atscPsipTableIds = parsed.atscPsipTableIds;
+    if (events.isEmpty()) {
+        const QString tables = formatTableIdSet(atscPsipTableIds);
+        errorText = dvrReadyObserved
+                        ? QString("No EIT events decoded for %1 (PSIP tables seen: %2)")
+                              .arg(contextName, tables.isEmpty() ? "none" : tables)
+                        : QString("No EIT events decoded for %1 (DVR ready signal not observed)")
+                              .arg(contextName);
+    }
+    return true;
+}
+
+bool captureGuideEventsForChannel(const QString &channelsFilePath,
+                                  int adapter,
+                                  int frontend,
+                                  const QString &channelName,
+                                  const QSet<int> &expectedServiceIds,
+                                  QList<RawGuideEvent> &events,
+                                  QHash<int, int> &atscSourceToProgram,
+                                  QSet<int> &atscPsipTableIds,
+                                  QString &errorText,
+                                  int totalTimeoutMs = kGuideLookupTotalMaxMs)
+{
+    events.clear();
+    atscSourceToProgram.clear();
+    atscPsipTableIds.clear();
+    errorText.clear();
+
+    const int effectiveTotalTimeoutMs = std::max(1000, totalTimeoutMs);
+
+    const QString zapExe = QStandardPaths::findExecutable("dvbv5-zap");
+    if (zapExe.isEmpty()) {
+        errorText = "dvbv5-zap is not available in PATH.";
+        return false;
+    }
+
+    QElapsedTimer lookupTimer;
+    lookupTimer.start();
+
+    QProcess zapProcess;
+    zapProcess.setProcessChannelMode(QProcess::SeparateChannels);
+    QStringList args;
+    args << "-I" << "ZAP"
+         << "-c" << channelsFilePath
+         << "-a" << QString::number(adapter)
+         << "-f" << QString::number(frontend)
+         << "-t" << QString::number(std::max(1, (effectiveTotalTimeoutMs + 999) / 1000))
+         << channelName;
+    zapProcess.start(zapExe, args);
+    if (!zapProcess.waitForStarted(std::min(1500, effectiveTotalTimeoutMs))) {
+        errorText = QString("Failed to start dvbv5-zap for %1 (%2)")
+                        .arg(channelName, zapProcess.errorString());
+        return false;
+    }
+
+    auto stopZap = [&zapProcess]() {
+        zapProcess.terminate();
+        if (!zapProcess.waitForFinished(1200)) {
+            zapProcess.kill();
+            zapProcess.waitForFinished(1200);
+        }
+    };
+
+    QString zapErrors;
+
+    const int remainingCaptureMs = std::max(0, effectiveTotalTimeoutMs - static_cast<int>(lookupTimer.elapsed()));
+    if (remainingCaptureMs <= 0) {
+        stopZap();
+        errorText = QString("Stopped EIT lookup for %1 after %2 ms without receiving any guide sections.")
+                        .arg(channelName)
+                        .arg(effectiveTotalTimeoutMs);
+        return false;
+    }
+
+    const bool captured = captureGuideEventsFromDemux(adapter,
+                                                      channelName,
+                                                      expectedServiceIds,
+                                                      events,
+                                                      atscSourceToProgram,
+                                                      atscPsipTableIds,
+                                                      errorText,
+                                                      remainingCaptureMs);
+    stopZap();
+    zapErrors += QString::fromUtf8(zapProcess.readAllStandardError());
+    if (!captured && !zapErrors.trimmed().isEmpty()) {
+        errorText += QString(" (%1)").arg(zapErrors.trimmed());
+    } else if (captured && events.isEmpty() && !zapErrors.trimmed().isEmpty() && errorText.isEmpty()) {
+        const QString tables = formatTableIdSet(atscPsipTableIds);
+        errorText = QString("No EIT events decoded for %1 within %2 ms (PSIP tables seen: %3; %4)")
+                        .arg(channelName)
+                        .arg(effectiveTotalTimeoutMs)
+                        .arg(tables.isEmpty() ? "none" : tables)
+                        .arg(zapErrors.trimmed());
+    } else if (captured && events.isEmpty() && errorText.isEmpty()) {
+        const QString tables = formatTableIdSet(atscPsipTableIds);
+        errorText = QString("No EIT events decoded for %1 within %2 ms (PSIP tables seen: %3)")
+                        .arg(channelName)
+                        .arg(effectiveTotalTimeoutMs)
+                        .arg(tables.isEmpty() ? "none" : tables);
+    }
+    return captured;
+}
 }
 
 MainWindow::MainWindow(QWidget *parent)
@@ -137,7 +1311,9 @@ MainWindow::MainWindow(QWidget *parent)
     mediaPlayer_ = new QMediaPlayer(this);
     audioOutput_ = new QAudioOutput(this);
     reconnectTimer_ = new QTimer(this);
+    currentShowTimer_ = new QTimer(this);
     reconnectTimer_->setSingleShot(true);
+    currentShowTimer_->setSingleShot(true);
 
     mediaPlayer_->setAudioOutput(audioOutput_);
     mediaPlayer_->setVideoOutput(videoWidget_);
@@ -173,6 +1349,11 @@ MainWindow::MainWindow(QWidget *parent)
                       .arg(exitCode)
                       .arg(status == QProcess::NormalExit ? "normal" : "crash")
                       .arg(streamBridgeProcess_->errorString()));
+        if (zapProcess_ != nullptr && zapProcess_->state() != QProcess::NotRunning) {
+            suppressZapExitReconnect_ = true;
+            stopProcess(zapProcess_, 1000);
+            suppressZapExitReconnect_ = false;
+        }
         if (!suppressBridgeExitReconnect_ && !userStoppedWatching_ && !currentChannelName_.isEmpty()) {
             if (tryDynamicBridgeFallback("Live stream bridge exited")) {
                 return;
@@ -206,6 +1387,7 @@ MainWindow::MainWindow(QWidget *parent)
         appendLog(QString("player: bufferProgress=%1").arg(progress, 0, 'f', 3));
     });
     connect(reconnectTimer_, &QTimer::timeout, this, &MainWindow::triggerReconnect);
+    connect(currentShowTimer_, &QTimer::timeout, this, &MainWindow::refreshCurrentShowStatus);
     connect(volumeSlider_, &QSlider::valueChanged, this, &MainWindow::handleVolumeChanged);
     connect(muteButton_, &QPushButton::toggled, this, &MainWindow::handleMuteToggled);
 
@@ -215,6 +1397,7 @@ MainWindow::MainWindow(QWidget *parent)
     loadChannelsFileIfPresent();
     refreshQuickButtons();
     playbackStatusLabel_->setText(playbackStatusText());
+    setCurrentShowStatus("NO EIT DATA");
 }
 
 MainWindow::~MainWindow()
@@ -225,20 +1408,12 @@ MainWindow::~MainWindow()
     if (reconnectTimer_ != nullptr) {
         reconnectTimer_->stop();
     }
-    waitingForDvrReady_ = false;
-    pendingDvrPath_.clear();
-
+    if (currentShowTimer_ != nullptr) {
+        currentShowTimer_->stop();
+    }
     if (mediaPlayer_ != nullptr) {
         mediaPlayer_->stop();
         mediaPlayer_->setSource(QUrl());
-    }
-
-    if (dvrStream_ != nullptr) {
-        if (dvrStream_->isOpen()) {
-            dvrStream_->close();
-        }
-        delete dvrStream_;
-        dvrStream_ = nullptr;
     }
 
     suppressBridgeExitReconnect_ = true;
@@ -313,6 +1488,12 @@ void MainWindow::buildUi()
             QString("Created by Voncloft\nVersion %1").arg(QStringLiteral(TV_TUNER_GUI_VERSION)));
     });
 
+    QMenu *viewMenu = menuBar()->addMenu("View");
+    QAction *tvGuideAction = viewMenu->addAction("TV Guide");
+    tvGuideAction->setShortcut(QKeySequence(Qt::CTRL | Qt::Key_G));
+    tvGuideAction->setShortcutContext(Qt::WindowShortcut);
+    connect(tvGuideAction, &QAction::triggered, this, &MainWindow::openTvGuide);
+
     auto *root = new QWidget(this);
     auto *mainLayout = new QVBoxLayout(root);
 
@@ -386,6 +1567,7 @@ void MainWindow::buildUi()
     muteButton_ = new QPushButton("Mute", watchPage);
     volumeSlider_ = new QSlider(Qt::Horizontal, watchPage);
     playbackStatusLabel_ = new QLabel("Idle", watchPage);
+    currentShowLabel_ = new QLabel("NO EIT DATA", watchPage);
     addFavoriteButton_ = new QPushButton("Add Favorite", watchPage);
     removeFavoriteButton_ = new QPushButton("Remove Favorite", watchPage);
 
@@ -396,6 +1578,8 @@ void MainWindow::buildUi()
     volumeSlider_->setValue(85);
     volumeSlider_->setFixedWidth(220);
     playbackStatusLabel_->setMinimumWidth(260);
+    currentShowLabel_->setMinimumWidth(320);
+    currentShowLabel_->setTextInteractionFlags(Qt::TextSelectableByMouse);
 
     watchControlsRow->addWidget(watchButton_);
     watchControlsRow->addWidget(stopWatchButton_);
@@ -408,6 +1592,9 @@ void MainWindow::buildUi()
     watchControlsRow->addSpacing(12);
     watchControlsRow->addWidget(new QLabel("Playback:", watchPage));
     watchControlsRow->addWidget(playbackStatusLabel_);
+    watchControlsRow->addSpacing(12);
+    watchControlsRow->addWidget(new QLabel("Watching Now:", watchPage));
+    watchControlsRow->addWidget(currentShowLabel_);
     watchControlsRow->addStretch(1);
 
     auto *contentSplitter = new QSplitter(Qt::Horizontal, watchPage);
@@ -797,6 +1984,7 @@ void MainWindow::openMediaFile()
     stopWatching();
     userStoppedWatching_ = true;
     currentChannelName_ = "File: " + QFileInfo(filePath).fileName();
+    setCurrentShowStatus(QFileInfo(filePath).fileName());
 
     mediaPlayer_->setAudioOutput(audioOutput_);
     mediaPlayer_->setSource(QUrl::fromLocalFile(filePath));
@@ -805,6 +1993,580 @@ void MainWindow::openMediaFile()
     appendLog("player: Opened local media file: " + filePath);
     playbackStatusLabel_->setText(playbackStatusText());
     statusBar()->showMessage("Playing local file: " + QFileInfo(filePath).fileName());
+}
+
+void MainWindow::openTvGuide()
+{
+    if (tvGuideDialog_ == nullptr) {
+        tvGuideDialog_ = new TvGuideDialog(this);
+        connect(tvGuideDialog_, &TvGuideDialog::refreshRequested, this, &MainWindow::refreshTvGuide);
+    }
+
+    tvGuideDialog_->show();
+    tvGuideDialog_->raise();
+    tvGuideDialog_->activateWindow();
+    refreshTvGuide();
+}
+
+void MainWindow::refreshTvGuide()
+{
+    if (scanProcess_ != nullptr && scanProcess_->state() != QProcess::NotRunning) {
+        QMessageBox::warning(this, "Scan in progress", "Stop scanning before opening the TV guide.");
+        return;
+    }
+
+    if (tvGuideDialog_ == nullptr) {
+        tvGuideDialog_ = new TvGuideDialog(this);
+        connect(tvGuideDialog_, &TvGuideDialog::refreshRequested, this, &MainWindow::refreshTvGuide);
+    }
+
+    if (channelLines_.isEmpty()) {
+        loadChannelsFileIfPresent();
+    }
+    if (channelLines_.isEmpty()) {
+        QMessageBox::information(this, "No channels", "No channels are loaded yet. Run a scan first.");
+        return;
+    }
+
+    if (!persistChannelsFile() && channelsFilePath_.isEmpty()) {
+        QMessageBox::warning(this, "Missing channels file", "Could not prepare channels.conf for guide collection.");
+        return;
+    }
+
+    const QVector<GuideChannelInfo> channels = parseGuideChannels(channelLines_);
+    if (channels.isEmpty()) {
+        QMessageBox::warning(this,
+                             "Unsupported channel format",
+                             "Could not parse channels.conf entries for guide mapping.");
+        return;
+    }
+
+    QHash<qint64, QVector<GuideChannelInfo>> channelsByFrequency;
+    QStringList channelOrder;
+    QSet<QString> channelSeen;
+    for (const GuideChannelInfo &channel : channels) {
+        channelsByFrequency[channel.frequencyHz].append(channel);
+        if (!channelSeen.contains(channel.name)) {
+            channelSeen.insert(channel.name);
+            channelOrder.append(channel.name);
+        }
+    }
+
+    const bool livePlaybackActive = zapProcess_ != nullptr
+                                    && zapProcess_->state() != QProcess::NotRunning
+                                    && !currentChannelName_.isEmpty()
+                                    && !currentChannelName_.startsWith("File: ");
+    const int playbackAdapter = adapterSpin_->value();
+    int guideFrontend = -1;
+    int guideAdapter = findPreferredGuideAdapter(frontendSpin_->value(), guideFrontend);
+    if (guideAdapter < 0) {
+        QMessageBox::warning(this, "Guide unavailable", "No tuner is available for EIT/guide collection.");
+        return;
+    }
+    bool usingAlternateGuideAdapter = false;
+    if (livePlaybackActive) {
+        int alternateFrontend = -1;
+        const int alternateAdapter = findPreferredSeparateGuideAdapter(playbackAdapter,
+                                                                       frontendSpin_->value(),
+                                                                       alternateFrontend);
+        if (alternateAdapter >= 0) {
+            guideAdapter = alternateAdapter;
+            guideFrontend = alternateFrontend;
+            usingAlternateGuideAdapter = true;
+            appendLog(QString("guide: using adapter%1/frontend%2 while playback continues on adapter%3")
+                          .arg(guideAdapter)
+                          .arg(guideFrontend)
+                          .arg(playbackAdapter));
+        }
+    }
+    qint64 liveFrequencyHz = -1;
+    bool currentProgramOk = false;
+    const int currentProgramId = currentProgramId_.toInt(&currentProgramOk, 0);
+    if (livePlaybackActive && guideAdapter == playbackAdapter && !usingAlternateGuideAdapter) {
+        for (const GuideChannelInfo &channel : channels) {
+            if (channel.name == currentChannelName_) {
+                liveFrequencyHz = channel.frequencyHz;
+                break;
+            }
+        }
+        if (liveFrequencyHz <= 0 && currentProgramOk) {
+            for (const GuideChannelInfo &channel : channels) {
+                if (channel.serviceId == currentProgramId) {
+                    liveFrequencyHz = channel.frequencyHz;
+                    break;
+                }
+            }
+        }
+        if (liveFrequencyHz <= 0) {
+            QMessageBox::warning(this,
+                                 "Guide unavailable",
+                                 "Could not determine the currently tuned multiplex while live playback is active.");
+            return;
+        }
+    }
+
+    const bool liveMuxOnlyRefresh = livePlaybackActive && guideAdapter == playbackAdapter && liveFrequencyHz > 0;
+    const bool hadGuideCache = !guideEntriesCache_.isEmpty();
+
+    QString loadingMessage = "Collecting OTA schedule data from EIT...";
+    QString statusMessage = "Collecting OTA guide data...";
+    if (usingAlternateGuideAdapter) {
+        loadingMessage = QString("Collecting OTA schedule data on adapter%1 while %2 continues playing on adapter%3...")
+                             .arg(guideAdapter)
+                             .arg(currentChannelName_)
+                             .arg(playbackAdapter);
+        statusMessage = QString("Collecting OTA guide data on adapter%1...").arg(guideAdapter);
+    } else if (liveMuxOnlyRefresh) {
+        loadingMessage = QString("Collecting OTA schedule data from the current multiplex while %1 continues playing...")
+                             .arg(currentChannelName_);
+        statusMessage = "Collecting OTA guide data from the current multiplex...";
+    }
+    tvGuideDialog_->setLoadingState(loadingMessage);
+    statusBar()->showMessage(statusMessage);
+    QCoreApplication::processEvents(QEventLoop::ExcludeUserInputEvents);
+
+    QList<qint64> frequencies = channelsByFrequency.keys();
+    if (liveMuxOnlyRefresh) {
+        frequencies = { liveFrequencyHz };
+    }
+
+    QProgressDialog progress(liveMuxOnlyRefresh
+                                 ? "Collecting OTA EIT schedule data from the current multiplex..."
+                                 : "Collecting OTA EIT schedule data...",
+                             "Cancel",
+                             0,
+                             frequencies.size(),
+                             this);
+    progress.setWindowModality(Qt::WindowModal);
+    progress.setMinimumDuration(0);
+
+    QHash<QString, QList<TvGuideEntry>> entriesByChannel = liveMuxOnlyRefresh ? guideEntriesCache_
+                                                                              : QHash<QString, QList<TvGuideEntry>>{};
+    QStringList errors;
+    int frequenciesWithData = 0;
+    int decodedEvents = 0;
+    QSet<int> observedPsipTableIds;
+    QStringList muxSummaryLines;
+    QStringList missingChannelNames;
+
+    QApplication::setOverrideCursor(Qt::BusyCursor);
+    for (int i = 0; i < frequencies.size(); ++i) {
+        const qint64 frequencyHz = frequencies.at(i);
+        const QVector<GuideChannelInfo> frequencyChannels = channelsByFrequency.value(frequencyHz);
+        if (frequencyChannels.isEmpty()) {
+            continue;
+        }
+        const bool reuseCurrentTunedMux = liveMuxOnlyRefresh && frequencyHz == liveFrequencyHz;
+
+        progress.setValue(i);
+        progress.setLabelText(QString("%1 %2 MHz (%3/%4) via %5")
+                                  .arg(reuseCurrentTunedMux ? "Reading" : "Tuning")
+                                  .arg(QString::number(static_cast<double>(frequencyHz) / 1000000.0, 'f', 1))
+                                  .arg(i + 1)
+                                  .arg(frequencies.size())
+                                  .arg(frequencyChannels.first().name));
+        QCoreApplication::processEvents(QEventLoop::AllEvents, 40);
+        if (progress.wasCanceled()) {
+            break;
+        }
+
+        QList<RawGuideEvent> frequencyEvents;
+        QHash<int, int> atscSourceToProgram;
+        QSet<int> psipTableIds;
+        QString errorText;
+        QSet<int> expectedServiceIds;
+        for (const GuideChannelInfo &channel : frequencyChannels) {
+            expectedServiceIds.insert(channel.serviceId);
+        }
+        if (reuseCurrentTunedMux) {
+            captureGuideEventsFromDemux(guideAdapter,
+                                        frequencyChannels.first().name,
+                                        expectedServiceIds,
+                                        frequencyEvents,
+                                        atscSourceToProgram,
+                                        psipTableIds,
+                                        errorText);
+        } else {
+            captureGuideEventsForChannel(channelsFilePath_,
+                                         guideAdapter,
+                                         guideFrontend,
+                                         frequencyChannels.first().name,
+                                         expectedServiceIds,
+                                         frequencyEvents,
+                                         atscSourceToProgram,
+                                         psipTableIds,
+                                         errorText);
+        }
+        appendLog(QString("guide: mux %1 tables=%2 decoded=%3 source-map=%4")
+                      .arg(frequencyChannels.first().name,
+                           formatTableIdSet(psipTableIds).isEmpty() ? "none" : formatTableIdSet(psipTableIds))
+                      .arg(frequencyEvents.size())
+                      .arg(atscSourceToProgram.size()));
+        observedPsipTableIds.unite(psipTableIds);
+        if (!errorText.isEmpty()) {
+            errors.append(errorText);
+        }
+
+        if (frequencyEvents.isEmpty()) {
+            QStringList missingForMux;
+            for (const GuideChannelInfo &channel : frequencyChannels) {
+                missingForMux.append(channel.name);
+                missingChannelNames.append(channel.name);
+            }
+            muxSummaryLines.append(QString("%1 MHz: 0/%2 channels missing %3")
+                                       .arg(QString::number(static_cast<double>(frequencyHz) / 1000000.0, 'f', 1))
+                                       .arg(frequencyChannels.size())
+                                       .arg(missingForMux.join(", ")));
+            continue;
+        }
+        ++frequenciesWithData;
+        decodedEvents += frequencyEvents.size();
+
+        QHash<int, QStringList> namesByServiceId;
+        for (const GuideChannelInfo &channel : frequencyChannels) {
+            namesByServiceId[channel.serviceId].append(channel.name);
+        }
+
+        int mappedForFrequency = 0;
+        QSet<QString> mappedChannelNamesForMux;
+        QHash<QString, QList<TvGuideEntry>> mappedEntriesForMux;
+        for (const RawGuideEvent &event : frequencyEvents) {
+            int mappedServiceId = event.serviceId;
+            if (atscSourceToProgram.contains(mappedServiceId)) {
+                mappedServiceId = atscSourceToProgram.value(mappedServiceId);
+            }
+            const QStringList mappedChannels = namesByServiceId.value(mappedServiceId);
+            if (mappedChannels.isEmpty()) {
+                continue;
+            }
+
+            TvGuideEntry guideEntry;
+            guideEntry.startUtc = event.startUtc;
+            guideEntry.endUtc = event.endUtc;
+            guideEntry.title = event.title;
+            for (const QString &channelName : mappedChannels) {
+                mappedEntriesForMux[channelName].append(guideEntry);
+                mappedChannelNamesForMux.insert(channelName);
+                ++mappedForFrequency;
+            }
+        }
+        if (!mappedEntriesForMux.isEmpty()) {
+            for (const GuideChannelInfo &channel : frequencyChannels) {
+                entriesByChannel.remove(channel.name);
+            }
+            for (auto it = mappedEntriesForMux.cbegin(); it != mappedEntriesForMux.cend(); ++it) {
+                entriesByChannel.insert(it.key(), it.value());
+            }
+        }
+        appendLog(QString("guide: mux %1 mapped=%2").arg(frequencyChannels.first().name).arg(mappedForFrequency));
+
+        QStringList missingForMux;
+        for (const GuideChannelInfo &channel : frequencyChannels) {
+            if (!mappedChannelNamesForMux.contains(channel.name)) {
+                missingForMux.append(channel.name);
+                missingChannelNames.append(channel.name);
+            }
+        }
+
+        QString muxSummary = QString("%1 MHz: %2/%3 channels")
+                                 .arg(QString::number(static_cast<double>(frequencyHz) / 1000000.0, 'f', 1))
+                                 .arg(mappedChannelNamesForMux.size())
+                                 .arg(frequencyChannels.size());
+        if (!missingForMux.isEmpty()) {
+            muxSummary += QString(" missing %1").arg(missingForMux.join(", "));
+        }
+        muxSummaryLines.append(muxSummary);
+    }
+    progress.setValue(frequencies.size());
+    QApplication::restoreOverrideCursor();
+
+    const QDateTime nowUtc = QDateTime::currentDateTimeUtc();
+    int mappedEntries = 0;
+    QDateTime latestEndUtc = nowUtc.addSecs(6 * 3600);
+
+    for (const QString &channelName : channelOrder) {
+        QList<TvGuideEntry> sorted = entriesByChannel.value(channelName);
+        std::sort(sorted.begin(), sorted.end(), [](const TvGuideEntry &a, const TvGuideEntry &b) {
+            return a.startUtc < b.startUtc;
+        });
+
+        QSet<QString> dedupe;
+        QList<TvGuideEntry> cleaned;
+        for (const TvGuideEntry &entry : sorted) {
+            if (!entry.startUtc.isValid() || !entry.endUtc.isValid() || entry.endUtc <= entry.startUtc) {
+                continue;
+            }
+            if (entry.endUtc < nowUtc.addSecs(-7200) || entry.startUtc > nowUtc.addDays(2)) {
+                continue;
+            }
+
+            const QString dedupeKey = QString("%1|%2|%3")
+                                          .arg(entry.startUtc.toSecsSinceEpoch())
+                                          .arg(entry.endUtc.toSecsSinceEpoch())
+                                          .arg(entry.title);
+            if (dedupe.contains(dedupeKey)) {
+                continue;
+            }
+            dedupe.insert(dedupeKey);
+            cleaned.append(entry);
+            if (entry.endUtc > latestEndUtc) {
+                latestEndUtc = entry.endUtc;
+            }
+        }
+
+        mappedEntries += cleaned.size();
+        entriesByChannel.insert(channelName, cleaned);
+        if (cleaned.isEmpty()) {
+            noAutoCurrentShowLookupChannels_.insert(channelName);
+        } else {
+            noAutoCurrentShowLookupChannels_.remove(channelName);
+        }
+    }
+
+    QDateTime windowStartUtc = nowUtc;
+    windowStartUtc = windowStartUtc.addSecs(-windowStartUtc.time().second());
+    windowStartUtc = windowStartUtc.addMSecs(-windowStartUtc.time().msec());
+    windowStartUtc = windowStartUtc.addSecs(-(windowStartUtc.time().minute() % 30) * 60);
+
+    constexpr int slotMinutes = 30;
+    const qint64 minimumWindowSeconds = 6 * 3600;
+    const qint64 requestedWindowSeconds = std::max(minimumWindowSeconds, windowStartUtc.secsTo(latestEndUtc) + slotMinutes * 60);
+    int slotCount = static_cast<int>(std::ceil(static_cast<double>(requestedWindowSeconds) / (slotMinutes * 60.0)));
+    slotCount = std::clamp(slotCount, 12, 32);
+
+    QString statusText = QString("Guide events: %1 mapped from %2 decoded across %3/%4 multiplexes.")
+                             .arg(mappedEntries)
+                             .arg(decodedEvents)
+                             .arg(frequenciesWithData)
+                             .arg(frequencies.size());
+    if (mappedEntries == 0) {
+        statusText = QString("No EIT schedule entries mapped. Checked %1 multiplexes.")
+                         .arg(frequencies.size());
+        if (observedPsipTableIds.contains(0xc8) && !observedPsipTableIds.contains(0xcb)) {
+            statusText += " ATSC PSIP was present, but EIT (table 0xCB) was not broadcast.";
+        }
+        if (observedPsipTableIds.contains(0xcb) && mappedEntries == 0) {
+            statusText += " EIT was detected, but did not map to current channel ids.";
+        }
+    }
+    if (!errors.isEmpty()) {
+        appendLog("guide: " + errors.first());
+        statusText += " Some multiplexes returned no schedule data.";
+    }
+    if (!muxSummaryLines.isEmpty()) {
+        statusText += "\n" + muxSummaryLines.join("\n");
+    }
+    missingChannelNames.removeDuplicates();
+    if (!missingChannelNames.isEmpty()) {
+        statusText += QString("\nNo guide data: %1").arg(missingChannelNames.join(", "));
+    }
+
+    if (usingAlternateGuideAdapter) {
+        QString liveStatus = QString("Live playback active: full guide refreshed on adapter%1 while %2 continued playing on adapter%3.")
+                                 .arg(guideAdapter)
+                                 .arg(currentChannelName_)
+                                 .arg(playbackAdapter);
+        statusText = liveStatus + "\n" + statusText;
+    } else if (liveMuxOnlyRefresh) {
+        QString liveStatus = QString("Live playback active: refreshed guide from the current multiplex only for %1.")
+                                 .arg(currentChannelName_);
+        liveStatus += " Full all-channel guide collection still requires retuning or a second tuner.";
+        if (hadGuideCache) {
+            liveStatus += " Cached guide rows are kept for channels that were not refreshed.";
+        }
+        statusText = liveStatus + "\n" + statusText;
+    }
+
+    guideEntriesCache_ = entriesByChannel;
+    applyCurrentShowStatusFromGuideCache();
+    tvGuideDialog_->setGuideData(channelOrder, entriesByChannel, windowStartUtc, slotMinutes, slotCount, statusText);
+    statusBar()->showMessage(statusText.section('\n', 0, 0));
+}
+
+void MainWindow::setCurrentShowStatus(const QString &text, const QString &toolTip)
+{
+    if (currentShowLabel_ == nullptr) {
+        return;
+    }
+
+    currentShowLabel_->setText(text);
+    currentShowLabel_->setToolTip(toolTip);
+}
+
+void MainWindow::scheduleCurrentShowRefresh(const QDateTime &refreshUtc)
+{
+    if (currentShowTimer_ == nullptr) {
+        return;
+    }
+
+    currentShowTimer_->stop();
+    if (!refreshUtc.isValid()) {
+        return;
+    }
+
+    const qint64 delayMs = QDateTime::currentDateTimeUtc().msecsTo(refreshUtc);
+    if (delayMs <= 0) {
+        return;
+    }
+
+    constexpr qint64 kMaxShowRefreshDelayMs = 24LL * 60LL * 60LL * 1000LL;
+    currentShowTimer_->start(static_cast<int>(std::min(delayMs, kMaxShowRefreshDelayMs)));
+}
+
+bool MainWindow::applyCurrentShowStatusFromGuideCache()
+{
+    if (currentChannelName_.isEmpty() || currentChannelName_.startsWith("File: ")) {
+        if (currentShowTimer_ != nullptr) {
+            currentShowTimer_->stop();
+        }
+        return false;
+    }
+
+    TvGuideEntry entry;
+    bool isCurrent = false;
+    if (!findCurrentOrNextGuideEntry(guideEntriesCache_.value(currentChannelName_),
+                                     QDateTime::currentDateTimeUtc(),
+                                     entry,
+                                     isCurrent)) {
+        if (currentShowTimer_ != nullptr) {
+            currentShowTimer_->stop();
+        }
+        return false;
+    }
+
+    const QString label = isCurrent ? entry.title : QString("Next: %1").arg(entry.title);
+    setCurrentShowStatus(label, guideEntryToolTipText(entry));
+    scheduleCurrentShowRefresh((isCurrent ? entry.endUtc : entry.startUtc).addSecs(1));
+    return true;
+}
+
+void MainWindow::probeCurrentShowBeforePlayback(const QString &channelName, int programId)
+{
+    currentShowTimer_->stop();
+
+    if (applyCurrentShowStatusFromGuideCache()) {
+        appendLog(QString("current-show: using cached EIT for %1 before playback").arg(channelName));
+        return;
+    }
+    if (noAutoCurrentShowLookupChannels_.contains(channelName)) {
+        setCurrentShowStatus("NO EIT DATA", "Auto EIT lookup disabled after a prior no-data result for this channel.");
+        appendLog(QString("current-show: skipping pre-playback EIT probe for %1 (previous no-data result)").arg(channelName));
+        return;
+    }
+    if (programId <= 0) {
+        setCurrentShowStatus("NO EIT DATA");
+        noAutoCurrentShowLookupChannels_.insert(channelName);
+        appendLog(QString("current-show: no valid program id for %1; skipping EIT probe").arg(channelName));
+        return;
+    }
+
+    int lookupFrontend = -1;
+    const int playbackAdapter = adapterSpin_->value();
+    const int lookupAdapter = findPreferredSeparateGuideAdapter(playbackAdapter,
+                                                                frontendSpin_->value(),
+                                                                lookupFrontend);
+    if (lookupAdapter < 0 || lookupFrontend < 0) {
+        currentShowTimer_->stop();
+        setCurrentShowStatus("NO EIT DATA", "No separate EIT tuner is available before playback.");
+        appendLog(QString("current-show: no separate guide tuner available for %1 before playback").arg(channelName));
+        return;
+    }
+
+    setCurrentShowStatus("Detecting...", QString("Checking EIT on adapter%1/frontend%2 before playback").arg(lookupAdapter).arg(lookupFrontend));
+    statusBar()->showMessage(QString("Checking EIT on adapter%1 before playback...").arg(lookupAdapter));
+    QCoreApplication::processEvents(QEventLoop::ExcludeUserInputEvents);
+
+    QList<RawGuideEvent> events;
+    QHash<int, int> atscSourceToProgram;
+    QSet<int> psipTableIds;
+    QString errorText;
+    QSet<int> expectedServiceIds;
+    expectedServiceIds.insert(programId);
+
+    QApplication::setOverrideCursor(Qt::BusyCursor);
+    const bool captured = captureGuideEventsForChannel(channelsFilePath_,
+                                                       lookupAdapter,
+                                                       lookupFrontend,
+                                                       channelName,
+                                                       expectedServiceIds,
+                                                       events,
+                                                       atscSourceToProgram,
+                                                       psipTableIds,
+                                                       errorText);
+    QApplication::restoreOverrideCursor();
+
+    QList<TvGuideEntry> entries;
+    for (const RawGuideEvent &event : events) {
+        int mappedServiceId = event.serviceId;
+        if (atscSourceToProgram.contains(mappedServiceId)) {
+            mappedServiceId = atscSourceToProgram.value(mappedServiceId);
+        }
+        if (mappedServiceId != programId) {
+            continue;
+        }
+
+        TvGuideEntry entry;
+        entry.startUtc = event.startUtc;
+        entry.endUtc = event.endUtc;
+        entry.title = event.title;
+        entries.append(entry);
+    }
+
+    std::sort(entries.begin(), entries.end(), [](const TvGuideEntry &a, const TvGuideEntry &b) {
+        return a.startUtc < b.startUtc;
+    });
+
+    appendLog(QString("current-show: pre-playback probe %1 on adapter%2/frontend%3 captured=%4 events=%5 mapped=%6 tables=%7")
+                  .arg(channelName)
+                  .arg(lookupAdapter)
+                  .arg(lookupFrontend)
+                  .arg(captured ? "yes" : "no")
+                  .arg(events.size())
+                  .arg(entries.size())
+                  .arg(formatTableIdSet(psipTableIds).isEmpty() ? "none" : formatTableIdSet(psipTableIds)));
+
+    if (!entries.isEmpty()) {
+        noAutoCurrentShowLookupChannels_.remove(channelName);
+        guideEntriesCache_.insert(channelName, entries);
+        if (!applyCurrentShowStatusFromGuideCache()) {
+            const TvGuideEntry &entry = entries.first();
+            setCurrentShowStatus(entry.title, guideEntryToolTipText(entry));
+        }
+        return;
+    }
+
+    noAutoCurrentShowLookupChannels_.insert(channelName);
+    currentShowTimer_->stop();
+    setCurrentShowStatus("NO EIT DATA", errorText.isEmpty() ? "No EIT data was found before playback started." : errorText);
+}
+
+void MainWindow::refreshCurrentShowStatus()
+{
+    if (currentChannelName_.isEmpty()) {
+        currentShowTimer_->stop();
+        setCurrentShowStatus("NO EIT DATA");
+        return;
+    }
+    if (currentChannelName_.startsWith("File: ")) {
+        currentShowTimer_->stop();
+        setCurrentShowStatus("Local File");
+        return;
+    }
+    if (zapProcess_ == nullptr || zapProcess_->state() == QProcess::NotRunning) {
+        currentShowTimer_->stop();
+        setCurrentShowStatus("NO EIT DATA");
+        return;
+    }
+
+    if (applyCurrentShowStatusFromGuideCache()) {
+        return;
+    }
+    currentShowTimer_->stop();
+    if (noAutoCurrentShowLookupChannels_.contains(currentChannelName_)) {
+        setCurrentShowStatus("NO EIT DATA", "EIT was checked before playback and no data was found for this channel.");
+        return;
+    }
+    setCurrentShowStatus("NO EIT DATA", "No cached EIT data remains for this channel.");
 }
 
 bool MainWindow::startWatchingChannel(const QString &channelName, bool reconnectAttempt)
@@ -847,41 +2609,26 @@ bool MainWindow::startWatchingChannel(const QString &channelName, bool reconnect
     mediaPlayer_->stop();
     mediaPlayer_->setSource(QUrl());
 
+    currentChannelName_ = channelName;
+    currentProgramId_ = programIdForChannel(channelName);
+    currentShowTimer_->stop();
+    ++currentShowLookupSerial_;
+    probeCurrentShowBeforePlayback(channelName, currentProgramId_.toInt());
+
     QStringList args;
     args << "-I" << "ZAP"
          << "-c" << channelsFilePath_
          << "-a" << QString::number(adapterSpin_->value())
          << "-f" << QString::number(frontendSpin_->value())
-         << "-r"
-         << "-P"
+         << "-o" << "-"
          << "-p";
 
     args << channelName;
-
-    appendLog("zap: launch " + formatCommandLine(zapExe, args));
-    zapProcess_->start(zapExe, args);
-    if (!zapProcess_->waitForStarted(2000)) {
-        appendLog(QString("Failed to start dvbv5-zap for %1 (%2)")
-                      .arg(channelName, zapProcess_->errorString()));
-        scheduleReconnect("Failed to start tuner process");
-        return false;
-    }
-
-    currentChannelName_ = channelName;
-    currentProgramId_ = programIdForChannel(channelName);
-    const QString dvrPath = QString("/dev/dvb/adapter%1/dvr0").arg(adapterSpin_->value());
-    pendingDvrPath_ = dvrPath;
-    waitingForDvrReady_ = true;
     appendLog(QString("Tuning channel: %1 (program=%2)")
                   .arg(channelName, currentProgramId_.isEmpty() ? "unknown" : currentProgramId_));
-
-    // Start playback when zap reports that the DVR interface is ready.
-    QTimer::singleShot(3500, this, [this, dvrPath]() {
-        if (waitingForDvrReady_ && pendingDvrPath_ == dvrPath) {
-            appendLog("DVR ready signal timeout; attempting playback anyway.");
-            startPlaybackFromDvr(dvrPath);
-        }
-    });
+    if (!startPlaybackPipeline(zapExe, args)) {
+        return false;
+    }
 
     stopWatchButton_->setEnabled(true);
     playbackStatusLabel_->setText(playbackStatusText());
@@ -894,25 +2641,16 @@ void MainWindow::stopWatching()
     exitFullscreen();
     userStoppedWatching_ = true;
     reconnectTimer_->stop();
+    currentShowTimer_->stop();
+    ++currentShowLookupSerial_;
     reconnectAttemptCount_ = 0;
     useResilientBridgeMode_ = false;
     resilientBridgeTried_ = false;
     currentChannelName_.clear();
     currentProgramId_.clear();
-    pendingDvrPath_.clear();
-    waitingForDvrReady_ = false;
-
     if (mediaPlayer_ != nullptr) {
         mediaPlayer_->stop();
         mediaPlayer_->setSource(QUrl());
-    }
-
-    if (dvrStream_ != nullptr) {
-        if (dvrStream_->isOpen()) {
-            dvrStream_->close();
-        }
-        dvrStream_->deleteLater();
-        dvrStream_ = nullptr;
     }
 
     if (streamBridgeProcess_ != nullptr && streamBridgeProcess_->state() != QProcess::NotRunning) {
@@ -929,6 +2667,7 @@ void MainWindow::stopWatching()
 
     stopWatchButton_->setEnabled(false);
     playbackStatusLabel_->setText(playbackStatusText());
+    setCurrentShowStatus("NO EIT DATA");
     if (scanProcess_->state() == QProcess::NotRunning) {
         statusBar()->showMessage("Ready");
     }
@@ -946,48 +2685,23 @@ void MainWindow::handleZapStdErr()
         const QString trimmed = line.trimmed();
         if (!trimmed.isEmpty()) {
             appendLog("zap: " + trimmed);
-            if (waitingForDvrReady_ && trimmed.contains("DVR interface")
-                && trimmed.contains("can now be opened")) {
-                QString detectedPath = pendingDvrPath_;
-                const QRegularExpression re("'([^']+/dvr0)'");
-                const auto match = re.match(trimmed);
-                if (match.hasMatch()) {
-                    detectedPath = match.captured(1);
-                }
-                appendLog("player: DVR ready path detected: " + detectedPath);
-                startPlaybackFromDvr(detectedPath);
-            }
         }
     }
 }
 
-void MainWindow::startPlaybackFromDvr(const QString &dvrPath)
+bool MainWindow::startPlaybackPipeline(const QString &zapExe, const QStringList &zapArgs)
 {
-    if (dvrPath.isEmpty()) {
-        return;
-    }
-    waitingForDvrReady_ = false;
-    pendingDvrPath_.clear();
-
-    if (dvrStream_ != nullptr) {
-        if (dvrStream_->isOpen()) {
-            dvrStream_->close();
-        }
-        dvrStream_->deleteLater();
-        dvrStream_ = nullptr;
+    const QString ffmpegExe = QStandardPaths::findExecutable("ffmpeg");
+    if (ffmpegExe.isEmpty()) {
+        appendLog("player: ffmpeg not found in PATH for live DVB bridge.");
+        scheduleReconnect("Missing ffmpeg for live stream");
+        return false;
     }
 
     if (streamBridgeProcess_ != nullptr && streamBridgeProcess_->state() != QProcess::NotRunning) {
         suppressBridgeExitReconnect_ = true;
         stopProcess(streamBridgeProcess_, 1000);
         suppressBridgeExitReconnect_ = false;
-    }
-
-    const QString ffmpegExe = QStandardPaths::findExecutable("ffmpeg");
-    if (ffmpegExe.isEmpty()) {
-        appendLog("player: ffmpeg not found in PATH for live DVB bridge.");
-        scheduleReconnect("Missing ffmpeg for live stream");
-        return;
     }
 
     QStringList ffmpegArgs;
@@ -1000,14 +2714,11 @@ void MainWindow::startPlaybackFromDvr(const QString &dvrPath)
                    << "-analyzeduration" << "4M"
                    << "-probesize" << "4M"
                    << "-f" << "mpegts"
-                   << "-i" << dvrPath;
-        if (!currentProgramId_.isEmpty()) {
-            ffmpegArgs << "-map" << QString("0:p:%1?").arg(currentProgramId_);
-        } else {
-            ffmpegArgs << "-map" << "0:v:0?"
-                       << "-map" << "0:a:0?";
-        }
-        ffmpegArgs
+                   << "-i" << "pipe:0"
+                   << "-map" << "0:v:0?"
+                   << "-map" << "0:a:0?"
+                   << "-sn"
+                   << "-dn"
                    << "-c:v" << "mpeg2video"
                    << "-q:v" << "3"
                    << "-c:a" << "mp2"
@@ -1024,13 +2735,11 @@ void MainWindow::startPlaybackFromDvr(const QString &dvrPath)
                    << "-analyzeduration" << "2M"
                    << "-probesize" << "2M"
                    << "-f" << "mpegts"
-                   << "-i" << dvrPath;
-        if (!currentProgramId_.isEmpty()) {
-            ffmpegArgs << "-map" << QString("0:p:%1?").arg(currentProgramId_);
-        } else {
-            ffmpegArgs << "-map" << "0";
-        }
-        ffmpegArgs
+                   << "-i" << "pipe:0"
+                   << "-map" << "0:v:0?"
+                   << "-map" << "0:a:0?"
+                   << "-sn"
+                   << "-dn"
                    << "-c" << "copy"
                    << "-mpegts_flags" << "+resend_headers+pat_pmt_at_frames"
                    << "-flush_packets" << "1"
@@ -1039,26 +2748,44 @@ void MainWindow::startPlaybackFromDvr(const QString &dvrPath)
     }
 
     appendLog("ffmpeg bridge: launch " + formatCommandLine(ffmpegExe, ffmpegArgs));
+    zapProcess_->setStandardOutputProcess(streamBridgeProcess_);
     streamBridgeProcess_->setProgram(ffmpegExe);
     streamBridgeProcess_->setArguments(ffmpegArgs);
     streamBridgeProcess_->setProcessChannelMode(QProcess::SeparateChannels);
     streamBridgeProcess_->start();
     if (!streamBridgeProcess_->waitForStarted(2000)) {
-        appendLog(QString("player: Failed to start ffmpeg bridge for %1 (%2)")
-                      .arg(dvrPath, streamBridgeProcess_->errorString()));
+        appendLog(QString("player: Failed to start ffmpeg bridge (%1)")
+                      .arg(streamBridgeProcess_->errorString()));
         scheduleReconnect("Could not start ffmpeg bridge");
-        return;
+        return false;
+    }
+
+    appendLog("zap: launch " + formatCommandLine(zapExe, zapArgs));
+    zapProcess_->start(zapExe, zapArgs);
+    if (!zapProcess_->waitForStarted(2000)) {
+        appendLog(QString("Failed to start dvbv5-zap for %1 (%2)")
+                      .arg(currentChannelName_, zapProcess_->errorString()));
+        suppressBridgeExitReconnect_ = true;
+        stopProcess(streamBridgeProcess_, 1000);
+        suppressBridgeExitReconnect_ = false;
+        scheduleReconnect("Failed to start tuner process");
+        return false;
     }
 
     const int udpPort = 23000 + adapterSpin_->value();
     const QUrl liveUrl(QString("udp://127.0.0.1:%1").arg(udpPort));
-    appendLog(QString("player: Starting playback from ffmpeg bridge on %1 via %2 (mode=%3, program=%4)")
-                  .arg(dvrPath,
-                       liveUrl.toString(),
+    appendLog(QString("player: Starting playback from zap stdout via %1 (mode=%2, program=%3)")
+                  .arg(liveUrl.toString(),
                        useResilientBridgeMode_ ? "resilient" : "normal",
                        currentProgramId_.isEmpty() ? "unknown" : currentProgramId_));
     mediaPlayer_->setAudioOutput(audioOutput_);
-    QTimer::singleShot(450, this, [this, liveUrl]() {
+    currentShowTimer_->stop();
+    if (applyCurrentShowStatusFromGuideCache()) {
+        // Cached guide data already resolved the current show.
+    } else if (noAutoCurrentShowLookupChannels_.contains(currentChannelName_)) {
+        setCurrentShowStatus("NO EIT DATA", "EIT was checked before playback and no data was found for this channel.");
+    }
+    QTimer::singleShot(3000, this, [this, liveUrl]() {
         if (streamBridgeProcess_ == nullptr || streamBridgeProcess_->state() != QProcess::Running) {
             appendLog("player: ffmpeg bridge exited before media attach.");
             return;
@@ -1067,6 +2794,7 @@ void MainWindow::startPlaybackFromDvr(const QString &dvrPath)
         mediaPlayer_->setSource(liveUrl);
         mediaPlayer_->play();
     });
+    return true;
 }
 
 void MainWindow::addSelectedFavorite()

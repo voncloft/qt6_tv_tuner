@@ -1,9 +1,12 @@
 #pragma once
 
+#include "TvGuideDialog.h"
+
 #include <QMainWindow>
 #include <QMediaPlayer>
 #include <QProcess>
 #include <QHash>
+#include <QSet>
 
 class QComboBox;
 class QLineEdit;
@@ -55,6 +58,8 @@ private slots:
     void toggleFullscreen();
     void handleFullscreenChanged(bool fullScreen);
     void openMediaFile();
+    void openTvGuide();
+    void refreshTvGuide();
 
 private:
     void buildUi();
@@ -68,13 +73,18 @@ private:
     void loadFavorites();
     void loadXspfChannelHints();
     void loadChannelsFileIfPresent();
-    void startPlaybackFromDvr(const QString &dvrPath);
+    bool startPlaybackPipeline(const QString &zapExe, const QStringList &zapArgs);
     void scheduleReconnect(const QString &reason);
     bool tryDynamicBridgeFallback(const QString &reason);
     QString playbackStatusText() const;
     QStringList makeArguments() const;
     QString selectedChannelNameFromTable() const;
     QString programIdForChannel(const QString &channelName) const;
+    void probeCurrentShowBeforePlayback(const QString &channelName, int programId);
+    void refreshCurrentShowStatus();
+    void scheduleCurrentShowRefresh(const QDateTime &refreshUtc);
+    void setCurrentShowStatus(const QString &text, const QString &toolTip = QString());
+    bool applyCurrentShowStatusFromGuideCache();
     void stopProcess(QProcess *process, int timeoutMs);
     void enterFullscreen();
     void exitFullscreen();
@@ -99,6 +109,7 @@ private:
     QTableWidget *channelsTable_{};
     QVideoWidget *videoWidget_{};
     QLabel *playbackStatusLabel_{};
+    QLabel *currentShowLabel_{};
     QSlider *volumeSlider_{};
     QWidget *fullscreenWindow_{};
     QVideoWidget *fullscreenVideoWidget_{};
@@ -117,9 +128,8 @@ private:
     QHash<QString, QString> xspfProgramByChannel_;
     QString currentChannelName_;
     QString currentProgramId_;
-    QString pendingDvrPath_;
-    bool waitingForDvrReady_{false};
-    QFile *dvrStream_{};
+    QHash<QString, QList<TvGuideEntry>> guideEntriesCache_;
+    QSet<QString> noAutoCurrentShowLookupChannels_;
     int reconnectAttemptCount_{0};
     const int maxReconnectAttempts_{6};
     bool userStoppedWatching_{false};
@@ -129,4 +139,7 @@ private:
     bool resilientBridgeTried_{false};
     bool fullscreenActive_{false};
     QTimer *reconnectTimer_{};
+    QTimer *currentShowTimer_{};
+    TvGuideDialog *tvGuideDialog_{};
+    int currentShowLookupSerial_{0};
 };

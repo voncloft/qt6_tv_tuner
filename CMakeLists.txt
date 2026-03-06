@@ -13,7 +13,9 @@ find_package(Qt6 REQUIRED COMPONENTS Widgets Multimedia MultimediaWidgets)
 add_executable(tv_tuner_gui
     src/main.cpp
     src/MainWindow.cpp
+    src/TvGuideDialog.cpp
     include/MainWindow.h
+    include/TvGuideDialog.h
     resources.qrc
 )
 
