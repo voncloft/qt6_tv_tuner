@@ -8,7 +8,7 @@ set(CMAKE_AUTOMOC ON)
 set(CMAKE_AUTOUIC ON)
 set(CMAKE_AUTORCC ON)
 
-find_package(Qt6 REQUIRED COMPONENTS Widgets Multimedia MultimediaWidgets)
+find_package(Qt6 REQUIRED COMPONENTS Widgets Multimedia MultimediaWidgets Network)
 
 add_executable(tv_tuner_gui
     src/main.cpp
@@ -25,4 +25,4 @@ target_compile_definitions(tv_tuner_gui PRIVATE
     TV_TUNER_GUI_VERSION="${PROJECT_VERSION}"
 )
 target_link_libraries(tv_tuner_gui PRIVATE Qt6::Widgets)
-target_link_libraries(tv_tuner_gui PRIVATE Qt6::Multimedia Qt6::MultimediaWidgets)
+target_link_libraries(tv_tuner_gui PRIVATE Qt6::Multimedia Qt6::MultimediaWidgets Qt6::Network)

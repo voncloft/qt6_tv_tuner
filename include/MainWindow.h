@@ -74,6 +74,7 @@ private slots:
     void handleAutoPictureInPictureToggled(bool checked);
     void handleGuideRefreshIntervalChanged(int minutes);
     void handleGuideCacheRetentionChanged(int hours);
+    void exportSchedulesDirectJson();
     void handleSearchScheduleRequested(const QString &favoriteShowTitle,
                                        const QString &channelName,
                                        const TvGuideEntry &entry);
@@ -100,6 +101,7 @@ private:
     void loadChannelsFileIfPresent();
     void startPlaybackFromDvr(const QString &dvrPath);
     bool refreshGuideData(bool interactive, bool updateDialog);
+    bool refreshGuideDataFromSchedulesDirect(bool interactive, bool updateDialog);
     bool writeGuideCacheFile(const QStringList &channelOrder,
                              const QHash<QString, QList<TvGuideEntry>> &entriesByChannel,
                              const QDateTime &windowStartUtc,
@@ -140,6 +142,12 @@ private:
     void saveFavoriteShowRules() const;
     void refreshFavoriteShowRuleList();
     void refreshScheduledSwitchList();
+    bool useSchedulesDirectGuideSource() const;
+    void updateSchedulesDirectControls();
+    bool ensureSchedulesDirectJson(bool allowCachedExport,
+                                   bool *usedCachedExport,
+                                   QString *summary,
+                                   QString *errorText);
     void loadTestingBugItems();
     void saveTestingBugItems() const;
     bool addTestingBugItemEntry(const QString &text, bool checked);
@@ -163,6 +171,14 @@ private:
     bool shouldDetachVideoForCurrentTab(int index) const;
     void detachVideoToPip();
     void attachVideoFromPip();
+    bool applySchedulesDirectGuideFallback(QHash<QString, QList<TvGuideEntry>> &entriesByChannel,
+                                           int retentionHours,
+                                           const QDateTime &nowUtc,
+                                           QDateTime *latestEndUtc,
+                                           QStringList *importedChannels,
+                                           QStringList *unmatchedChannels,
+                                           QStringList *skippedChannels,
+                                           int *importedEntryCount);
     void applyGuideFilterSettings();
     void applyGuideRefreshIntervalSetting();
     bool purgeExpiredGuideCacheFiles(bool clearLoadedState);
@@ -199,18 +215,24 @@ private:
     QCheckBox *obeyScheduledSwitchesCheckBox_{};
     QCheckBox *autoFavoriteShowSchedulingCheckBox_{};
     QCheckBox *autoPictureInPictureCheckBox_{};
+    QCheckBox *useSchedulesDirectGuideCheckBox_{};
     QSpinBox *guideRefreshIntervalSpin_{};
     QSpinBox *guideCacheRetentionSpin_{};
     QLineEdit *favoriteShowRuleEdit_{};
     QLineEdit *testingBugItemEdit_{};
+    QLineEdit *schedulesDirectUsernameEdit_{};
+    QLineEdit *schedulesDirectPasswordEdit_{};
+    QLineEdit *schedulesDirectPostalCodeEdit_{};
     QListWidget *favoriteShowRulesList_{};
     QListWidget *scheduledSwitchesList_{};
     QListWidget *testingBugItemsList_{};
     QPushButton *addFavoriteShowRuleButton_{};
+    QPushButton *exportSchedulesDirectButton_{};
     QPushButton *saveTestingBugItemButton_{};
     QPushButton *removeTestingBugItemButton_{};
     QPushButton *removeFavoriteShowRuleButton_{};
     QPushButton *removeScheduledSwitchButton_{};
+    QLabel *schedulesDirectStatusLabel_{};
     QTabWidget *tabs_{};
     QWidget *watchPage_{};
     QWidget *configPage_{};

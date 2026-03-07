@@ -23,6 +23,7 @@ struct TvGuideEntry {
     QDateTime startUtc;
     QDateTime endUtc;
     QString title;
+    QString episode;
     QString synopsis;
 };
 
@@ -31,6 +32,7 @@ struct TvGuideScheduledSwitch {
     QDateTime startUtc;
     QDateTime endUtc;
     QString title;
+    QString episode;
     QString synopsis;
 };
 

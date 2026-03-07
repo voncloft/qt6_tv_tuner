@@ -52,27 +52,74 @@ bool scheduledSwitchMatchesEntry(const TvGuideScheduledSwitch &scheduledSwitch,
            && guideEntriesMatch(TvGuideEntry{scheduledSwitch.startUtc,
                                              scheduledSwitch.endUtc,
                                              scheduledSwitch.title,
+                                             scheduledSwitch.episode,
                                              scheduledSwitch.synopsis},
                                 entry);
 }
 
+struct GuideEntryDisplayParts {
+    QString title;
+    QString episodeTitle;
+    QString synopsisBody;
+};
+
+GuideEntryDisplayParts displayPartsForEntry(const TvGuideEntry &entry)
+{
+    GuideEntryDisplayParts parts;
+    parts.title = entry.title.trimmed();
+    parts.episodeTitle = entry.episode.trimmed();
+    parts.synopsisBody = entry.synopsis.trimmed();
+
+    const QString synopsis = entry.synopsis.trimmed();
+    if (synopsis.isEmpty() || !parts.episodeTitle.isEmpty()) {
+        return parts;
+    }
+
+    const QStringList rawLines = synopsis.split('\n');
+    QStringList lines;
+    for (const QString &line : rawLines) {
+        const QString trimmedLine = line.trimmed();
+        if (!trimmedLine.isEmpty()) {
+            lines.append(trimmedLine);
+        }
+    }
+
+    if (lines.size() >= 2) {
+        parts.episodeTitle = lines.takeFirst();
+        parts.synopsisBody = lines.join('\n').trimmed();
+    }
+    return parts;
+}
+
 QString formatEntryLabel(const TvGuideEntry &entry)
 {
-    const QString synopsis = entry.synopsis.trimmed();
-    if (synopsis.isEmpty()) {
-        return entry.title;
+    const GuideEntryDisplayParts parts = displayPartsForEntry(entry);
+    QStringList lines;
+    if (!parts.title.isEmpty()) {
+        lines << parts.title;
     }
-    return entry.title + "\n" + synopsis;
+    if (!parts.episodeTitle.isEmpty()) {
+        lines << parts.episodeTitle;
+    }
+    if (!parts.synopsisBody.isEmpty()) {
+        lines << parts.synopsisBody;
+    }
+    return lines.join('\n');
 }
 
 QString formatEntryHtml(const TvGuideEntry &entry)
 {
-    const QString synopsis = entry.synopsis.trimmed().toHtmlEscaped();
+    const GuideEntryDisplayParts parts = displayPartsForEntry(entry);
     QString html = QString("<div style=\"color:#ffffff;\">"
                            "<div style=\"font-weight:600; margin-bottom:4px;\">%1</div>")
-                       .arg(entry.title.toHtmlEscaped());
-    if (!synopsis.isEmpty()) {
-        html += QString("<div style=\"color:#d4d4d4; font-size:90%%;\">%1</div>").arg(synopsis);
+                       .arg(parts.title.toHtmlEscaped());
+    if (!parts.episodeTitle.isEmpty()) {
+        html += QString("<div style=\"color:#f1d27a; font-style:italic; margin-bottom:4px;\">%1</div>")
+                    .arg(parts.episodeTitle.toHtmlEscaped());
+    }
+    if (!parts.synopsisBody.isEmpty()) {
+        html += QString("<div style=\"color:#d4d4d4; font-size:90%%;\">%1</div>")
+                    .arg(parts.synopsisBody.toHtmlEscaped().replace('\n', "<br/>"));
     }
     html += "</div>";
     return html;
@@ -80,12 +127,16 @@ QString formatEntryHtml(const TvGuideEntry &entry)
 
 QString formatEntryToolTip(const TvGuideEntry &entry)
 {
+    const GuideEntryDisplayParts parts = displayPartsForEntry(entry);
     QString text = QString("%1\n%2 - %3")
-        .arg(entry.title,
+        .arg(parts.title,
              entry.startUtc.toLocalTime().toString("ddd h:mm AP"),
              entry.endUtc.toLocalTime().toString("ddd h:mm AP"));
-    if (!entry.synopsis.trimmed().isEmpty()) {
-        text += "\n\n" + entry.synopsis.trimmed();
+    if (!parts.episodeTitle.isEmpty()) {
+        text += "\nEpisode: " + parts.episodeTitle;
+    }
+    if (!parts.synopsisBody.isEmpty()) {
+        text += "\n\nSynopsis: " + parts.synopsisBody;
     }
     return text;
 }
@@ -342,7 +393,7 @@ protected:
 
         if (!renderedAny) {
             painter.setPen(QColor(160, 160, 160));
-            painter.drawText(rect().adjusted(10, 0, -10, 0), Qt::AlignCenter, "NO EIT DATA");
+            painter.drawText(rect().adjusted(10, 0, -10, 0), Qt::AlignCenter, "NO GUIDE DATA");
         }
 
         const qint64 nowOffset = windowStartUtc_.secsTo(QDateTime::currentDateTimeUtc());
@@ -771,12 +822,15 @@ void TvGuideDialog::updateSearchResults()
     for (const QString &channelName : orderedChannels) {
         const QList<TvGuideEntry> entries = entriesByChannel_.value(channelName);
         for (const TvGuideEntry &entry : entries) {
-            const QString title = entry.title.trimmed();
-            const QString synopsis = entry.synopsis.trimmed();
+            const GuideEntryDisplayParts parts = displayPartsForEntry(entry);
+            const QString title = parts.title;
+            const QString episode = parts.episodeTitle;
+            const QString synopsis = parts.synopsisBody;
             if (title.isEmpty()) {
                 continue;
             }
             if (!title.contains(query, Qt::CaseInsensitive)
+                && !episode.contains(query, Qt::CaseInsensitive)
                 && !synopsis.contains(query, Qt::CaseInsensitive)) {
                 continue;
             }
@@ -800,15 +854,18 @@ void TvGuideDialog::updateSearchResults()
 
     searchResults_ = matchedResults;
     for (const SearchResult &result : searchResults_) {
-        const QString synopsis = result.entry.synopsis.trimmed();
+        const GuideEntryDisplayParts parts = displayPartsForEntry(result.entry);
         QStringList lines;
-        lines << result.entry.title.trimmed();
+        lines << parts.title;
+        if (!parts.episodeTitle.isEmpty()) {
+            lines << "Episode: " + parts.episodeTitle;
+        }
         lines << QString("%1 - %2 | %3")
                      .arg(result.entry.startUtc.toLocalTime().toString("ddd h:mm AP"),
                           result.entry.endUtc.toLocalTime().toString("h:mm AP"),
                           result.channelName);
-        if (!synopsis.isEmpty()) {
-            lines << synopsis;
+        if (!parts.synopsisBody.isEmpty()) {
+            lines << "Synopsis: " + parts.synopsisBody;
         }
         showSearchResultsList_->addItem(lines.join('\n'));
     }

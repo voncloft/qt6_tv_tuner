@@ -40,6 +40,9 @@
 #include <QMenu>
 #include <QMenuBar>
 #include <QMessageBox>
+#include <QNetworkAccessManager>
+#include <QNetworkReply>
+#include <QNetworkRequest>
 #include <QPlainTextEdit>
 #include <QProgressDialog>
 #include <QProcess>
@@ -61,6 +64,7 @@
 #include <QTimer>
 #include <QTimeZone>
 #include <QUrl>
+#include <QUrlQuery>
 #include <QXmlStreamReader>
 #include <QVBoxLayout>
 #include <QVideoWidget>
@@ -68,6 +72,7 @@
 #include <QScreen>
 #include <QWindow>
 #include <QCursor>
+#include <QCryptographicHash>
 #include <QSet>
 #include <linux/dvb/dmx.h>
 #include <fcntl.h>
@@ -99,6 +104,10 @@ constexpr auto kAutoPictureInPictureSetting = "video/autoPictureInPicture";
 constexpr auto kGuideRefreshIntervalMinutesSetting = "tvGuide/refreshIntervalMinutes";
 constexpr auto kGuideCacheRetentionHoursSetting = "tvGuide/cacheRetentionHours";
 constexpr auto kLockedScheduledSwitchesSetting = "tvGuide/lockedScheduledSwitches";
+constexpr auto kUseSchedulesDirectGuideSetting = "tvGuide/useSchedulesDirect";
+constexpr auto kSchedulesDirectUsernameSetting = "schedulesDirect/username";
+constexpr auto kSchedulesDirectPasswordSha1Setting = "schedulesDirect/passwordSha1";
+constexpr auto kSchedulesDirectPostalCodeSetting = "schedulesDirect/postalCode";
 constexpr int kDefaultGuideRefreshIntervalMinutes = 60;
 constexpr int kDefaultGuideCacheRetentionHours = 24;
 
@@ -213,9 +222,83 @@ QString resolveGuideSchedulePath()
     return QDir(appDataPath).filePath("guide_scheduled_switches.json");
 }
 
+QString resolveSchedulesDirectExportPath()
+{
+    const QString appDataPath = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
+    if (appDataPath.isEmpty()) {
+        return {};
+    }
+    return QDir(appDataPath).filePath("schedules_direct.org.json");
+}
+
+QString resolveLegacySchedulesDirectExportPath()
+{
+    const QString appDataPath = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
+    if (appDataPath.isEmpty()) {
+        return {};
+    }
+    return QDir(appDataPath).filePath("schedules_direct.org");
+}
+
+QString resolveChannelHintsJsonPath()
+{
+    const QString appDataPath = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
+    if (appDataPath.isEmpty()) {
+        return {};
+    }
+    return QDir(appDataPath).filePath("channel_hints.json");
+}
+
 QString normalizeFavoriteShowRule(const QString &title)
 {
     return title.simplified().toCaseFolded();
+}
+
+struct GuideEntryDisplayParts {
+    QString title;
+    QString episodeTitle;
+    QString synopsisBody;
+};
+
+GuideEntryDisplayParts displayPartsForGuideEntry(const TvGuideEntry &entry)
+{
+    GuideEntryDisplayParts parts;
+    parts.title = entry.title.trimmed();
+    parts.episodeTitle = entry.episode.trimmed();
+    parts.synopsisBody = entry.synopsis.trimmed();
+
+    if (!parts.episodeTitle.isEmpty()) {
+        return parts;
+    }
+
+    const QString rawSynopsis = entry.synopsis.trimmed();
+    if (!rawSynopsis.contains('\n')) {
+        return parts;
+    }
+
+    const QStringList rawLines = rawSynopsis.split('\n');
+    QStringList lines;
+    for (const QString &line : rawLines) {
+        const QString trimmedLine = line.trimmed();
+        if (!trimmedLine.isEmpty()) {
+            lines.append(trimmedLine);
+        }
+    }
+
+    if (lines.isEmpty()) {
+        parts.synopsisBody.clear();
+        return parts;
+    }
+
+    parts.episodeTitle = lines.takeFirst();
+    parts.synopsisBody = lines.join('\n').trimmed();
+    return parts;
+}
+
+bool looksLikeSha1Hex(const QString &text)
+{
+    static const QRegularExpression pattern(QStringLiteral("^[0-9a-fA-F]{40}$"));
+    return pattern.match(text.trimmed()).hasMatch();
 }
 
 QString currentGuideCacheStamp(const QString &generatedUtc,
@@ -231,6 +314,137 @@ QString currentGuideCacheStamp(const QString &generatedUtc,
                          .arg(slotCount);
     }
     return cacheStamp;
+}
+
+struct JsonRequestResult {
+    QJsonDocument document;
+    QByteArray body;
+    QString errorText;
+    int httpStatus{0};
+    bool timedOut{false};
+
+    bool ok() const
+    {
+        return errorText.trimmed().isEmpty() && !timedOut && httpStatus >= 200 && httpStatus < 300;
+    }
+};
+
+JsonRequestResult performJsonRequest(QNetworkAccessManager &networkManager,
+                                     const QString &userAgent,
+                                     const QUrl &url,
+                                     const QString &token = QString(),
+                                     const QJsonDocument &requestBody = QJsonDocument(),
+                                     const QByteArray &method = QByteArray(),
+                                     int timeoutMs = 15000)
+{
+    JsonRequestResult result;
+
+    QNetworkRequest request(url);
+    request.setHeader(QNetworkRequest::ContentTypeHeader, "application/json");
+    request.setRawHeader("Accept", "application/json");
+    request.setRawHeader("User-Agent", userAgent.toUtf8());
+    if (!token.trimmed().isEmpty()) {
+        request.setRawHeader("token", token.trimmed().toUtf8());
+    }
+
+    const QByteArray body = requestBody.isNull() ? QByteArray() : requestBody.toJson(QJsonDocument::Compact);
+    const QByteArray effectiveMethod = method.trimmed().toUpper();
+    QNetworkReply *reply = nullptr;
+    if (effectiveMethod.isEmpty()) {
+        reply = requestBody.isNull()
+                    ? networkManager.get(request)
+                    : networkManager.post(request, body);
+    } else if (effectiveMethod == "GET") {
+        reply = networkManager.get(request);
+    } else if (effectiveMethod == "POST") {
+        reply = networkManager.post(request, body);
+    } else {
+        reply = networkManager.sendCustomRequest(request, effectiveMethod, body);
+    }
+    QEventLoop loop;
+    QTimer timeoutTimer;
+    timeoutTimer.setSingleShot(true);
+
+    QObject::connect(reply, &QNetworkReply::finished, &loop, &QEventLoop::quit);
+    QObject::connect(&timeoutTimer, &QTimer::timeout, &loop, [&]() {
+        result.timedOut = true;
+        result.errorText = QString("Request timed out after %1 ms").arg(timeoutMs);
+        reply->abort();
+        loop.quit();
+    });
+
+    timeoutTimer.start(timeoutMs);
+    loop.exec();
+    timeoutTimer.stop();
+
+    const QVariant statusCode = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute);
+    result.httpStatus = statusCode.isValid() ? statusCode.toInt() : 0;
+    result.body = reply->readAll();
+
+    QJsonParseError parseError{};
+    result.document = QJsonDocument::fromJson(result.body, &parseError);
+    if (!result.body.trimmed().isEmpty() && parseError.error != QJsonParseError::NoError) {
+        result.errorText = QString("Invalid JSON response: %1").arg(parseError.errorString());
+    }
+
+    if (!result.timedOut && reply->error() != QNetworkReply::NoError) {
+        QString serverMessage;
+        if (result.document.isObject()) {
+            const QJsonObject object = result.document.object();
+            const QString message = object.value("message").toString().trimmed();
+            const QString response = object.value("response").toString().trimmed();
+            if (!message.isEmpty() && !response.isEmpty()) {
+                serverMessage = QString("%1 (%2)").arg(message, response);
+            } else {
+                serverMessage = !message.isEmpty() ? message : response;
+            }
+        }
+
+        result.errorText = serverMessage.isEmpty()
+                               ? reply->errorString()
+                               : QString("%1: %2").arg(reply->errorString(), serverMessage);
+    } else if (!result.timedOut && result.errorText.trimmed().isEmpty() && (result.httpStatus < 200 || result.httpStatus >= 300)) {
+        result.errorText = QString("Unexpected HTTP status %1").arg(result.httpStatus);
+    }
+
+    reply->deleteLater();
+    return result;
+}
+
+QString firstProgramTitle(const QJsonObject &program)
+{
+    const QJsonArray titles = program.value("titles").toArray();
+    for (const QJsonValue &titleValue : titles) {
+        const QJsonObject titleObject = titleValue.toObject();
+        const QString title = titleObject.value("title120").toString().trimmed();
+        if (!title.isEmpty()) {
+            return title;
+        }
+        const QString shortTitle = titleObject.value("title40").toString().trimmed();
+        if (!shortTitle.isEmpty()) {
+            return shortTitle;
+        }
+    }
+    return {};
+}
+
+QString bestProgramDescription(const QJsonObject &program)
+{
+    const QJsonObject descriptions = program.value("descriptions").toObject();
+    const QStringList preferredBuckets = {QStringLiteral("description1000"),
+                                          QStringLiteral("description100"),
+                                          QStringLiteral("description1000Lang"),
+                                          QStringLiteral("description100Lang")};
+    for (const QString &bucket : preferredBuckets) {
+        const QJsonArray values = descriptions.value(bucket).toArray();
+        for (const QJsonValue &value : values) {
+            const QString description = value.toObject().value("description").toString().trimmed();
+            if (!description.isEmpty()) {
+                return description;
+            }
+        }
+    }
+    return {};
 }
 
 bool guideEntryMatchesScheduledSwitch(const QString &channelName,
@@ -269,14 +483,10 @@ bool scheduledSwitchesOverlap(const TvGuideScheduledSwitch &left, const TvGuideS
 
 QString autoFavoriteDismissalKey(const QString &cacheStamp, const TvGuideScheduledSwitch &scheduledSwitch)
 {
-    const QString trimmedStamp = cacheStamp.trimmed();
-    if (trimmedStamp.isEmpty()) {
-        return {};
-    }
+    Q_UNUSED(cacheStamp);
 
-    return QString("%1||%2||%3||%4||%5")
-        .arg(trimmedStamp,
-             scheduledSwitch.channelName.trimmed(),
+    return QString("%1||%2||%3||%4")
+        .arg(scheduledSwitch.channelName.trimmed(),
              QString::number(scheduledSwitch.startUtc.toMSecsSinceEpoch()),
              QString::number(scheduledSwitch.endUtc.toMSecsSinceEpoch()),
              normalizeFavoriteShowRule(scheduledSwitch.title));
@@ -338,17 +548,13 @@ void setAutoFavoriteLockedIn(QStringList &lockedSelections,
 
 QStringList loadPersistedAutoFavoriteDecisionList(const QString &cacheStamp, const QString &settingKey)
 {
-    const QString trimmedStamp = cacheStamp.trimmed();
-    if (trimmedStamp.isEmpty()) {
-        return {};
-    }
+    Q_UNUSED(cacheStamp);
 
     QSettings settings("tv_tuner_gui", "watcher");
-    const QString storedStamp = settings.value(kDismissedAutoFavoriteCandidatesStampSetting).toString().trimmed();
-    if (storedStamp != trimmedStamp) {
-        return {};
-    }
-    return settings.value(settingKey).toStringList();
+    QStringList values = settings.value(settingKey).toStringList();
+    values.removeAll(QString());
+    values.removeDuplicates();
+    return values;
 }
 
 void savePersistedAutoFavoriteConflictState(const QString &cacheStamp,
@@ -356,17 +562,28 @@ void savePersistedAutoFavoriteConflictState(const QString &cacheStamp,
                                             const QStringList &lockedSelections)
 {
     QSettings settings("tv_tuner_gui", "watcher");
-    const QString trimmedStamp = cacheStamp.trimmed();
-    if (trimmedStamp.isEmpty() || (dismissedCandidates.isEmpty() && lockedSelections.isEmpty())) {
+    if (dismissedCandidates.isEmpty() && lockedSelections.isEmpty()) {
         settings.remove(kDismissedAutoFavoriteCandidatesSetting);
         settings.remove(kLockedAutoFavoriteSelectionsSetting);
         settings.remove(kDismissedAutoFavoriteCandidatesStampSetting);
         return;
     }
 
-    settings.setValue(kDismissedAutoFavoriteCandidatesStampSetting, trimmedStamp);
-    settings.setValue(kDismissedAutoFavoriteCandidatesSetting, dismissedCandidates);
-    settings.setValue(kLockedAutoFavoriteSelectionsSetting, lockedSelections);
+    QStringList dedupedDismissed = dismissedCandidates;
+    dedupedDismissed.removeAll(QString());
+    dedupedDismissed.removeDuplicates();
+    QStringList dedupedLocked = lockedSelections;
+    dedupedLocked.removeAll(QString());
+    dedupedLocked.removeDuplicates();
+
+    const QString trimmedStamp = cacheStamp.trimmed();
+    if (trimmedStamp.isEmpty()) {
+        settings.remove(kDismissedAutoFavoriteCandidatesStampSetting);
+    } else {
+        settings.setValue(kDismissedAutoFavoriteCandidatesStampSetting, trimmedStamp);
+    }
+    settings.setValue(kDismissedAutoFavoriteCandidatesSetting, dedupedDismissed);
+    settings.setValue(kLockedAutoFavoriteSelectionsSetting, dedupedLocked);
 }
 
 QString scheduledSwitchLabel(const TvGuideScheduledSwitch &scheduledSwitch)
@@ -463,6 +680,9 @@ QJsonObject scheduledSwitchToJsonObject(const TvGuideScheduledSwitch &scheduledS
     object.insert("startUtc", scheduledSwitch.startUtc.toString(Qt::ISODateWithMs));
     object.insert("endUtc", scheduledSwitch.endUtc.toString(Qt::ISODateWithMs));
     object.insert("title", scheduledSwitch.title);
+    if (!scheduledSwitch.episode.trimmed().isEmpty()) {
+        object.insert("episode", scheduledSwitch.episode.trimmed());
+    }
     object.insert("synopsis", scheduledSwitch.synopsis);
     return object;
 }
@@ -481,6 +701,7 @@ QList<TvGuideScheduledSwitch> scheduledSwitchesFromJsonArray(const QJsonArray &a
         scheduledSwitch.startUtc = QDateTime::fromString(object.value("startUtc").toString(), Qt::ISODateWithMs);
         scheduledSwitch.endUtc = QDateTime::fromString(object.value("endUtc").toString(), Qt::ISODateWithMs);
         scheduledSwitch.title = object.value("title").toString().trimmed();
+        scheduledSwitch.episode = object.value("episode").toString().trimmed();
         scheduledSwitch.synopsis = object.value("synopsis").toString().trimmed();
 
         if (scheduledSwitch.channelName.isEmpty()
@@ -550,6 +771,128 @@ QString tuneKeyForParts(const QStringList &parts)
         return {};
     }
     return tuneKey(parts[1], parts[5]);
+}
+
+bool loadChannelHintsFromJson(QHash<QString, QString> &numberByTuneKey,
+                              QHash<QString, QString> &programByChannel,
+                              QString *errorText = nullptr)
+{
+    const QString hintsPath = resolveChannelHintsJsonPath();
+    if (hintsPath.isEmpty()) {
+        if (errorText != nullptr) {
+            *errorText = "Could not resolve the channel hints JSON path.";
+        }
+        return false;
+    }
+
+    QFile hintsFile(hintsPath);
+    if (!hintsFile.exists()) {
+        return false;
+    }
+    if (!hintsFile.open(QIODevice::ReadOnly | QIODevice::Text)) {
+        if (errorText != nullptr) {
+            *errorText = QString("Could not open %1.").arg(hintsPath);
+        }
+        return false;
+    }
+
+    QJsonParseError parseError{};
+    const QJsonDocument document = QJsonDocument::fromJson(hintsFile.readAll(), &parseError);
+    if (parseError.error != QJsonParseError::NoError || !document.isObject()) {
+        if (errorText != nullptr) {
+            *errorText = QString("Could not parse %1 (%2).").arg(hintsPath, parseError.errorString());
+        }
+        return false;
+    }
+
+    const QJsonObject root = document.object();
+    const QJsonObject numberObject = root.value("numberByTuneKey").toObject();
+    for (auto it = numberObject.begin(); it != numberObject.end(); ++it) {
+        const QString key = it.key().trimmed();
+        const QString value = it.value().toString().trimmed();
+        if (!key.isEmpty() && !value.isEmpty()) {
+            numberByTuneKey.insert(key, value);
+        }
+    }
+
+    const QJsonObject programObject = root.value("programByChannel").toObject();
+    for (auto it = programObject.begin(); it != programObject.end(); ++it) {
+        const QString key = it.key().trimmed();
+        const QString value = it.value().toString().trimmed();
+        if (!key.isEmpty() && !value.isEmpty()) {
+            programByChannel.insert(key, value);
+        }
+    }
+
+    return !numberByTuneKey.isEmpty() || !programByChannel.isEmpty();
+}
+
+bool saveChannelHintsToJson(const QHash<QString, QString> &numberByTuneKey,
+                            const QHash<QString, QString> &programByChannel,
+                            QString *errorText = nullptr)
+{
+    const QString hintsPath = resolveChannelHintsJsonPath();
+    if (hintsPath.isEmpty()) {
+        if (errorText != nullptr) {
+            *errorText = "Could not resolve the channel hints JSON path.";
+        }
+        return false;
+    }
+
+    QFileInfo hintsInfo(hintsPath);
+    QDir hintsDir = hintsInfo.dir();
+    if (!hintsDir.exists() && !hintsDir.mkpath(".")) {
+        if (errorText != nullptr) {
+            *errorText = QString("Could not create %1.").arg(hintsDir.path());
+        }
+        return false;
+    }
+
+    QJsonObject numberObject;
+    for (auto it = numberByTuneKey.cbegin(); it != numberByTuneKey.cend(); ++it) {
+        if (!it.key().trimmed().isEmpty() && !it.value().trimmed().isEmpty()) {
+            numberObject.insert(it.key(), it.value());
+        }
+    }
+
+    QJsonObject programObject;
+    for (auto it = programByChannel.cbegin(); it != programByChannel.cend(); ++it) {
+        if (!it.key().trimmed().isEmpty() && !it.value().trimmed().isEmpty()) {
+            programObject.insert(it.key(), it.value());
+        }
+    }
+
+    QJsonObject root;
+    root.insert("version", 1);
+    root.insert("generatedUtc", QDateTime::currentDateTimeUtc().toString(Qt::ISODateWithMs));
+    root.insert("numberByTuneKey", numberObject);
+    root.insert("programByChannel", programObject);
+
+    QSaveFile hintsFile(hintsPath);
+    if (!hintsFile.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+        if (errorText != nullptr) {
+            *errorText = QString("Could not open %1 for writing.").arg(hintsPath);
+        }
+        return false;
+    }
+
+    const QByteArray payload = QJsonDocument(root).toJson(QJsonDocument::Indented);
+    if (hintsFile.write(payload) != payload.size()) {
+        hintsFile.cancelWriting();
+        if (errorText != nullptr) {
+            *errorText = QString("Could not write %1.").arg(hintsPath);
+        }
+        return false;
+    }
+
+    if (!hintsFile.commit()) {
+        if (errorText != nullptr) {
+            *errorText = QString("Could not finalize %1.").arg(hintsPath);
+        }
+        return false;
+    }
+
+    return true;
 }
 
 QStringList normalizedFavorites(const QStringList &favorites, int maxCount = -1)
@@ -723,12 +1066,16 @@ bool findCurrentOrNextGuideEntry(const QList<TvGuideEntry> &entries,
 
 QString guideEntryToolTipText(const TvGuideEntry &entry)
 {
+    const GuideEntryDisplayParts parts = displayPartsForGuideEntry(entry);
     QString text = QString("%1\n%2 - %3")
-        .arg(entry.title,
+        .arg(parts.title,
              entry.startUtc.toLocalTime().toString("ddd h:mm AP"),
              entry.endUtc.toLocalTime().toString("ddd h:mm AP"));
-    if (!entry.synopsis.trimmed().isEmpty()) {
-        text += "\n\n" + entry.synopsis.trimmed();
+    if (!parts.episodeTitle.isEmpty()) {
+        text += "\nEpisode: " + parts.episodeTitle;
+    }
+    if (!parts.synopsisBody.isEmpty()) {
+        text += "\n\nSynopsis: " + parts.synopsisBody;
     }
     return text;
 }
@@ -743,10 +1090,15 @@ QString summarizeGuideEntries(const QList<TvGuideEntry> &entries, int maxItems =
     const int limit = std::min(maxItems, static_cast<int>(entries.size()));
     for (int i = 0; i < limit; ++i) {
         const TvGuideEntry &entry = entries.at(i);
-        parts << QString("%1 [%2-%3]")
-                     .arg(entry.title,
+        const GuideEntryDisplayParts display = displayPartsForGuideEntry(entry);
+        QString summary = QString("%1 [%2-%3]")
+                              .arg(display.title,
                           entry.startUtc.toLocalTime().toString("h:mm AP"),
                           entry.endUtc.toLocalTime().toString("h:mm AP"));
+        if (!display.episodeTitle.isEmpty()) {
+            summary += QString(" {%1}").arg(display.episodeTitle);
+        }
+        parts << summary;
     }
     if (entries.size() > limit) {
         parts << QString("... +%1 more").arg(entries.size() - limit);
@@ -759,6 +1111,207 @@ struct GuideChannelInfo {
     qint64 frequencyHz{0};
     int serviceId{-1};
 };
+
+struct SchedulesDirectLocalChannelHint {
+    QString name;
+    qint64 frequencyHz{0};
+    int serviceId{-1};
+    int rfChannel{-1};
+    int virtualMajor{-1};
+    int virtualMinor{-1};
+};
+
+struct SchedulesDirectChannelPayload {
+    QString channelLabel;
+    int rfChannel{-1};
+    int virtualMajor{-1};
+    int virtualMinor{-1};
+    QString stationName;
+    QString callsign;
+    QString affiliate;
+    QList<TvGuideEntry> entries;
+};
+
+QString normalizeGuideMatchText(const QString &text)
+{
+    QString normalized = text.toUpper();
+    normalized.remove(QRegularExpression("[^A-Z0-9]+"));
+    return normalized;
+}
+
+int atscRfChannelForFrequencyHz(qint64 frequencyHz)
+{
+    if (frequencyHz <= 0) {
+        return -1;
+    }
+
+    const int mhz = static_cast<int>(std::llround(static_cast<double>(frequencyHz) / 1000000.0));
+    if (mhz >= 57 && mhz <= 81 && ((mhz - 57) % 6) == 0) {
+        return 2 + ((mhz - 57) / 6);
+    }
+    if (mhz >= 177 && mhz <= 213 && ((mhz - 177) % 6) == 0) {
+        return 7 + ((mhz - 177) / 6);
+    }
+    if (mhz >= 473 && mhz <= 695 && ((mhz - 473) % 6) == 0) {
+        return 14 + ((mhz - 473) / 6);
+    }
+    return -1;
+}
+
+bool parseSchedulesDirectChannelLabel(const QString &channelLabel, int &major, int &minor)
+{
+    major = -1;
+    minor = -1;
+
+    const QStringList parts = channelLabel.trimmed().split('.');
+    if (parts.size() != 2) {
+        return false;
+    }
+
+    bool majorOk = false;
+    bool minorOk = false;
+    const int parsedMajor = parts.at(0).toInt(&majorOk);
+    const int parsedMinor = parts.at(1).toInt(&minorOk);
+    if (!majorOk || !minorOk || parsedMajor <= 0 || parsedMinor <= 0) {
+        return false;
+    }
+
+    major = parsedMajor;
+    minor = parsedMinor;
+    return true;
+}
+
+bool parseLocalVirtualChannelHint(const QString &channelNumberHint,
+                                  int serviceId,
+                                  int &major,
+                                  int &minor)
+{
+    major = -1;
+    minor = -1;
+
+    const QString trimmedHint = channelNumberHint.trimmed();
+    if (!trimmedHint.isEmpty()) {
+        const QStringList parts = trimmedHint.split(':');
+        if (parts.size() >= 2) {
+            bool majorOk = false;
+            bool minorOk = false;
+            const int parsedMajor = parts.at(0).toInt(&majorOk);
+            int parsedMinor = parts.at(1).toInt(&minorOk);
+            if (majorOk && minorOk && parsedMajor > 0 && parsedMinor > 0) {
+                if (parsedMinor >= 1024) {
+                    parsedMinor -= 1024;
+                }
+                if (parsedMinor > 0) {
+                    major = parsedMajor;
+                    minor = parsedMinor;
+                    return true;
+                }
+            }
+        }
+    }
+
+    if (serviceId >= 1001 && serviceId < 2000) {
+        minor = serviceId - 1000;
+        return minor > 0;
+    }
+
+    return false;
+}
+
+QString schedulesDirectEpisodeForProgram(const QJsonObject &programObject)
+{
+    return programObject.value("episode").toString().trimmed().isEmpty()
+               ? programObject.value("episodeTitle").toString().trimmed()
+               : programObject.value("episode").toString().trimmed();
+}
+
+QString schedulesDirectSynopsisForProgram(const QJsonObject &programObject)
+{
+    return programObject.value("description").toString().trimmed();
+}
+
+QVector<SchedulesDirectChannelPayload> parseSchedulesDirectExportChannels(const QJsonObject &root)
+{
+    QVector<SchedulesDirectChannelPayload> channels;
+    const QJsonArray lineups = root.value("lineups").toArray();
+    for (const QJsonValue &lineupValue : lineups) {
+        const QJsonArray lineupChannels = lineupValue.toObject().value("channels").toArray();
+        for (const QJsonValue &channelValue : lineupChannels) {
+            if (!channelValue.isObject()) {
+                continue;
+            }
+
+            const QJsonObject channelObject = channelValue.toObject();
+            SchedulesDirectChannelPayload channel;
+            channel.channelLabel = channelObject.value("channel").toString().trimmed();
+            channel.rfChannel = channelObject.value("uhfVhf").toInt(-1);
+            parseSchedulesDirectChannelLabel(channel.channelLabel, channel.virtualMajor, channel.virtualMinor);
+
+            const QJsonObject stationObject = channelObject.value("station").toObject();
+            channel.stationName = stationObject.value("name").toString().trimmed();
+            channel.callsign = stationObject.value("callsign").toString().trimmed();
+            channel.affiliate = stationObject.value("affiliate").toString().trimmed();
+
+            const QJsonArray scheduleDays = channelObject.value("schedule").toArray();
+            for (const QJsonValue &scheduleDayValue : scheduleDays) {
+                const QJsonArray programs = scheduleDayValue.toObject().value("programs").toArray();
+                for (const QJsonValue &programValue : programs) {
+                    const QJsonObject programObject = programValue.toObject();
+                    const QString airDateTime = programObject.value("airDateTime").toString().trimmed();
+                    if (airDateTime.isEmpty()) {
+                        continue;
+                    }
+
+                    QDateTime startUtc = QDateTime::fromString(airDateTime, Qt::ISODate);
+                    if (!startUtc.isValid()) {
+                        startUtc = QDateTime::fromString(airDateTime, Qt::ISODateWithMs);
+                    }
+                    if (!startUtc.isValid()) {
+                        continue;
+                    }
+                    startUtc = startUtc.toUTC();
+
+                    const int durationSeconds = std::max(0, programObject.value("duration").toInt());
+                    const QString title = programObject.value("title").toString().trimmed();
+                    if (title.isEmpty() || durationSeconds <= 0) {
+                        continue;
+                    }
+
+                    TvGuideEntry entry;
+                    entry.startUtc = startUtc;
+                    entry.endUtc = startUtc.addSecs(durationSeconds);
+                    entry.title = title;
+                    entry.episode = schedulesDirectEpisodeForProgram(programObject);
+                    entry.synopsis = schedulesDirectSynopsisForProgram(programObject);
+                    channel.entries.append(entry);
+                }
+            }
+
+            channels.append(channel);
+        }
+    }
+
+    return channels;
+}
+
+bool schedulesDirectLocalNameMatches(const QString &localName,
+                                     const SchedulesDirectChannelPayload &candidate)
+{
+    const QString normalizedLocal = normalizeGuideMatchText(localName);
+    if (normalizedLocal.isEmpty()) {
+        return false;
+    }
+
+    const QString normalizedStation = normalizeGuideMatchText(candidate.stationName);
+    const QString normalizedCallsign = normalizeGuideMatchText(candidate.callsign);
+    const QString normalizedAffiliate = normalizeGuideMatchText(candidate.affiliate);
+
+    return normalizedStation == normalizedLocal
+           || normalizedCallsign == normalizedLocal
+           || normalizedStation.contains(normalizedLocal)
+           || normalizedCallsign.contains(normalizedLocal)
+           || normalizedAffiliate == normalizedLocal;
+}
 
 struct RawGuideEvent {
     int serviceId{-1};
@@ -866,6 +1419,9 @@ QList<TvGuideEntry> cleanGuideEntries(const QList<TvGuideEntry> &entries,
                                       .arg(entry.title);
         if (dedupeIndexByKey.contains(dedupeKey)) {
             TvGuideEntry &existingEntry = cleaned[dedupeIndexByKey.value(dedupeKey)];
+            if (existingEntry.episode.trimmed().isEmpty() && !entry.episode.trimmed().isEmpty()) {
+                existingEntry.episode = entry.episode.trimmed();
+            }
             if (existingEntry.synopsis.trimmed().isEmpty() && !entry.synopsis.trimmed().isEmpty()) {
                 existingEntry.synopsis = entry.synopsis.trimmed();
             }
@@ -886,6 +1442,9 @@ QJsonObject guideEntryToJson(const TvGuideEntry &entry)
     object.insert("startUtc", entry.startUtc.toString(Qt::ISODateWithMs));
     object.insert("endUtc", entry.endUtc.toString(Qt::ISODateWithMs));
     object.insert("title", entry.title);
+    if (!entry.episode.trimmed().isEmpty()) {
+        object.insert("episode", entry.episode.trimmed());
+    }
     if (!entry.synopsis.trimmed().isEmpty()) {
         object.insert("synopsis", entry.synopsis.trimmed());
     }
@@ -914,7 +1473,13 @@ QList<TvGuideEntry> guideEntriesFromJsonArray(const QJsonArray &array)
         entry.startUtc = QDateTime::fromString(object.value("startUtc").toString(), Qt::ISODateWithMs);
         entry.endUtc = QDateTime::fromString(object.value("endUtc").toString(), Qt::ISODateWithMs);
         entry.title = object.value("title").toString().trimmed();
+        entry.episode = object.value("episode").toString().trimmed();
         entry.synopsis = object.value("synopsis").toString().trimmed();
+        if (entry.episode.isEmpty()) {
+            const GuideEntryDisplayParts parts = displayPartsForGuideEntry(entry);
+            entry.episode = parts.episodeTitle;
+            entry.synopsis = parts.synopsisBody;
+        }
         if (!entry.startUtc.isValid() || !entry.endUtc.isValid() || entry.title.isEmpty()) {
             continue;
         }
@@ -2490,6 +3055,10 @@ MainWindow::MainWindow(QWidget *parent)
         const QSignalBlocker blocker(autoPictureInPictureCheckBox_);
         autoPictureInPictureCheckBox_->setChecked(autoPictureInPictureEnabled_);
     }
+    if (useSchedulesDirectGuideCheckBox_ != nullptr) {
+        const QSignalBlocker blocker(useSchedulesDirectGuideCheckBox_);
+        useSchedulesDirectGuideCheckBox_->setChecked(settings.value(kUseSchedulesDirectGuideSetting, false).toBool());
+    }
     if (guideRefreshIntervalSpin_ != nullptr) {
         const QSignalBlocker blocker(guideRefreshIntervalSpin_);
         guideRefreshIntervalSpin_->setValue(settings.value(kGuideRefreshIntervalMinutesSetting,
@@ -2502,8 +3071,21 @@ MainWindow::MainWindow(QWidget *parent)
                                                           kDefaultGuideCacheRetentionHours)
                                                .toInt());
     }
+    if (schedulesDirectUsernameEdit_ != nullptr) {
+        const QSignalBlocker blocker(schedulesDirectUsernameEdit_);
+        schedulesDirectUsernameEdit_->setText(settings.value(kSchedulesDirectUsernameSetting).toString().trimmed());
+    }
+    if (schedulesDirectPasswordEdit_ != nullptr) {
+        const QSignalBlocker blocker(schedulesDirectPasswordEdit_);
+        schedulesDirectPasswordEdit_->setText(settings.value(kSchedulesDirectPasswordSha1Setting).toString().trimmed());
+    }
+    if (schedulesDirectPostalCodeEdit_ != nullptr) {
+        const QSignalBlocker blocker(schedulesDirectPostalCodeEdit_);
+        schedulesDirectPostalCodeEdit_->setText(settings.value(kSchedulesDirectPostalCodeSetting).toString().trimmed());
+    }
     applyGuideFilterSettings();
     applyGuideRefreshIntervalSetting();
+    updateSchedulesDirectControls();
 
     connect(scanProcess_, &QProcess::readyReadStandardOutput, this, &MainWindow::handleStdOut);
     connect(scanProcess_, &QProcess::readyReadStandardError, this, &MainWindow::handleStdErr);
@@ -2861,10 +3443,12 @@ void MainWindow::buildUi()
 
     auto *guideOptionsGroup = new QGroupBox("TV Guide", configPage_);
     auto *guideOptionsLayout = new QVBoxLayout(guideOptionsGroup);
+    useSchedulesDirectGuideCheckBox_ = new QCheckBox("Use Schedules Direct OTA data for guide refreshes", guideOptionsGroup);
     hideNoEitChannelsCheckBox_ = new QCheckBox("Hide channels without EIT data", guideOptionsGroup);
     showFavoritesOnlyCheckBox_ = new QCheckBox("Show only favorites in TV Guide", guideOptionsGroup);
     obeyScheduledSwitchesCheckBox_ = new QCheckBox("Obey scheduled tuner switches", guideOptionsGroup);
     autoFavoriteShowSchedulingCheckBox_ = new QCheckBox("Automatically schedule favorite show matches", guideOptionsGroup);
+    guideOptionsLayout->addWidget(useSchedulesDirectGuideCheckBox_);
     guideOptionsLayout->addWidget(hideNoEitChannelsCheckBox_);
     guideOptionsLayout->addWidget(showFavoritesOnlyCheckBox_);
     guideOptionsLayout->addWidget(obeyScheduledSwitchesCheckBox_);
@@ -2886,6 +3470,29 @@ void MainWindow::buildUi()
     guideCacheRetentionSpin_->setSuffix(" hr");
     cacheOptionsForm->addRow("Refresh guide JSON every:", guideRefreshIntervalSpin_);
     cacheOptionsForm->addRow("Delete guide cache after:", guideCacheRetentionSpin_);
+
+    auto *schedulesDirectGroup = new QGroupBox("Schedules Direct", configPage_);
+    auto *schedulesDirectLayout = new QVBoxLayout(schedulesDirectGroup);
+    auto *schedulesDirectForm = new QFormLayout();
+    schedulesDirectUsernameEdit_ = new QLineEdit(schedulesDirectGroup);
+    schedulesDirectUsernameEdit_->setPlaceholderText("voncloft");
+    schedulesDirectPasswordEdit_ = new QLineEdit(schedulesDirectGroup);
+    schedulesDirectPasswordEdit_->setEchoMode(QLineEdit::Password);
+    schedulesDirectPasswordEdit_->setPlaceholderText("Saved as SHA1 for background refreshes");
+    schedulesDirectPostalCodeEdit_ = new QLineEdit(schedulesDirectGroup);
+    schedulesDirectPostalCodeEdit_->setPlaceholderText("46825");
+    schedulesDirectPostalCodeEdit_->setMaxLength(16);
+    schedulesDirectForm->addRow("Username:", schedulesDirectUsernameEdit_);
+    schedulesDirectForm->addRow("Password:", schedulesDirectPasswordEdit_);
+    schedulesDirectForm->addRow("ZIP / Postal code:", schedulesDirectPostalCodeEdit_);
+    exportSchedulesDirectButton_ = new QPushButton("Download schedules_direct.org.json", schedulesDirectGroup);
+    exportSchedulesDirectButton_->setEnabled(false);
+    schedulesDirectStatusLabel_ = new QLabel("Downloads OTA lineup, schedule, and program data to a JSON file in the app data folder. When the guide checkbox above is enabled, background guide refreshes use this source instead of live EIT.", schedulesDirectGroup);
+    schedulesDirectStatusLabel_->setWordWrap(true);
+    schedulesDirectStatusLabel_->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    schedulesDirectLayout->addLayout(schedulesDirectForm);
+    schedulesDirectLayout->addWidget(exportSchedulesDirectButton_, 0);
+    schedulesDirectLayout->addWidget(schedulesDirectStatusLabel_, 0);
 
     auto *favoriteShowsGroup = new QGroupBox("Favorite Shows", metaManagementPage);
     auto *favoriteShowsLayout = new QVBoxLayout(favoriteShowsGroup);
@@ -2918,6 +3525,7 @@ void MainWindow::buildUi()
     configLayout->addWidget(guideOptionsGroup);
     configLayout->addWidget(playbackOptionsGroup);
     configLayout->addWidget(cacheOptionsGroup);
+    configLayout->addWidget(schedulesDirectGroup);
     configLayout->addStretch(1);
 
     metaManagementLayout->addWidget(favoriteShowsGroup, 1);
@@ -3137,6 +3745,44 @@ void MainWindow::buildUi()
             qOverload<int>(&QSpinBox::valueChanged),
             this,
             &MainWindow::handleGuideCacheRetentionChanged);
+    connect(useSchedulesDirectGuideCheckBox_, &QCheckBox::toggled, this, [this](bool checked) {
+        QSettings settings("tv_tuner_gui", "watcher");
+        settings.setValue(kUseSchedulesDirectGuideSetting, checked);
+        updateSchedulesDirectControls();
+        const bool dialogVisible = tvGuideDialog_ != nullptr && tvGuideDialog_->isVisible();
+        if (refreshGuideData(false, dialogVisible)) {
+            loadGuideCacheFile();
+            applyCurrentShowStatusFromGuideCache();
+        }
+        if (!dialogVisible) {
+            updateTvGuideDialogFromCurrentCache(false);
+        }
+    });
+    connect(schedulesDirectUsernameEdit_, &QLineEdit::textChanged, this, [this](const QString &text) {
+        QSettings settings("tv_tuner_gui", "watcher");
+        settings.setValue(kSchedulesDirectUsernameSetting, text.trimmed());
+        updateSchedulesDirectControls();
+    });
+    connect(schedulesDirectPostalCodeEdit_, &QLineEdit::textChanged, this, [this](const QString &text) {
+        QSettings settings("tv_tuner_gui", "watcher");
+        settings.setValue(kSchedulesDirectPostalCodeSetting, text.trimmed());
+        updateSchedulesDirectControls();
+    });
+    connect(schedulesDirectPasswordEdit_, &QLineEdit::textChanged, this, [this](const QString &text) {
+        QSettings settings("tv_tuner_gui", "watcher");
+        const QString trimmedText = text.trimmed();
+        if (trimmedText.isEmpty()) {
+            settings.remove(kSchedulesDirectPasswordSha1Setting);
+        } else if (looksLikeSha1Hex(trimmedText)) {
+            settings.setValue(kSchedulesDirectPasswordSha1Setting, trimmedText.toLower());
+        } else {
+            const QString passwordSha1 =
+                QString::fromLatin1(QCryptographicHash::hash(text.toUtf8(), QCryptographicHash::Sha1).toHex());
+            settings.setValue(kSchedulesDirectPasswordSha1Setting, passwordSha1);
+        }
+        updateSchedulesDirectControls();
+    });
+    connect(exportSchedulesDirectButton_, &QPushButton::clicked, this, &MainWindow::exportSchedulesDirectJson);
     connect(channelsTable_, &QTableWidget::cellDoubleClicked, this, [this](int, int) {
         watchSelectedChannel();
     });
@@ -3201,6 +3847,7 @@ void MainWindow::buildUi()
     connect(removeFavoriteShowRuleButton_, &QPushButton::clicked, this, &MainWindow::removeSelectedFavoriteShowRule);
     connect(removeScheduledSwitchButton_, &QPushButton::clicked, this, &MainWindow::removeSelectedScheduledSwitch);
     connect(fullscreenButton_, &QPushButton::clicked, this, &MainWindow::toggleFullscreen);
+    updateSchedulesDirectControls();
 }
 
 void MainWindow::handleGuideHideNoEitToggled(bool checked)
@@ -3284,6 +3931,990 @@ void MainWindow::handleGuideCacheRetentionChanged(int hours)
     updateTvGuideDialogFromCurrentCache(false);
     setStatusBarStateMessage(removed ? "Old cached data purged"
                                      : "Guide cache retention updated");
+}
+
+bool MainWindow::useSchedulesDirectGuideSource() const
+{
+    if (useSchedulesDirectGuideCheckBox_ != nullptr) {
+        return useSchedulesDirectGuideCheckBox_->isChecked();
+    }
+    QSettings settings("tv_tuner_gui", "watcher");
+    return settings.value(kUseSchedulesDirectGuideSetting, false).toBool();
+}
+
+void MainWindow::updateSchedulesDirectControls()
+{
+    const QString username = schedulesDirectUsernameEdit_ != nullptr
+                                 ? schedulesDirectUsernameEdit_->text().trimmed()
+                                 : QString();
+    const QString password = schedulesDirectPasswordEdit_ != nullptr
+                                 ? schedulesDirectPasswordEdit_->text().trimmed()
+                                 : QString();
+    const QString postalCode = schedulesDirectPostalCodeEdit_ != nullptr
+                                   ? schedulesDirectPostalCodeEdit_->text().trimmed()
+                                   : QString();
+    const bool ready = !username.isEmpty() && !password.isEmpty() && !postalCode.isEmpty();
+    if (exportSchedulesDirectButton_ != nullptr) {
+        exportSchedulesDirectButton_->setEnabled(ready);
+    }
+
+    if (schedulesDirectStatusLabel_ == nullptr) {
+        return;
+    }
+
+    const bool hasCachedJson = QFileInfo::exists(resolveSchedulesDirectExportPath())
+                               || QFileInfo::exists(resolveLegacySchedulesDirectExportPath());
+    if (useSchedulesDirectGuideSource()) {
+        if (ready) {
+            schedulesDirectStatusLabel_->setText("Background guide refreshes will download OTA JSON from Schedules Direct and use it instead of live EIT.");
+        } else if (hasCachedJson) {
+            schedulesDirectStatusLabel_->setText("Background guide refreshes are set to Schedules Direct. Cached OTA JSON will be used until username, password, and ZIP are filled in again.");
+        } else {
+            schedulesDirectStatusLabel_->setText("Background guide refreshes are set to Schedules Direct. Enter username, password, and ZIP/postal code to let the timer download OTA JSON.");
+        }
+        return;
+    }
+
+    if (ready) {
+        schedulesDirectStatusLabel_->setText("Ready to download schedules_direct.org.json. The password field can contain your plain password or the saved 40-character SHA1 hash.");
+    } else if (hasCachedJson) {
+        schedulesDirectStatusLabel_->setText("A cached Schedules Direct OTA JSON file is available. Enter username, password, and ZIP/postal code to refresh it.");
+    } else {
+        schedulesDirectStatusLabel_->setText("Enter username, password, and ZIP/postal code to download OTA JSON. The config stores the password as a SHA1 hash because sdJSON accepts the hash directly.");
+    }
+}
+
+bool MainWindow::ensureSchedulesDirectJson(bool allowCachedExport,
+                                           bool *usedCachedExport,
+                                           QString *summary,
+                                           QString *errorText)
+{
+    if (usedCachedExport != nullptr) {
+        *usedCachedExport = false;
+    }
+    if (summary != nullptr) {
+        summary->clear();
+    }
+    if (errorText != nullptr) {
+        errorText->clear();
+    }
+
+    QSettings settings("tv_tuner_gui", "watcher");
+    const QString username = schedulesDirectUsernameEdit_ != nullptr
+                                 ? schedulesDirectUsernameEdit_->text().trimmed()
+                                 : settings.value(kSchedulesDirectUsernameSetting).toString().trimmed();
+    const QString postalCode = schedulesDirectPostalCodeEdit_ != nullptr
+                                   ? schedulesDirectPostalCodeEdit_->text().trimmed()
+                                   : settings.value(kSchedulesDirectPostalCodeSetting).toString().trimmed();
+    QString passwordInput = schedulesDirectPasswordEdit_ != nullptr
+                                ? schedulesDirectPasswordEdit_->text().trimmed()
+                                : settings.value(kSchedulesDirectPasswordSha1Setting).toString().trimmed();
+    const QString exportPath = resolveSchedulesDirectExportPath();
+    const QString legacyExportPath = resolveLegacySchedulesDirectExportPath();
+    const QString cachedExportPath = QFileInfo::exists(exportPath)
+                                         ? exportPath
+                                         : (QFileInfo::exists(legacyExportPath) ? legacyExportPath : QString());
+
+    const auto finishWithCachedExport = [&](const QString &reason) {
+        if (usedCachedExport != nullptr) {
+            *usedCachedExport = true;
+        }
+        const QString message = QString("%1 Using cached Schedules Direct JSON from %2.")
+                                    .arg(reason.trimmed(), cachedExportPath);
+        if (summary != nullptr) {
+            *summary = message;
+        }
+        appendLog(QString("schedules-direct: %1").arg(message));
+        if (schedulesDirectStatusLabel_ != nullptr) {
+            schedulesDirectStatusLabel_->setText(message);
+        }
+        setStatusBarStateMessage("Using cached Schedules Direct JSON");
+        return true;
+    };
+
+    if (username.isEmpty() || passwordInput.isEmpty() || postalCode.isEmpty()) {
+        if (allowCachedExport && !cachedExportPath.isEmpty()) {
+            return finishWithCachedExport("Schedules Direct credentials are incomplete.");
+        }
+        const QString message = "Enter your Schedules Direct username, password, and ZIP/postal code first.";
+        if (errorText != nullptr) {
+            *errorText = message;
+        }
+        appendLog(QString("schedules-direct: %1").arg(message));
+        if (schedulesDirectStatusLabel_ != nullptr) {
+            schedulesDirectStatusLabel_->setText(message);
+        }
+        setStatusBarStateMessage("Schedules Direct download not configured");
+        return false;
+    }
+
+    if (exportPath.isEmpty()) {
+        const QString message = "Could not resolve the app data folder for schedules_direct.org.json.";
+        if (errorText != nullptr) {
+            *errorText = message;
+        }
+        if (schedulesDirectStatusLabel_ != nullptr) {
+            schedulesDirectStatusLabel_->setText(message);
+        }
+        setStatusBarStateMessage("Schedules Direct download failed");
+        return false;
+    }
+
+    QFileInfo exportInfo(exportPath);
+    QDir exportDir = exportInfo.dir();
+    if (!exportDir.exists() && !exportDir.mkpath(".")) {
+        const QString message = QString("Could not create the export folder for %1.").arg(exportPath);
+        if (errorText != nullptr) {
+            *errorText = message;
+        }
+        if (schedulesDirectStatusLabel_ != nullptr) {
+            schedulesDirectStatusLabel_->setText(message);
+        }
+        setStatusBarStateMessage("Schedules Direct download failed");
+        return false;
+    }
+
+    QString passwordSha1 = passwordInput;
+    if (!looksLikeSha1Hex(passwordSha1)) {
+        passwordSha1 = QString::fromLatin1(QCryptographicHash::hash(passwordInput.toUtf8(), QCryptographicHash::Sha1).toHex());
+    }
+    passwordSha1 = passwordSha1.toLower();
+    settings.setValue(kSchedulesDirectUsernameSetting, username);
+    settings.setValue(kSchedulesDirectPasswordSha1Setting, passwordSha1);
+    settings.setValue(kSchedulesDirectPostalCodeSetting, postalCode);
+
+    const auto updateStatus = [this](const QString &text, const QString &statusBarText = QString()) {
+        if (schedulesDirectStatusLabel_ != nullptr) {
+            schedulesDirectStatusLabel_->setText(text);
+        }
+        setStatusBarStateMessage(statusBarText.isEmpty() ? text : statusBarText);
+        QCoreApplication::processEvents(QEventLoop::AllEvents, 50);
+    };
+
+    updateStatus("Connecting to Schedules Direct...", "Schedules Direct download in progress");
+    logInteraction("program",
+                   "schedules-direct.export.start",
+                   QString("username=%1 postal=%2 source=%3")
+                       .arg(username,
+                            postalCode,
+                            useSchedulesDirectGuideSource() ? "guide-timer" : "manual"));
+
+    const QString userAgent = QString("tv_tuner_gui/%1").arg(QStringLiteral(TV_TUNER_GUI_VERSION));
+    QNetworkAccessManager networkManager;
+
+    const auto failExport = [&](const QString &failureSummary, const QString &details) {
+        QString message = failureSummary.trimmed();
+        if (!details.trimmed().isEmpty()) {
+            message += QString(" %1").arg(details.trimmed());
+        }
+        message.replace('\n', ' ');
+        appendLog(QString("schedules-direct: %1").arg(message));
+        logInteraction("program",
+                       "schedules-direct.export.failed",
+                       message);
+        if (allowCachedExport && !cachedExportPath.isEmpty()) {
+            return finishWithCachedExport(message);
+        }
+        if (schedulesDirectStatusLabel_ != nullptr) {
+            schedulesDirectStatusLabel_->setText(failureSummary);
+        }
+        if (errorText != nullptr) {
+            *errorText = message;
+        }
+        setStatusBarStateMessage("Schedules Direct export failed");
+        return false;
+    };
+
+    QJsonObject tokenRequestBody;
+    tokenRequestBody.insert("username", username);
+    tokenRequestBody.insert("password", passwordSha1);
+    const JsonRequestResult tokenResult =
+        performJsonRequest(networkManager,
+                           userAgent,
+                           QUrl("https://json.schedulesdirect.org/20141201/token"),
+                           QString(),
+                           QJsonDocument(tokenRequestBody));
+    if (!tokenResult.ok() || !tokenResult.document.isObject()) {
+        return failExport("Schedules Direct login failed.", tokenResult.errorText);
+    }
+
+    const QJsonObject tokenObject = tokenResult.document.object();
+    const QString token = tokenObject.value("token").toString().trimmed();
+    if (token.isEmpty()) {
+        return failExport("Schedules Direct login failed.", "The token response did not include a usable token.");
+    }
+
+    updateStatus("Fetching account status...");
+
+    const JsonRequestResult statusResult =
+        performJsonRequest(networkManager,
+                           userAgent,
+                           QUrl("https://json.schedulesdirect.org/20141201/status"),
+                           token);
+    if (!statusResult.ok() || !statusResult.document.isObject()) {
+        return failExport("Schedules Direct status lookup failed.", statusResult.errorText);
+    }
+
+    updateStatus(QString("Fetching headends for %1...").arg(postalCode));
+
+    QUrl headendsUrl("https://json.schedulesdirect.org/20141201/headends");
+    QUrlQuery headendsQuery;
+    headendsQuery.addQueryItem("country", "USA");
+    headendsQuery.addQueryItem("postalcode", postalCode);
+    headendsUrl.setQuery(headendsQuery);
+    const JsonRequestResult headendsResult =
+        performJsonRequest(networkManager,
+                           userAgent,
+                           headendsUrl,
+                           token);
+    if (!headendsResult.ok() || !headendsResult.document.isArray()) {
+        return failExport("Schedules Direct headend lookup failed.", headendsResult.errorText);
+    }
+
+    const QJsonArray headends = headendsResult.document.array();
+    QJsonArray otaHeadends;
+    QStringList otaLineupIds;
+    for (const QJsonValue &value : headends) {
+        if (!value.isObject()) {
+            continue;
+        }
+
+        const QJsonObject headend = value.toObject();
+        if (headend.value("transport").toString().trimmed().compare("Antenna", Qt::CaseInsensitive) != 0) {
+            continue;
+        }
+
+        otaHeadends.append(headend);
+        const QJsonArray lineups = headend.value("lineups").toArray();
+        for (const QJsonValue &lineupValue : lineups) {
+            const QString lineupId = lineupValue.toObject().value("lineup").toString().trimmed();
+            if (!lineupId.isEmpty() && !otaLineupIds.contains(lineupId)) {
+                otaLineupIds.append(lineupId);
+            }
+        }
+    }
+    if (otaLineupIds.isEmpty()) {
+        return failExport(QString("No OTA lineup was found for %1.").arg(postalCode),
+                          "Schedules Direct returned no Antenna lineups for the current ZIP/postal code.");
+    }
+
+    QSet<QString> accountLineupIds;
+    const QJsonArray statusLineups = statusResult.document.object().value("lineups").toArray();
+    for (const QJsonValue &value : statusLineups) {
+        const QString lineupId = value.toObject().value("lineup").toString().trimmed();
+        if (!lineupId.isEmpty()) {
+            accountLineupIds.insert(lineupId);
+        }
+    }
+
+    QJsonArray addedLineups;
+    QJsonArray exportedLineups;
+    int totalChannels = 0;
+    int totalScheduleEntries = 0;
+    int totalResolvedPrograms = 0;
+
+    constexpr int kSchedulesDirectTimeoutMs = 120000;
+    constexpr int kProgramChunkSize = 500;
+
+    for (int index = 0; index < otaLineupIds.size(); ++index) {
+        const QString &lineupId = otaLineupIds.at(index);
+        const QString encodedLineupId = QString::fromUtf8(QUrl::toPercentEncoding(lineupId));
+
+        if (!accountLineupIds.contains(lineupId)) {
+            updateStatus(QString("Adding OTA lineup %1/%2...")
+                             .arg(index + 1)
+                             .arg(otaLineupIds.size()));
+
+            const JsonRequestResult addLineupResult =
+                performJsonRequest(networkManager,
+                                   userAgent,
+                                   QUrl(QString("https://json.schedulesdirect.org/20141201/lineups/%1")
+                                            .arg(encodedLineupId)),
+                                   token,
+                                   QJsonDocument(),
+                                   "PUT",
+                                   kSchedulesDirectTimeoutMs);
+            if (!addLineupResult.ok() || !addLineupResult.document.isObject()) {
+                return failExport(QString("Could not add OTA lineup %1 to the Schedules Direct account.").arg(lineupId),
+                                  addLineupResult.errorText);
+            }
+
+            addedLineups.append(addLineupResult.document.object());
+            accountLineupIds.insert(lineupId);
+        }
+
+        updateStatus(QString("Fetching OTA lineup %1/%2...")
+                         .arg(index + 1)
+                         .arg(otaLineupIds.size()));
+
+        const JsonRequestResult lineupResult =
+            performJsonRequest(networkManager,
+                               userAgent,
+                               QUrl(QString("https://json.schedulesdirect.org/20141201/lineups/%1")
+                                        .arg(encodedLineupId)),
+                               token,
+                               QJsonDocument(),
+                               QByteArray(),
+                               kSchedulesDirectTimeoutMs);
+        if (!lineupResult.ok() || !lineupResult.document.isObject()) {
+            return failExport(QString("Could not fetch OTA lineup %1.").arg(lineupId), lineupResult.errorText);
+        }
+
+        const QJsonObject lineupObject = lineupResult.document.object();
+        const QJsonArray stationMap = lineupObject.value("map").toArray();
+        const QJsonArray stations = lineupObject.value("stations").toArray();
+        if (stationMap.isEmpty()) {
+            return failExport(QString("OTA lineup %1 returned no channel map.").arg(lineupId),
+                              "The lineup request succeeded but did not include any mapped OTA stations.");
+        }
+
+        QHash<QString, QJsonObject> stationById;
+        for (const QJsonValue &stationValue : stations) {
+            const QJsonObject stationObject = stationValue.toObject();
+            const QString stationId = stationObject.value("stationID").toString().trimmed();
+            if (!stationId.isEmpty()) {
+                stationById.insert(stationId, stationObject);
+            }
+        }
+
+        QSet<QString> stationIdSet;
+        QJsonArray schedulesRequestArray;
+        for (const QJsonValue &mapValue : stationMap) {
+            const QString stationId = mapValue.toObject().value("stationID").toString().trimmed();
+            if (stationId.isEmpty() || stationIdSet.contains(stationId)) {
+                continue;
+            }
+            stationIdSet.insert(stationId);
+            QJsonObject scheduleRequestObject;
+            scheduleRequestObject.insert("stationID", stationId);
+            schedulesRequestArray.append(scheduleRequestObject);
+        }
+
+        updateStatus(QString("Fetching OTA schedules %1/%2...")
+                         .arg(index + 1)
+                         .arg(otaLineupIds.size()));
+
+        const JsonRequestResult schedulesResult =
+            performJsonRequest(networkManager,
+                               userAgent,
+                               QUrl("https://json.schedulesdirect.org/20141201/schedules"),
+                               token,
+                               QJsonDocument(schedulesRequestArray),
+                               QByteArray(),
+                               kSchedulesDirectTimeoutMs);
+        if (!schedulesResult.ok() || !schedulesResult.document.isArray()) {
+            return failExport(QString("Could not fetch OTA schedules for %1.").arg(lineupId),
+                              schedulesResult.errorText);
+        }
+
+        const QJsonArray scheduleDays = schedulesResult.document.array();
+        QHash<QString, QJsonArray> scheduleDaysByStation;
+        QStringList uniqueProgramIds;
+        QSet<QString> seenProgramIds;
+        int lineupScheduleEntries = 0;
+        for (const QJsonValue &scheduleDayValue : scheduleDays) {
+            if (!scheduleDayValue.isObject()) {
+                continue;
+            }
+
+            const QJsonObject scheduleDayObject = scheduleDayValue.toObject();
+            const QString stationId = scheduleDayObject.value("stationID").toString().trimmed();
+            if (stationId.isEmpty()) {
+                continue;
+            }
+
+            QJsonArray stationScheduleDays = scheduleDaysByStation.value(stationId);
+            stationScheduleDays.append(scheduleDayObject);
+            scheduleDaysByStation.insert(stationId, stationScheduleDays);
+
+            const QJsonArray dailyPrograms = scheduleDayObject.value("programs").toArray();
+            for (const QJsonValue &programValue : dailyPrograms) {
+                const QString programId = programValue.toObject().value("programID").toString().trimmed();
+                if (!programId.isEmpty() && !seenProgramIds.contains(programId)) {
+                    seenProgramIds.insert(programId);
+                    uniqueProgramIds.append(programId);
+                }
+                if (!programId.isEmpty()) {
+                    ++lineupScheduleEntries;
+                }
+            }
+        }
+
+        QJsonObject programsById;
+        for (int start = 0; start < uniqueProgramIds.size(); start += kProgramChunkSize) {
+            const int chunkNumber = (start / kProgramChunkSize) + 1;
+            const int chunkCount = std::max(1, static_cast<int>(std::ceil(uniqueProgramIds.size()
+                                                                          / static_cast<double>(kProgramChunkSize))));
+            updateStatus(QString("Fetching OTA program details %1/%2 for %3...")
+                             .arg(chunkNumber)
+                             .arg(chunkCount)
+                             .arg(lineupId));
+
+            QJsonArray programsRequestArray;
+            const int end = std::min(start + kProgramChunkSize, static_cast<int>(uniqueProgramIds.size()));
+            for (int programIndex = start; programIndex < end; ++programIndex) {
+                programsRequestArray.append(uniqueProgramIds.at(programIndex));
+            }
+
+            const JsonRequestResult programsResult =
+                performJsonRequest(networkManager,
+                                   userAgent,
+                                   QUrl("https://json.schedulesdirect.org/20141201/programs"),
+                                   token,
+                                   QJsonDocument(programsRequestArray),
+                                   QByteArray(),
+                                   kSchedulesDirectTimeoutMs);
+            if (!programsResult.ok() || !programsResult.document.isArray()) {
+                return failExport(QString("Could not fetch OTA program details for %1.").arg(lineupId),
+                                  programsResult.errorText);
+            }
+
+            for (const QJsonValue &programValue : programsResult.document.array()) {
+                if (!programValue.isObject()) {
+                    continue;
+                }
+                const QJsonObject programObject = programValue.toObject();
+                const QString programId = programObject.value("programID").toString().trimmed();
+                if (!programId.isEmpty()) {
+                    programsById.insert(programId, programObject);
+                }
+            }
+        }
+
+        QJsonArray channels;
+        for (const QJsonValue &mapValue : stationMap) {
+            const QJsonObject mapObject = mapValue.toObject();
+            const QString stationId = mapObject.value("stationID").toString().trimmed();
+
+            QJsonObject channelObject = mapObject;
+            if (stationById.contains(stationId)) {
+                channelObject.insert("station", stationById.value(stationId));
+            }
+
+            QJsonArray enrichedScheduleDays;
+            int channelScheduleEntries = 0;
+            const QJsonArray stationScheduleDays = scheduleDaysByStation.value(stationId);
+            for (const QJsonValue &scheduleDayValue : stationScheduleDays) {
+                const QJsonObject scheduleDayObject = scheduleDayValue.toObject();
+                QJsonObject enrichedScheduleDay = scheduleDayObject;
+                QJsonArray enrichedPrograms;
+
+                const QJsonArray dailyPrograms = scheduleDayObject.value("programs").toArray();
+                for (const QJsonValue &programValue : dailyPrograms) {
+                    QJsonObject enrichedProgram = programValue.toObject();
+                    const QString programId = enrichedProgram.value("programID").toString().trimmed();
+                    const QJsonObject programObject = programsById.value(programId).toObject();
+                    if (!programObject.isEmpty()) {
+                        const QString title = firstProgramTitle(programObject);
+                        const QString episodeTitle = programObject.value("episodeTitle150").toString().trimmed();
+                        const QString description = bestProgramDescription(programObject);
+                        const QString showType = programObject.value("showType").toString().trimmed();
+                        const QString entityType = programObject.value("entityType").toString().trimmed();
+                        const QString originalAirDate = programObject.value("originalAirDate").toString().trimmed();
+
+                        if (!title.isEmpty()) {
+                            enrichedProgram.insert("title", title);
+                        }
+                        if (!episodeTitle.isEmpty()) {
+                            enrichedProgram.insert("episode", episodeTitle);
+                            enrichedProgram.insert("episodeTitle", episodeTitle);
+                        }
+                        if (!description.isEmpty()) {
+                            enrichedProgram.insert("description", description);
+                        }
+                        if (!showType.isEmpty()) {
+                            enrichedProgram.insert("showType", showType);
+                        }
+                        if (!entityType.isEmpty()) {
+                            enrichedProgram.insert("entityType", entityType);
+                        }
+                        if (!originalAirDate.isEmpty()) {
+                            enrichedProgram.insert("originalAirDate", originalAirDate);
+                        }
+
+                        const QJsonArray genres = programObject.value("genres").toArray();
+                        if (!genres.isEmpty()) {
+                            enrichedProgram.insert("genres", genres);
+                        }
+                    }
+
+                    enrichedPrograms.append(enrichedProgram);
+                    ++channelScheduleEntries;
+                }
+
+                enrichedScheduleDay.insert("programs", enrichedPrograms);
+                enrichedScheduleDays.append(enrichedScheduleDay);
+            }
+
+            channelObject.insert("schedule", enrichedScheduleDays);
+            channelObject.insert("scheduleEntryCount", channelScheduleEntries);
+            channels.append(channelObject);
+            ++totalChannels;
+            totalScheduleEntries += channelScheduleEntries;
+        }
+
+        totalResolvedPrograms += programsById.size();
+
+        QJsonObject exportedLineup;
+        exportedLineup.insert("lineup", lineupId);
+        exportedLineup.insert("metadata", lineupObject.value("metadata").toObject());
+        exportedLineup.insert("stationCount", stations.size());
+        exportedLineup.insert("channelCount", channels.size());
+        exportedLineup.insert("scheduleDayCount", scheduleDays.size());
+        exportedLineup.insert("scheduleEntryCount", lineupScheduleEntries);
+        exportedLineup.insert("programCount", programsById.size());
+        exportedLineup.insert("channels", channels);
+        exportedLineups.append(exportedLineup);
+    }
+
+    QJsonObject exportObject;
+    exportObject.insert("version", 2);
+    exportObject.insert("generatedUtc", QDateTime::currentDateTimeUtc().toString(Qt::ISODateWithMs));
+    exportObject.insert("source", "Schedules Direct sdJSON");
+    exportObject.insert("transport", "Antenna");
+    exportObject.insert("country", "USA");
+    exportObject.insert("postalCode", postalCode);
+    exportObject.insert("username", username);
+    exportObject.insert("tokenExpires", tokenObject.value("tokenExpires").toInt());
+    exportObject.insert("status", statusResult.document.object());
+    exportObject.insert("otaHeadends", otaHeadends);
+    exportObject.insert("addedLineups", addedLineups);
+    exportObject.insert("lineups", exportedLineups);
+    exportObject.insert("totalChannels", totalChannels);
+    exportObject.insert("totalScheduleEntries", totalScheduleEntries);
+    exportObject.insert("totalProgramRecords", totalResolvedPrograms);
+
+    QSaveFile exportFile(exportPath);
+    if (!exportFile.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+        return failExport("Schedules Direct export failed.",
+                          QString("Could not open %1 for writing.").arg(exportPath));
+    }
+
+    const QByteArray payload = QJsonDocument(exportObject).toJson(QJsonDocument::Indented);
+    if (exportFile.write(payload) != payload.size()) {
+        exportFile.cancelWriting();
+        return failExport("Schedules Direct export failed.",
+                          QString("Could not write the JSON payload to %1.").arg(exportPath));
+    }
+    if (!exportFile.commit()) {
+        return failExport("Schedules Direct export failed.",
+                          QString("Could not finalize %1.").arg(exportPath));
+    }
+
+    QHash<QString, QList<TvGuideEntry>> guideLikeEntries;
+    QStringList importedChannels;
+    QStringList unmatchedChannels;
+    QStringList skippedChannels;
+    int importedEntryCount = 0;
+    const QDateTime nowUtc = QDateTime::currentDateTimeUtc();
+    const int retentionHours = guideCacheRetentionHoursValue(guideCacheRetentionSpin_);
+    QDateTime latestEndUtc = nowUtc.addSecs(6 * 3600);
+    applySchedulesDirectGuideFallback(guideLikeEntries,
+                                      retentionHours,
+                                      nowUtc,
+                                      &latestEndUtc,
+                                      &importedChannels,
+                                      &unmatchedChannels,
+                                      &skippedChannels,
+                                      &importedEntryCount);
+
+    QStringList channelOrder;
+    QSet<QString> seenChannelNames;
+    const QVector<GuideChannelInfo> localChannels = parseGuideChannels(channelLines_);
+    for (const GuideChannelInfo &channel : localChannels) {
+        if (!channel.name.trimmed().isEmpty() && !seenChannelNames.contains(channel.name)) {
+            seenChannelNames.insert(channel.name);
+            channelOrder.append(channel.name);
+        }
+    }
+
+    QDateTime windowStartUtc = nowUtc;
+    windowStartUtc = windowStartUtc.addSecs(-windowStartUtc.time().second());
+    windowStartUtc = windowStartUtc.addMSecs(-windowStartUtc.time().msec());
+    windowStartUtc = windowStartUtc.addSecs(-(windowStartUtc.time().minute() % 30) * 60);
+
+    constexpr int slotMinutes = 30;
+    const qint64 minimumWindowSeconds = 6 * 3600;
+    const qint64 requestedWindowSeconds =
+        std::max(minimumWindowSeconds, windowStartUtc.secsTo(latestEndUtc) + slotMinutes * 60);
+    int slotCount = static_cast<int>(std::ceil(static_cast<double>(requestedWindowSeconds) / (slotMinutes * 60.0)));
+    slotCount = std::clamp(slotCount, 12, 32);
+
+    QJsonArray channelOrderArray;
+    for (const QString &channelName : channelOrder) {
+        channelOrderArray.append(channelName);
+    }
+
+    QJsonObject entriesByChannelObject;
+    int guideLikeChannelCount = 0;
+    for (const QString &channelName : channelOrder) {
+        const QList<TvGuideEntry> entries = guideLikeEntries.value(channelName);
+        if (!entries.isEmpty()) {
+            ++guideLikeChannelCount;
+        }
+        entriesByChannelObject.insert(channelName, guideEntriesToJsonArray(entries));
+    }
+
+    QString guideLikeStatusText = QString("Schedules Direct OTA guide: %1 entries mapped for %2/%3 local channels.")
+                                      .arg(importedEntryCount)
+                                      .arg(guideLikeChannelCount)
+                                      .arg(channelOrder.size());
+    if (!unmatchedChannels.isEmpty()) {
+        guideLikeStatusText += QString("\nNo guide data: %1").arg(unmatchedChannels.join(", "));
+    }
+    if (!skippedChannels.isEmpty()) {
+        guideLikeStatusText += QString("\nSkipped duplicate local channel names: %1").arg(skippedChannels.join(", "));
+    }
+
+    exportObject.insert("version", 3);
+    exportObject.insert("windowStartUtc", windowStartUtc.toString(Qt::ISODateWithMs));
+    exportObject.insert("slotMinutes", slotMinutes);
+    exportObject.insert("slotCount", slotCount);
+    exportObject.insert("statusText", guideLikeStatusText);
+    exportObject.insert("channelOrder", channelOrderArray);
+    exportObject.insert("entriesByChannel", entriesByChannelObject);
+    exportObject.insert("mappedChannels", QJsonArray::fromStringList(importedChannels));
+    exportObject.insert("unmatchedChannels", QJsonArray::fromStringList(unmatchedChannels));
+    exportObject.insert("skippedChannels", QJsonArray::fromStringList(skippedChannels));
+
+    QSaveFile guideLikeExportFile(exportPath);
+    if (!guideLikeExportFile.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+        return failExport("Schedules Direct export failed.",
+                          QString("Could not reopen %1 for guide-shaped JSON output.").arg(exportPath));
+    }
+
+    const QByteArray guideLikePayload = QJsonDocument(exportObject).toJson(QJsonDocument::Indented);
+    if (guideLikeExportFile.write(guideLikePayload) != guideLikePayload.size()) {
+        guideLikeExportFile.cancelWriting();
+        return failExport("Schedules Direct export failed.",
+                          QString("Could not write the guide-shaped JSON payload to %1.").arg(exportPath));
+    }
+    if (!guideLikeExportFile.commit()) {
+        return failExport("Schedules Direct export failed.",
+                          QString("Could not finalize the guide-shaped JSON payload at %1.").arg(exportPath));
+    }
+
+    const QString summaryText = QString("Saved %1 OTA lineup%2 with %3 channels and %4 show entries to %5")
+                                .arg(exportedLineups.size())
+                                .arg(exportedLineups.size() == 1 ? QString() : QString("s"))
+                                .arg(totalChannels)
+                                .arg(totalScheduleEntries)
+                                .arg(exportPath);
+    appendLog(QString("schedules-direct: %1").arg(summaryText));
+    logInteraction("program",
+                   "schedules-direct.export.complete",
+                   QString("postal=%1 ota-lineups=%2 channels=%3 schedule-entries=%4 path=%5")
+                       .arg(postalCode)
+                       .arg(exportedLineups.size())
+                       .arg(totalChannels)
+                       .arg(totalScheduleEntries)
+                       .arg(exportPath));
+    if (schedulesDirectStatusLabel_ != nullptr) {
+        schedulesDirectStatusLabel_->setText(summaryText);
+    }
+    setStatusBarStateMessage("Schedules Direct export complete");
+    if (summary != nullptr) {
+        *summary = summaryText;
+    }
+    return true;
+}
+
+void MainWindow::exportSchedulesDirectJson()
+{
+    if (exportSchedulesDirectButton_ != nullptr) {
+        exportSchedulesDirectButton_->setEnabled(false);
+    }
+    struct ExportGuard {
+        std::function<void()> onExit;
+        ~ExportGuard()
+        {
+            if (onExit) {
+                onExit();
+            }
+        }
+    } exportGuard{[this]() {
+        if (exportSchedulesDirectButton_ != nullptr) {
+            const bool ready = schedulesDirectUsernameEdit_ != nullptr
+                               && schedulesDirectPasswordEdit_ != nullptr
+                               && schedulesDirectPostalCodeEdit_ != nullptr
+                               && !schedulesDirectUsernameEdit_->text().trimmed().isEmpty()
+                               && !schedulesDirectPasswordEdit_->text().trimmed().isEmpty()
+                               && !schedulesDirectPostalCodeEdit_->text().trimmed().isEmpty();
+            exportSchedulesDirectButton_->setEnabled(ready);
+        }
+    }};
+
+    QString summaryText;
+    QString errorText;
+    bool usedCachedExport = false;
+    const bool ok = ensureSchedulesDirectJson(false, &usedCachedExport, &summaryText, &errorText);
+    if (!ok) {
+        return;
+    }
+}
+
+bool MainWindow::applySchedulesDirectGuideFallback(QHash<QString, QList<TvGuideEntry>> &entriesByChannel,
+                                                   int retentionHours,
+                                                   const QDateTime &nowUtc,
+                                                   QDateTime *latestEndUtc,
+                                                   QStringList *importedChannels,
+                                                   QStringList *unmatchedChannels,
+                                                   QStringList *skippedChannels,
+                                                   int *importedEntryCount)
+{
+    if (importedChannels != nullptr) {
+        importedChannels->clear();
+    }
+    if (unmatchedChannels != nullptr) {
+        unmatchedChannels->clear();
+    }
+    if (skippedChannels != nullptr) {
+        skippedChannels->clear();
+    }
+    if (importedEntryCount != nullptr) {
+        *importedEntryCount = 0;
+    }
+
+    auto appendUnique = [](QStringList *list, const QString &value) {
+        if (list == nullptr) {
+            return;
+        }
+        const QString trimmedValue = value.trimmed();
+        if (!trimmedValue.isEmpty() && !list->contains(trimmedValue)) {
+            list->append(trimmedValue);
+        }
+    };
+
+    if (channelLines_.isEmpty()) {
+        return false;
+    }
+
+    QString exportPath = resolveSchedulesDirectExportPath();
+    if (exportPath.isEmpty()) {
+        return false;
+    }
+    if (!QFileInfo::exists(exportPath)) {
+        const QString legacyExportPath = resolveLegacySchedulesDirectExportPath();
+        if (QFileInfo::exists(legacyExportPath)) {
+            exportPath = legacyExportPath;
+        }
+    }
+
+    QFile exportFile(exportPath);
+    if (!exportFile.exists() || !exportFile.open(QIODevice::ReadOnly | QIODevice::Text)) {
+        return false;
+    }
+
+    QJsonParseError parseError{};
+    const QJsonDocument document = QJsonDocument::fromJson(exportFile.readAll(), &parseError);
+    if (parseError.error != QJsonParseError::NoError || !document.isObject()) {
+        appendLog(QString("guide-sd: could not parse %1 (%2)")
+                      .arg(exportPath, parseError.errorString()));
+        return false;
+    }
+
+    const QJsonObject rootObject = document.object();
+    const QJsonObject embeddedEntriesObject = rootObject.value("entriesByChannel").toObject();
+    if (!embeddedEntriesObject.isEmpty()) {
+        int importedEntries = 0;
+        for (auto it = embeddedEntriesObject.begin(); it != embeddedEntriesObject.end(); ++it) {
+            const QString channelName = it.key().trimmed();
+            if (channelName.isEmpty()) {
+                continue;
+            }
+
+            const QList<TvGuideEntry> cleanedEntries =
+                cleanGuideEntries(guideEntriesFromJsonArray(it.value().toArray()),
+                                  nowUtc,
+                                  retentionHours,
+                                  latestEndUtc);
+            entriesByChannel.insert(channelName, cleanedEntries);
+            if (!cleanedEntries.isEmpty()) {
+                importedEntries += cleanedEntries.size();
+                appendUnique(importedChannels, channelName);
+            }
+        }
+
+        const auto appendArrayToList = [&appendUnique](const QJsonArray &array, QStringList *list) {
+            for (const QJsonValue &value : array) {
+                appendUnique(list, value.toString());
+            }
+        };
+        appendArrayToList(rootObject.value("unmatchedChannels").toArray(), unmatchedChannels);
+        appendArrayToList(rootObject.value("skippedChannels").toArray(), skippedChannels);
+
+        if (importedEntryCount != nullptr) {
+            *importedEntryCount = importedEntries;
+        }
+        if (importedChannels != nullptr && !importedChannels->isEmpty()) {
+            appendLog(QString("guide-sd: loaded %1 entries for %2 local channel%3 from embedded guide data in %4")
+                          .arg(importedEntries)
+                          .arg(importedChannels->size())
+                          .arg(importedChannels->size() == 1 ? QString() : QString("s"))
+                          .arg(exportPath));
+            return true;
+        }
+        return false;
+    }
+
+    const QVector<SchedulesDirectChannelPayload> sdChannels =
+        parseSchedulesDirectExportChannels(rootObject);
+    if (sdChannels.isEmpty()) {
+        appendLog(QString("guide-sd: %1 did not contain OTA schedule entries.").arg(exportPath));
+        return false;
+    }
+
+    const QVector<GuideChannelInfo> localChannels = parseGuideChannels(channelLines_);
+    if (localChannels.isEmpty()) {
+        return false;
+    }
+
+    QHash<QString, int> localNameCounts;
+    for (const GuideChannelInfo &channel : localChannels) {
+        localNameCounts[channel.name] += 1;
+    }
+
+    int importedEntries = 0;
+    int matchedChannels = 0;
+    for (const GuideChannelInfo &channel : localChannels) {
+        const QString localName = channel.name.trimmed();
+        if (localName.isEmpty()) {
+            continue;
+        }
+
+        if (localNameCounts.value(localName) > 1) {
+            appendUnique(skippedChannels, localName);
+            continue;
+        }
+
+        if (!entriesByChannel.value(localName).isEmpty()) {
+            continue;
+        }
+
+        SchedulesDirectLocalChannelHint hint;
+        hint.name = localName;
+        hint.frequencyHz = channel.frequencyHz;
+        hint.serviceId = channel.serviceId;
+        hint.rfChannel = atscRfChannelForFrequencyHz(channel.frequencyHz);
+
+        const QString xspfNumberHint =
+            xspfNumberByTuneKey_.value(tuneKey(QString::number(channel.frequencyHz),
+                                              QString::number(channel.serviceId))).trimmed();
+        parseLocalVirtualChannelHint(xspfNumberHint, channel.serviceId, hint.virtualMajor, hint.virtualMinor);
+
+        const SchedulesDirectChannelPayload *matchedChannel = nullptr;
+
+        if (hint.virtualMajor > 0 && hint.virtualMinor > 0) {
+            for (const SchedulesDirectChannelPayload &candidate : sdChannels) {
+                if (candidate.virtualMajor == hint.virtualMajor
+                    && candidate.virtualMinor == hint.virtualMinor) {
+                    matchedChannel = &candidate;
+                    break;
+                }
+            }
+        }
+
+        if (matchedChannel == nullptr && hint.rfChannel > 0 && hint.virtualMinor > 0) {
+            const SchedulesDirectChannelPayload *uniqueRfMinorMatch = nullptr;
+            for (const SchedulesDirectChannelPayload &candidate : sdChannels) {
+                if (candidate.rfChannel != hint.rfChannel || candidate.virtualMinor != hint.virtualMinor) {
+                    continue;
+                }
+                if (uniqueRfMinorMatch != nullptr) {
+                    uniqueRfMinorMatch = nullptr;
+                    break;
+                }
+                uniqueRfMinorMatch = &candidate;
+            }
+            matchedChannel = uniqueRfMinorMatch;
+        }
+
+        if (matchedChannel == nullptr && hint.rfChannel > 0) {
+            const SchedulesDirectChannelPayload *uniqueRfNameMatch = nullptr;
+            for (const SchedulesDirectChannelPayload &candidate : sdChannels) {
+                if (candidate.rfChannel != hint.rfChannel
+                    || !schedulesDirectLocalNameMatches(localName, candidate)) {
+                    continue;
+                }
+                if (uniqueRfNameMatch != nullptr) {
+                    uniqueRfNameMatch = nullptr;
+                    break;
+                }
+                uniqueRfNameMatch = &candidate;
+            }
+            matchedChannel = uniqueRfNameMatch;
+        }
+
+        if (matchedChannel == nullptr && hint.virtualMajor > 0) {
+            const SchedulesDirectChannelPayload *uniqueMajorNameMatch = nullptr;
+            for (const SchedulesDirectChannelPayload &candidate : sdChannels) {
+                if (candidate.virtualMajor != hint.virtualMajor
+                    || !schedulesDirectLocalNameMatches(localName, candidate)) {
+                    continue;
+                }
+                if (uniqueMajorNameMatch != nullptr) {
+                    uniqueMajorNameMatch = nullptr;
+                    break;
+                }
+                uniqueMajorNameMatch = &candidate;
+            }
+            matchedChannel = uniqueMajorNameMatch;
+        }
+
+        if (matchedChannel == nullptr && hint.rfChannel > 0) {
+            const SchedulesDirectChannelPayload *onlyRfMatch = nullptr;
+            for (const SchedulesDirectChannelPayload &candidate : sdChannels) {
+                if (candidate.rfChannel != hint.rfChannel) {
+                    continue;
+                }
+                if (onlyRfMatch != nullptr) {
+                    onlyRfMatch = nullptr;
+                    break;
+                }
+                onlyRfMatch = &candidate;
+            }
+            matchedChannel = onlyRfMatch;
+        }
+
+        if (matchedChannel == nullptr) {
+            appendUnique(unmatchedChannels, localName);
+            continue;
+        }
+
+        const QList<TvGuideEntry> cleanedEntries =
+            cleanGuideEntries(matchedChannel->entries, nowUtc, retentionHours, latestEndUtc);
+        if (cleanedEntries.isEmpty()) {
+            appendUnique(unmatchedChannels, localName);
+            continue;
+        }
+
+        entriesByChannel.insert(localName, cleanedEntries);
+        importedEntries += cleanedEntries.size();
+        ++matchedChannels;
+        appendUnique(importedChannels, localName);
+        appendLog(QString("guide-sd: mapped %1 -> %2 (%3 entries)")
+                      .arg(localName, matchedChannel->channelLabel)
+                      .arg(cleanedEntries.size()));
+    }
+
+    if (importedEntryCount != nullptr) {
+        *importedEntryCount = importedEntries;
+    }
+
+    if (matchedChannels > 0) {
+        appendLog(QString("guide-sd: imported %1 entries for %2 local channel%3 from %4")
+                      .arg(importedEntries)
+                      .arg(matchedChannels)
+                      .arg(matchedChannels == 1 ? QString() : QString("s"))
+                      .arg(exportPath));
+    }
+    if (skippedChannels != nullptr && !skippedChannels->isEmpty()) {
+        appendLog(QString("guide-sd: skipped duplicate local channel name%1: %2")
+                      .arg(skippedChannels->size() == 1 ? QString() : QString("s"))
+                      .arg(skippedChannels->join(", ")));
+    }
+
+    return matchedChannels > 0;
 }
 
 void MainWindow::applyGuideFilterSettings()
@@ -3618,6 +5249,18 @@ void MainWindow::handleCurrentTabChanged(int index)
 
     if (tabs_->widget(index) == tvGuideDialog_ && tvGuideDialog_ != nullptr) {
         tvGuideDialog_->syncToCurrentTime();
+        const QDateTime nowUtc = QDateTime::currentDateTimeUtc();
+        const bool cacheLooksCurrent =
+            guideCacheLooksCurrentForStartup(guideEntriesCache_, lastGuideWindowStartUtc_, nowUtc);
+        const bool cacheMatchesSelectedSource =
+            useSchedulesDirectGuideSource()
+                ? lastGuideStatusText_.contains("Schedules Direct", Qt::CaseInsensitive)
+                : !lastGuideStatusText_.contains("Schedules Direct", Qt::CaseInsensitive);
+        if (!guideRefreshInProgress_ && (!cacheLooksCurrent || !cacheMatchesSelectedSource)) {
+            refreshGuideData(false, true);
+        } else {
+            updateTvGuideDialogFromCurrentCache(false);
+        }
     }
 
     if (tabs_->widget(index) == watchPage_) {
@@ -4380,6 +6023,7 @@ void MainWindow::scheduleMatchingGuideEntriesForTitle(const QString &favoriteSho
                 candidate.startUtc = entry.startUtc;
                 candidate.endUtc = entry.endUtc;
                 candidate.title = entry.title.trimmed();
+                candidate.episode = entry.episode.trimmed();
                 candidate.synopsis = entry.synopsis.trimmed();
                 appendCandidate(candidate);
             }
@@ -4438,6 +6082,7 @@ void MainWindow::handleGuideScheduleToggle(const QString &channelName, const TvG
     candidate.startUtc = entry.startUtc;
     candidate.endUtc = entry.endUtc;
     candidate.title = entry.title.trimmed();
+    candidate.episode = entry.episode.trimmed();
     candidate.synopsis = entry.synopsis.trimmed();
     logInteraction("user",
                    "schedule.guide-toggle",
@@ -4508,6 +6153,7 @@ void MainWindow::handleSearchScheduleRequested(const QString &favoriteShowTitle,
     candidate.startUtc = entry.startUtc;
     candidate.endUtc = entry.endUtc;
     candidate.title = entry.title.trimmed();
+    candidate.episode = entry.episode.trimmed();
     candidate.synopsis = entry.synopsis.trimmed();
 
     if (entryIsFuture) {
@@ -4600,18 +6246,10 @@ void MainWindow::autoScheduleFavoriteShowsFromGuideCache(bool promptForConflict,
         lockedAutoFavoriteSelections_ =
             loadPersistedAutoFavoriteDecisionList(currentCacheStamp,
                                                   kLockedAutoFavoriteSelectionsSetting);
-        if (dismissedAutoFavoriteCandidates_.isEmpty() && lockedAutoFavoriteSelections_.isEmpty()) {
-            savePersistedAutoFavoriteConflictState(QString(),
-                                                   dismissedAutoFavoriteCandidates_,
-                                                   lockedAutoFavoriteSelections_);
-            appendLog(QString("favorite-show auto: cleared persisted conflict decisions for new stamp %1")
-                          .arg(currentCacheStamp));
-        } else {
-            appendLog(QString("favorite-show auto: restored persisted conflict decisions for stamp %1 dismissed=%2 locked=%3")
-                          .arg(currentCacheStamp)
-                          .arg(dismissedAutoFavoriteCandidates_.size())
-                          .arg(lockedAutoFavoriteSelections_.size()));
-        }
+        appendLog(QString("favorite-show auto: restored persisted conflict decisions for stamp %1 dismissed=%2 locked=%3")
+                      .arg(currentCacheStamp)
+                      .arg(dismissedAutoFavoriteCandidates_.size())
+                      .arg(lockedAutoFavoriteSelections_.size()));
     }
     logInteraction("program",
                    "favorite-show.auto.begin",
@@ -4660,6 +6298,7 @@ void MainWindow::autoScheduleFavoriteShowsFromGuideCache(bool promptForConflict,
                 candidate.startUtc = entry.startUtc;
                 candidate.endUtc = entry.endUtc;
                 candidate.title = entry.title.trimmed();
+                candidate.episode = entry.episode.trimmed();
                 candidate.synopsis = entry.synopsis.trimmed();
                 if (isAutoFavoriteDismissed(dismissedAutoFavoriteCandidates_, currentCacheStamp, candidate)) {
                     appendLog(QString("favorite-show auto: skipped dismissed candidate rule=%1 -> %2")
@@ -5138,13 +6777,20 @@ void MainWindow::openMediaFile()
 
 bool MainWindow::refreshGuideData(bool interactive, bool updateDialog)
 {
-    if (scanProcess_ != nullptr && scanProcess_->state() != QProcess::NotRunning) {
+    const bool useSchedulesDirect = useSchedulesDirectGuideSource();
+    if (!useSchedulesDirect
+        && scanProcess_ != nullptr
+        && scanProcess_->state() != QProcess::NotRunning) {
         if (interactive) {
             QMessageBox::warning(this, "Scan in progress", "Stop scanning before opening the TV guide.");
         } else {
             appendLog("guide-bg: skipped guide refresh while a scan is in progress.");
         }
         return false;
+    }
+
+    if (useSchedulesDirect) {
+        return refreshGuideDataFromSchedulesDirect(interactive, updateDialog);
     }
 
     if (channelLines_.isEmpty()) {
@@ -5598,8 +7244,10 @@ bool MainWindow::refreshGuideData(bool interactive, bool updateDialog)
 
 void MainWindow::refreshTvGuide()
 {
-    loadGuideCacheFile();
-    updateTvGuideDialogFromCurrentCache(true);
+    if (!refreshGuideData(true, true)) {
+        loadGuideCacheFile();
+        updateTvGuideDialogFromCurrentCache(true);
+    }
 }
 
 bool MainWindow::writeGuideCacheFile(const QStringList &channelOrder,
@@ -5706,6 +7354,238 @@ bool writeGuideCacheBetaFile(const QStringList &channelOrder,
 }
 }
 
+bool MainWindow::refreshGuideDataFromSchedulesDirect(bool interactive, bool updateDialog)
+{
+    if (guideEntriesCache_.isEmpty()) {
+        loadGuideCacheFile();
+    }
+
+    const auto setGuideRefreshInProgress = [this](bool active) {
+        guideRefreshInProgress_ = active;
+        setStatusBarStateMessage(lastStatusBarMessage_);
+    };
+    struct GuideRefreshGuard {
+        std::function<void()> onExit;
+        ~GuideRefreshGuard()
+        {
+            if (onExit) {
+                onExit();
+            }
+        }
+    };
+
+    setGuideRefreshInProgress(true);
+    GuideRefreshGuard guideRefreshGuard{[&setGuideRefreshInProgress]() {
+        setGuideRefreshInProgress(false);
+    }};
+
+    const QString loadingMessage = "Downloading OTA schedule data from Schedules Direct...";
+    if (updateDialog && tvGuideDialog_ != nullptr) {
+        tvGuideDialog_->setLoadingState(loadingMessage);
+    }
+    setStatusBarStateMessage("Downloading Schedules Direct guide data...");
+    if (!interactive) {
+        appendLog("guide-bg: starting Schedules Direct guide refresh.");
+    }
+    QCoreApplication::processEvents(QEventLoop::ExcludeUserInputEvents);
+
+    QString exportSummary;
+    QString exportError;
+    bool usedCachedExport = false;
+    if (!ensureSchedulesDirectJson(true, &usedCachedExport, &exportSummary, &exportError)) {
+        const QString statusText = exportError.trimmed().isEmpty()
+                                       ? QString("Schedules Direct guide refresh failed.")
+                                       : exportError.trimmed();
+        appendLog(QString("guide-sd: %1").arg(statusText));
+        if (updateDialog && tvGuideDialog_ != nullptr) {
+            tvGuideDialog_->setLoadingState(statusText);
+        }
+        setStatusBarStateMessage(statusText.section('\n', 0, 0));
+        return false;
+    }
+
+    QString exportPath = resolveSchedulesDirectExportPath();
+    if (!QFileInfo::exists(exportPath)) {
+        const QString legacyExportPath = resolveLegacySchedulesDirectExportPath();
+        if (QFileInfo::exists(legacyExportPath)) {
+            exportPath = legacyExportPath;
+        }
+    }
+
+    QFile exportFile(exportPath);
+    if (!exportFile.exists() || !exportFile.open(QIODevice::ReadOnly | QIODevice::Text)) {
+        const QString statusText = QString("Could not open %1 for Schedules Direct guide import.").arg(exportPath);
+        appendLog(QString("guide-sd: %1").arg(statusText));
+        if (updateDialog && tvGuideDialog_ != nullptr) {
+            tvGuideDialog_->setLoadingState(statusText);
+        }
+        setStatusBarStateMessage("Schedules Direct guide import failed");
+        return false;
+    }
+
+    QJsonParseError parseError{};
+    const QJsonDocument document = QJsonDocument::fromJson(exportFile.readAll(), &parseError);
+    if (parseError.error != QJsonParseError::NoError || !document.isObject()) {
+        const QString statusText = QString("Could not parse %1 (%2).").arg(exportPath, parseError.errorString());
+        appendLog(QString("guide-sd: %1").arg(statusText));
+        if (updateDialog && tvGuideDialog_ != nullptr) {
+            tvGuideDialog_->setLoadingState(statusText);
+        }
+        setStatusBarStateMessage("Schedules Direct guide import failed");
+        return false;
+    }
+
+    const QJsonObject root = document.object();
+    QStringList channelOrder;
+    const QJsonArray channelOrderArray = root.value("channelOrder").toArray();
+    for (const QJsonValue &value : channelOrderArray) {
+        const QString channelName = value.toString().trimmed();
+        if (!channelName.isEmpty() && !channelOrder.contains(channelName)) {
+            channelOrder.append(channelName);
+        }
+    }
+    if (channelOrder.isEmpty()) {
+        const QVector<GuideChannelInfo> localChannels = parseGuideChannels(channelLines_);
+        QSet<QString> seenChannelNames;
+        for (const GuideChannelInfo &channel : localChannels) {
+            if (!channel.name.trimmed().isEmpty() && !seenChannelNames.contains(channel.name)) {
+                seenChannelNames.insert(channel.name);
+                channelOrder.append(channel.name);
+            }
+        }
+    }
+
+    const QDateTime nowUtc = QDateTime::currentDateTimeUtc();
+    const int retentionHours = guideCacheRetentionHoursValue(guideCacheRetentionSpin_);
+    QDateTime latestEndUtc = nowUtc.addSecs(6 * 3600);
+    QHash<QString, QList<TvGuideEntry>> entriesByChannel;
+    const QJsonObject entriesObject = root.value("entriesByChannel").toObject();
+    if (!entriesObject.isEmpty()) {
+        for (auto it = entriesObject.begin(); it != entriesObject.end(); ++it) {
+            entriesByChannel.insert(it.key(),
+                                    cleanGuideEntries(guideEntriesFromJsonArray(it.value().toArray()),
+                                                      nowUtc,
+                                                      retentionHours,
+                                                      &latestEndUtc));
+        }
+    } else {
+        QStringList importedChannels;
+        QStringList unmatchedChannels;
+        QStringList skippedChannels;
+        int importedEntryCount = 0;
+        applySchedulesDirectGuideFallback(entriesByChannel,
+                                          retentionHours,
+                                          nowUtc,
+                                          &latestEndUtc,
+                                          &importedChannels,
+                                          &unmatchedChannels,
+                                          &skippedChannels,
+                                          &importedEntryCount);
+    }
+
+    int mappedEntries = 0;
+    QStringList missingChannelNames;
+    for (const QString &channelName : channelOrder) {
+        const QList<TvGuideEntry> cleaned =
+            cleanGuideEntries(entriesByChannel.value(channelName), nowUtc, retentionHours, &latestEndUtc);
+        entriesByChannel.insert(channelName, cleaned);
+        mappedEntries += cleaned.size();
+        if (cleaned.isEmpty()) {
+            noAutoCurrentShowLookupChannels_.insert(channelName);
+            missingChannelNames.append(channelName);
+        } else {
+            noAutoCurrentShowLookupChannels_.remove(channelName);
+        }
+    }
+
+    QDateTime windowStartUtc = QDateTime::fromString(root.value("windowStartUtc").toString(), Qt::ISODateWithMs);
+    if (!windowStartUtc.isValid()) {
+        windowStartUtc = nowUtc;
+        windowStartUtc = windowStartUtc.addSecs(-windowStartUtc.time().second());
+        windowStartUtc = windowStartUtc.addMSecs(-windowStartUtc.time().msec());
+        windowStartUtc = windowStartUtc.addSecs(-(windowStartUtc.time().minute() % 30) * 60);
+    }
+
+    const int slotMinutes = std::clamp(root.value("slotMinutes").toInt(30), 15, 120);
+    int slotCount = root.value("slotCount").toInt(12);
+    if (slotCount <= 0) {
+        const qint64 minimumWindowSeconds = 6 * 3600;
+        const qint64 requestedWindowSeconds =
+            std::max(minimumWindowSeconds, windowStartUtc.secsTo(latestEndUtc) + slotMinutes * 60);
+        slotCount = static_cast<int>(std::ceil(static_cast<double>(requestedWindowSeconds) / (slotMinutes * 60.0)));
+        slotCount = std::clamp(slotCount, 12, 32);
+    }
+
+    QString statusText = root.value("statusText").toString().trimmed();
+    if (statusText.isEmpty()) {
+        statusText = QString("Schedules Direct OTA guide: %1 entries loaded for %2/%3 local channels.")
+                         .arg(mappedEntries)
+                         .arg(channelOrder.size() - missingChannelNames.size())
+                         .arg(channelOrder.size());
+    }
+    if (!exportSummary.trimmed().isEmpty()) {
+        statusText = exportSummary.trimmed() + "\n" + statusText;
+    }
+    if (!missingChannelNames.isEmpty()
+        && !statusText.contains(QString("No guide data: %1").arg(missingChannelNames.join(", ")))) {
+        statusText += QString("\nNo guide data: %1").arg(missingChannelNames.join(", "));
+    }
+    if (usedCachedExport) {
+        statusText = "Using cached Schedules Direct JSON.\n" + statusText;
+    }
+
+    lastGuideChannelOrder_ = channelOrder;
+    lastGuideWindowStartUtc_ = windowStartUtc;
+    lastGuideSlotMinutes_ = slotMinutes;
+    lastGuideSlotCount_ = slotCount;
+    lastGuideStatusText_ = statusText;
+    guideEntriesCache_ = entriesByChannel;
+    if (!writeGuideCacheFile(channelOrder, entriesByChannel, windowStartUtc, slotMinutes, slotCount, statusText)) {
+        appendLog("guide-sd: failed to write guide cache file.");
+    } else if (!loadGuideCacheFile()) {
+        appendLog("guide-sd: failed to reload guide cache file after refresh; using in-memory cache.");
+        guideEntriesCache_ = entriesByChannel;
+        lastGuideChannelOrder_ = channelOrder;
+        lastGuideWindowStartUtc_ = windowStartUtc;
+        lastGuideSlotMinutes_ = slotMinutes;
+        lastGuideSlotCount_ = slotCount;
+        lastGuideStatusText_ = statusText;
+    }
+
+    QJsonArray betaExtractions;
+    QJsonObject extractionObject;
+    extractionObject.insert("source", "Schedules Direct sdJSON");
+    extractionObject.insert("exportPath", exportPath);
+    extractionObject.insert("usedCachedExport", usedCachedExport);
+    extractionObject.insert("mappedEntryCount", mappedEntries);
+    extractionObject.insert("channelCount", channelOrder.size());
+    extractionObject.insert("statusText", statusText);
+    betaExtractions.append(extractionObject);
+    if (!writeGuideCacheBetaFile(channelOrder,
+                                 entriesByChannel,
+                                 windowStartUtc,
+                                 slotMinutes,
+                                 slotCount,
+                                 statusText,
+                                 betaExtractions)) {
+        appendLog("guide-sd: failed to write beta guide cache file.");
+    }
+
+    applyCurrentShowStatusFromGuideCache();
+    if (updateDialog && tvGuideDialog_ != nullptr) {
+        tvGuideDialog_->setGuideData(lastGuideChannelOrder_,
+                                     favorites_,
+                                     guideEntriesCache_,
+                                     lastGuideWindowStartUtc_,
+                                     lastGuideSlotMinutes_,
+                                     lastGuideSlotCount_,
+                                     scheduledSwitches_,
+                                     lastGuideStatusText_);
+    }
+    setStatusBarStateMessage(statusText.section('\n', 0, 0));
+    return mappedEntries > 0;
+}
+
 bool MainWindow::loadGuideCacheFile()
 {
     purgeExpiredGuideCacheFiles(true);
@@ -5785,20 +7665,16 @@ void MainWindow::setCurrentShowStatus(const QString &text,
                                       const QString &toolTip,
                                       const QString &synopsisText)
 {
-    Q_UNUSED(toolTip);
-
     if (currentShowLabel_ == nullptr) {
         return;
     }
 
     currentShowLabel_->setText(text);
-    currentShowLabel_->setToolTip(QString());
+    currentShowLabel_->setToolTip(toolTip.trimmed());
     if (currentShowSynopsisLabel_ != nullptr) {
         const QString trimmedSynopsis = synopsisText.trimmed();
-        currentShowSynopsisLabel_->setText(trimmedSynopsis.isEmpty()
-                                               ? QString()
-                                               : QString("Synopsis: %1").arg(trimmedSynopsis));
-        currentShowSynopsisLabel_->setToolTip(QString());
+        currentShowSynopsisLabel_->setText(trimmedSynopsis);
+        currentShowSynopsisLabel_->setToolTip(trimmedSynopsis);
         currentShowSynopsisLabel_->setVisible(!fullscreenActive_ && !trimmedSynopsis.isEmpty());
         currentShowSynopsisLabel_->updateGeometry();
     }
@@ -5870,10 +7746,21 @@ bool MainWindow::applyCurrentShowStatusFromGuideCache()
     QDateTime refreshUtc;
 
     if (foundCurrent) {
-        lines << QString("Current: %1").arg(currentEntry.title);
+        const GuideEntryDisplayParts currentParts = displayPartsForGuideEntry(currentEntry);
+        lines << QString("Current: %1").arg(currentParts.title);
+        if (!currentParts.episodeTitle.isEmpty()) {
+            lines << QString("Episode: %1").arg(currentParts.episodeTitle);
+        }
         toolTips << guideEntryToolTipText(currentEntry);
-        if (synopsisText.isEmpty() && !currentEntry.synopsis.trimmed().isEmpty()) {
-            synopsisText = currentEntry.synopsis.trimmed();
+        if (synopsisText.isEmpty()) {
+            QStringList detailLines;
+            if (!currentParts.episodeTitle.isEmpty()) {
+                detailLines << QString("Episode: %1").arg(currentParts.episodeTitle);
+            }
+            if (!currentParts.synopsisBody.isEmpty()) {
+                detailLines << QString("Synopsis: %1").arg(currentParts.synopsisBody);
+            }
+            synopsisText = detailLines.join('\n');
         }
         refreshUtc = currentEntry.endUtc.addSecs(1);
     } else {
@@ -5881,12 +7768,23 @@ bool MainWindow::applyCurrentShowStatusFromGuideCache()
     }
 
     if (foundNext) {
+        const GuideEntryDisplayParts nextParts = displayPartsForGuideEntry(nextEntry);
         lines << QString("Next (%1): %2")
                      .arg(nextEntry.startUtc.toLocalTime().toString("h:mm AP"),
-                          nextEntry.title);
+                          nextParts.title);
+        if (!nextParts.episodeTitle.isEmpty()) {
+            lines << QString("Next Episode: %1").arg(nextParts.episodeTitle);
+        }
         toolTips << guideEntryToolTipText(nextEntry);
-        if (synopsisText.isEmpty() && !nextEntry.synopsis.trimmed().isEmpty()) {
-            synopsisText = nextEntry.synopsis.trimmed();
+        if (synopsisText.isEmpty()) {
+            QStringList detailLines;
+            if (!nextParts.episodeTitle.isEmpty()) {
+                detailLines << QString("Episode: %1").arg(nextParts.episodeTitle);
+            }
+            if (!nextParts.synopsisBody.isEmpty()) {
+                detailLines << QString("Synopsis: %1").arg(nextParts.synopsisBody);
+            }
+            synopsisText = detailLines.join('\n');
         }
         if (!refreshUtc.isValid()) {
             refreshUtc = nextEntry.startUtc.addSecs(1);
@@ -6416,7 +8314,9 @@ void MainWindow::setStatusBarStateMessage(const QString &text)
         if (!message.isEmpty()) {
             message += " | ";
         }
-        message += "Getting latest EIT data...";
+        message += useSchedulesDirectGuideSource()
+                       ? "Getting latest Schedules Direct guide data..."
+                       : "Getting latest EIT data...";
     }
 
     if (guideRefreshTimer_ != nullptr && guideRefreshTimer_->isActive()) {
@@ -6446,7 +8346,9 @@ void MainWindow::updateTvGuideDialogFromCurrentCache(bool showStatusMessage)
         !lastGuideChannelOrder_.isEmpty() || !guideEntriesCache_.isEmpty() || !lastGuideStatusText_.trimmed().isEmpty();
     const QString statusText = hasGuideCache
                                    ? lastGuideStatusText_
-                                   : QString("No cached guide data loaded yet. Background EIT retrieval will update this window automatically.");
+                                   : (useSchedulesDirectGuideSource()
+                                          ? QString("No cached guide data loaded yet. Background Schedules Direct retrieval will update this window automatically.")
+                                          : QString("No cached guide data loaded yet. Background EIT retrieval will update this window automatically."));
 
     tvGuideDialog_->setGuideData(lastGuideChannelOrder_,
                                  favorites_,
@@ -6811,10 +8713,25 @@ void MainWindow::loadXspfChannelHints()
     xspfNumberByTuneKey_.clear();
     xspfProgramByChannel_.clear();
 
+    QString jsonError;
+    const bool loadedJsonHints = loadChannelHintsFromJson(xspfNumberByTuneKey_,
+                                                          xspfProgramByChannel_,
+                                                          &jsonError);
+    if (loadedJsonHints) {
+        appendLog(QString("Loaded %1 saved channel hint mapping%2 from %3")
+                      .arg(xspfProgramByChannel_.size())
+                      .arg(xspfProgramByChannel_.size() == 1 ? QString() : QString("s"))
+                      .arg(resolveChannelHintsJsonPath()));
+    } else if (!jsonError.trimmed().isEmpty()) {
+        appendLog(jsonError);
+    }
+
     const QString xspfPath = QDir::home().filePath("Desktop/tv.xspf");
     QFile file(xspfPath);
     if (!file.exists()) {
-        appendLog("No XSPF playlist found on Desktop; using channels.conf metadata.");
+        if (!loadedJsonHints) {
+            appendLog("No saved channel hint JSON or XSPF playlist found; using channels.conf metadata.");
+        }
         return;
     }
     if (!file.open(QIODevice::ReadOnly | QIODevice::Text)) {
@@ -6890,14 +8807,23 @@ void MainWindow::loadXspfChannelHints()
 
     if (xml.hasError()) {
         appendLog("Failed to parse XSPF playlist: " + xml.errorString());
-        xspfNumberByTuneKey_.clear();
-        xspfProgramByChannel_.clear();
+        if (!loadedJsonHints) {
+            xspfNumberByTuneKey_.clear();
+            xspfProgramByChannel_.clear();
+        }
         return;
     }
 
-    appendLog(QString("Loaded %1 XSPF program mappings from %2")
+    QString saveError;
+    if (!saveChannelHintsToJson(xspfNumberByTuneKey_, xspfProgramByChannel_, &saveError)
+        && !saveError.trimmed().isEmpty()) {
+        appendLog(saveError);
+    }
+
+    appendLog(QString("Loaded %1 XSPF program mappings from %2 and cached them to %3")
                   .arg(xspfProgramByChannel_.size())
-                  .arg(xspfPath));
+                  .arg(xspfPath)
+                  .arg(resolveChannelHintsJsonPath()));
 }
 
 void MainWindow::loadChannelsFileIfPresent()
