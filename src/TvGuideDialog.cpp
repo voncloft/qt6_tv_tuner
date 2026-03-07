@@ -36,6 +36,7 @@ constexpr int kGuideRowHeight = 132;
 constexpr int kGuideGridLineWidth = 2;
 constexpr int kGuideBoxBorderWidth = 2;
 constexpr int kGuideScheduleCheckboxSize = 16;
+constexpr int kDefaultFavoriteShowRating = 1;
 
 bool guideEntriesMatch(const TvGuideEntry &left, const TvGuideEntry &right)
 {
@@ -91,12 +92,42 @@ GuideEntryDisplayParts displayPartsForEntry(const TvGuideEntry &entry)
     return parts;
 }
 
-QString formatEntryLabel(const TvGuideEntry &entry)
+QString normalizeFavoriteShowRule(const QString &title)
+{
+    return title.simplified().toCaseFolded();
+}
+
+int favoriteShowRatingForTitle(const QHash<QString, int> &favoriteShowRatings, const QString &title)
+{
+    const QString normalizedTitle = normalizeFavoriteShowRule(title);
+    if (normalizedTitle.isEmpty()) {
+        return kDefaultFavoriteShowRating;
+    }
+
+    return std::max(kDefaultFavoriteShowRating, favoriteShowRatings.value(normalizedTitle, kDefaultFavoriteShowRating));
+}
+
+QString formatRatedShowTitle(const QString &title, const QHash<QString, int> &favoriteShowRatings)
+{
+    const QString trimmedTitle = title.simplified();
+    if (trimmedTitle.isEmpty()) {
+        return QString();
+    }
+
+    if (!favoriteShowRatings.contains(normalizeFavoriteShowRule(trimmedTitle))) {
+        return QString("%1 (rating: N/A)").arg(trimmedTitle);
+    }
+
+    return QString("%1 (rating: %2)").arg(trimmedTitle).arg(favoriteShowRatingForTitle(favoriteShowRatings, trimmedTitle));
+}
+
+QString formatEntryLabel(const TvGuideEntry &entry, const QHash<QString, int> &favoriteShowRatings)
 {
     const GuideEntryDisplayParts parts = displayPartsForEntry(entry);
     QStringList lines;
-    if (!parts.title.isEmpty()) {
-        lines << parts.title;
+    const QString ratedTitle = formatRatedShowTitle(parts.title, favoriteShowRatings);
+    if (!ratedTitle.isEmpty()) {
+        lines << ratedTitle;
     }
     if (!parts.episodeTitle.isEmpty()) {
         lines << parts.episodeTitle;
@@ -107,12 +138,13 @@ QString formatEntryLabel(const TvGuideEntry &entry)
     return lines.join('\n');
 }
 
-QString formatEntryHtml(const TvGuideEntry &entry)
+QString formatEntryHtml(const TvGuideEntry &entry, const QHash<QString, int> &favoriteShowRatings)
 {
     const GuideEntryDisplayParts parts = displayPartsForEntry(entry);
+    const QString ratedTitle = formatRatedShowTitle(parts.title, favoriteShowRatings);
     QString html = QString("<div style=\"color:#ffffff;\">"
                            "<div style=\"font-weight:600; margin-bottom:4px;\">%1</div>")
-                       .arg(parts.title.toHtmlEscaped());
+                       .arg(ratedTitle.toHtmlEscaped());
     if (!parts.episodeTitle.isEmpty()) {
         html += QString("<div style=\"color:#f1d27a; font-style:italic; margin-bottom:4px;\">%1</div>")
                     .arg(parts.episodeTitle.toHtmlEscaped());
@@ -125,11 +157,12 @@ QString formatEntryHtml(const TvGuideEntry &entry)
     return html;
 }
 
-QString formatEntryToolTip(const TvGuideEntry &entry)
+QString formatEntryToolTip(const TvGuideEntry &entry, const QHash<QString, int> &favoriteShowRatings)
 {
     const GuideEntryDisplayParts parts = displayPartsForEntry(entry);
+    const QString ratedTitle = formatRatedShowTitle(parts.title, favoriteShowRatings);
     QString text = QString("%1\n%2 - %3")
-        .arg(parts.title,
+        .arg(ratedTitle,
              entry.startUtc.toLocalTime().toString("ddd h:mm AP"),
              entry.endUtc.toLocalTime().toString("ddd h:mm AP"));
     if (!parts.episodeTitle.isEmpty()) {
@@ -141,7 +174,10 @@ QString formatEntryToolTip(const TvGuideEntry &entry)
     return text;
 }
 
-int measureEntryTextHeight(const QFont &font, int width, const TvGuideEntry &entry)
+int measureEntryTextHeight(const QFont &font,
+                           int width,
+                           const TvGuideEntry &entry,
+                           const QHash<QString, int> &favoriteShowRatings)
 {
     if (width <= 0 || entry.title.trimmed().isEmpty()) {
         return 0;
@@ -150,12 +186,15 @@ int measureEntryTextHeight(const QFont &font, int width, const TvGuideEntry &ent
     QTextDocument document;
     document.setDefaultFont(font);
     document.setDocumentMargin(0);
-    document.setHtml(formatEntryHtml(entry));
+    document.setHtml(formatEntryHtml(entry, favoriteShowRatings));
     document.setTextWidth(width);
     return std::max(0, static_cast<int>(std::ceil(document.size().height())));
 }
 
-void drawEntryText(QPainter &painter, const QRect &textRect, const TvGuideEntry &entry)
+void drawEntryText(QPainter &painter,
+                   const QRect &textRect,
+                   const TvGuideEntry &entry,
+                   const QHash<QString, int> &favoriteShowRatings)
 {
     if (!textRect.isValid() || entry.title.trimmed().isEmpty()) {
         return;
@@ -164,7 +203,7 @@ void drawEntryText(QPainter &painter, const QRect &textRect, const TvGuideEntry 
     QTextDocument document;
     document.setDefaultFont(painter.font());
     document.setDocumentMargin(0);
-    document.setHtml(formatEntryHtml(entry));
+    document.setHtml(formatEntryHtml(entry, favoriteShowRatings));
     document.setTextWidth(textRect.width());
 
     painter.save();
@@ -271,6 +310,7 @@ class GuideChannelBandWidget final : public QWidget
 {
 public:
     GuideChannelBandWidget(const QList<TvGuideEntry> &entries,
+                           const QHash<QString, int> &favoriteShowRatings,
                            const QDateTime &windowStartUtc,
                            int slotMinutes,
                            int slotCount,
@@ -280,6 +320,7 @@ public:
                            QWidget *parent = nullptr)
         : QWidget(parent)
         , entries_(entries)
+        , favoriteShowRatings_(favoriteShowRatings)
         , windowStartUtc_(windowStartUtc)
         , slotMinutes_(slotMinutes)
         , slotCount_(slotCount)
@@ -387,7 +428,7 @@ protected:
             }
 
             painter.setPen(QColor(255, 255, 255));
-            drawEntryText(painter, box.adjusted(10, 8, -checkboxInset, -8), entry);
+            drawEntryText(painter, box.adjusted(10, 8, -checkboxInset, -8), entry, favoriteShowRatings_);
             renderedAny = true;
         }
 
@@ -500,7 +541,7 @@ private:
                                            boxWidth - 20 - (entry.startUtc > QDateTime::currentDateTimeUtc()
                                                                 ? (kGuideScheduleCheckboxSize + 16)
                                                                 : 0));
-            const int textHeight = measureEntryTextHeight(font(), textWidth, entry);
+            const int textHeight = measureEntryTextHeight(font(), textWidth, entry, favoriteShowRatings_);
             preferred = std::max(preferred, textHeight + 26);
         }
 
@@ -508,6 +549,7 @@ private:
     }
 
     QList<TvGuideEntry> entries_;
+    QHash<QString, int> favoriteShowRatings_;
     QDateTime windowStartUtc_;
     int slotMinutes_{30};
     int slotCount_{0};
@@ -694,12 +736,12 @@ void TvGuideDialog::syncToCurrentTime()
 
 QString TvGuideDialog::entryLabel(const TvGuideEntry &entry) const
 {
-    return formatEntryLabel(entry);
+    return formatEntryLabel(entry, favoriteShowRatings_);
 }
 
 QString TvGuideDialog::entryToolTip(const TvGuideEntry &entry) const
 {
-    return formatEntryToolTip(entry);
+    return formatEntryToolTip(entry, favoriteShowRatings_);
 }
 
 void TvGuideDialog::resizeEvent(QResizeEvent *event)
@@ -764,6 +806,7 @@ void TvGuideDialog::applyGuideHorizontalScroll(int value)
 
 void TvGuideDialog::setGuideData(const QStringList &channelOrder,
                                  const QStringList &favoriteChannels,
+                                 const QHash<QString, int> &favoriteShowRatings,
                                  const QHash<QString, QList<TvGuideEntry>> &entriesByChannel,
                                  const QDateTime &windowStartUtc,
                                  int slotMinutes,
@@ -776,6 +819,7 @@ void TvGuideDialog::setGuideData(const QStringList &channelOrder,
     channelOrder_ = channelOrder;
     favoriteChannels_ = favoriteChannels;
     favoriteChannels_.removeDuplicates();
+    favoriteShowRatings_ = favoriteShowRatings;
     entriesByChannel_ = entriesByChannel;
     scheduledSwitches_ = scheduledSwitches;
     windowStartUtc_ = windowStartUtc;
@@ -855,8 +899,9 @@ void TvGuideDialog::updateSearchResults()
     searchResults_ = matchedResults;
     for (const SearchResult &result : searchResults_) {
         const GuideEntryDisplayParts parts = displayPartsForEntry(result.entry);
+        const QString ratedTitle = formatRatedShowTitle(parts.title, favoriteShowRatings_);
         QStringList lines;
-        lines << parts.title;
+        lines << ratedTitle;
         if (!parts.episodeTitle.isEmpty()) {
             lines << "Episode: " + parts.episodeTitle;
         }
@@ -980,6 +1025,7 @@ void TvGuideDialog::renderGuideTable()
     int rowsHeight = 0;
     for (const QString &channel : visibleChannels) {
         auto *bandWidget = new GuideChannelBandWidget(entriesByChannel_.value(channel),
+                                                      favoriteShowRatings_,
                                                       windowStartUtc_,
                                                       slotMinutes_,
                                                       slotCount_,

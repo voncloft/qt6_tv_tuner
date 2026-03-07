@@ -48,6 +48,7 @@ public:
     void syncToCurrentTime();
     void setGuideData(const QStringList &channelOrder,
                       const QStringList &favoriteChannels,
+                      const QHash<QString, int> &favoriteShowRatings,
                       const QHash<QString, QList<TvGuideEntry>> &entriesByChannel,
                       const QDateTime &windowStartUtc,
                       int slotMinutes,
@@ -99,6 +100,7 @@ private:
     QWidget *guideContent_{};
     QStringList channelOrder_;
     QStringList favoriteChannels_;
+    QHash<QString, int> favoriteShowRatings_;
     QHash<QString, QList<TvGuideEntry>> entriesByChannel_;
     QList<TvGuideScheduledSwitch> scheduledSwitches_;
     QDateTime windowStartUtc_;
