@@ -88,6 +88,8 @@ private:
     void buildUi();
     void setScanningState(bool running);
     void appendLog(const QString &line);
+    // Keep user/program behavior observable: new interaction paths should log entry and outcome here.
+    void logInteraction(const QString &actor, const QString &action, const QString &details = QString());
     void parseAndStoreLine(const QString &line);
     bool persistChannelsFile();
     bool startWatchingChannel(const QString &channelName, bool reconnectAttempt = false);
@@ -272,5 +274,8 @@ private:
     bool videoDetachedToPip_{false};
     bool autoFavoriteShowSchedulingEnabled_{true};
     bool autoPictureInPictureEnabled_{true};
+    bool deferStartupAutoFavoriteScheduling_{true};
+    QStringList dismissedAutoFavoriteCandidates_;
+    QStringList lockedAutoFavoriteSelections_;
     bool startupSwitchSummaryShown_{false};
 };
