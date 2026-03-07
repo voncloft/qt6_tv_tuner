@@ -101,6 +101,7 @@ constexpr auto kDismissedAutoFavoriteCandidatesStampSetting = "tvGuide/dismissed
 constexpr auto kLockedAutoFavoriteSelectionsSetting = "tvGuide/lockedAutoFavoriteSelections";
 constexpr auto kTestingBugItemsSetting = "testing/bugItems";
 constexpr auto kAutoPictureInPictureSetting = "video/autoPictureInPicture";
+constexpr auto kHideStartupSwitchSummarySetting = "tvGuide/hideStartupSwitchSummary";
 constexpr auto kGuideRefreshIntervalMinutesSetting = "tvGuide/refreshIntervalMinutes";
 constexpr auto kGuideCacheRetentionHoursSetting = "tvGuide/cacheRetentionHours";
 constexpr auto kLockedScheduledSwitchesSetting = "tvGuide/lockedScheduledSwitches";
@@ -1490,12 +1491,8 @@ QList<TvGuideEntry> guideEntriesFromJsonArray(const QJsonArray &array)
 
 bool pruneGuideCacheFile(const QString &cachePath,
                          const QDateTime &nowUtc,
-                         int retentionHours,
-                         bool *removedFile = nullptr)
+                         int retentionHours)
 {
-    if (removedFile != nullptr) {
-        *removedFile = false;
-    }
     if (cachePath.isEmpty()) {
         return false;
     }
@@ -1518,7 +1515,6 @@ bool pruneGuideCacheFile(const QString &cachePath,
     }
 
     bool changed = false;
-    bool keptAnyEntries = false;
     QJsonObject trimmedEntriesObject;
     for (auto it = entriesObject.begin(); it != entriesObject.end(); ++it) {
         const QJsonArray originalArray = it.value().toArray();
@@ -1528,24 +1524,11 @@ bool pruneGuideCacheFile(const QString &cachePath,
         if (trimmedArray != originalArray) {
             changed = true;
         }
-        if (!trimmedEntries.isEmpty()) {
-            keptAnyEntries = true;
-        }
         trimmedEntriesObject.insert(it.key(), trimmedArray);
     }
 
     if (!changed) {
         return false;
-    }
-
-    if (!keptAnyEntries) {
-        if (!QFile::remove(cachePath)) {
-            return false;
-        }
-        if (removedFile != nullptr) {
-            *removedFile = true;
-        }
-        return true;
     }
 
     QJsonObject updatedRoot = root;
@@ -3055,6 +3038,16 @@ MainWindow::MainWindow(QWidget *parent)
         const QSignalBlocker blocker(autoPictureInPictureCheckBox_);
         autoPictureInPictureCheckBox_->setChecked(autoPictureInPictureEnabled_);
     }
+    if (hideStartupSwitchSummaryCheckBox_ != nullptr) {
+        const QSignalBlocker blocker(hideStartupSwitchSummaryCheckBox_);
+        hideStartupSwitchSummaryCheckBox_->setChecked(
+            settings.value(kHideStartupSwitchSummarySetting, false).toBool());
+    }
+    if (hideStartupSwitchSummaryCheckBox_ != nullptr) {
+        const QSignalBlocker blocker(hideStartupSwitchSummaryCheckBox_);
+        hideStartupSwitchSummaryCheckBox_->setChecked(
+            settings.value(kHideStartupSwitchSummarySetting, false).toBool());
+    }
     if (useSchedulesDirectGuideCheckBox_ != nullptr) {
         const QSignalBlocker blocker(useSchedulesDirectGuideCheckBox_);
         useSchedulesDirectGuideCheckBox_->setChecked(settings.value(kUseSchedulesDirectGuideSetting, false).toBool());
@@ -3375,6 +3368,7 @@ void MainWindow::buildUi()
     watchPage_ = new QWidget(tabs_);
     auto *watchLayout = new QVBoxLayout(watchPage_);
     watchLayout->setContentsMargins(0, 0, 0, 0);
+    watchLayout->setSpacing(6);
 
     auto *tuningPage = new QWidget(tabs_);
     auto *tuningLayout = new QVBoxLayout(tuningPage);
@@ -3457,7 +3451,10 @@ void MainWindow::buildUi()
     auto *playbackOptionsGroup = new QGroupBox("Playback", configPage_);
     auto *playbackOptionsLayout = new QVBoxLayout(playbackOptionsGroup);
     autoPictureInPictureCheckBox_ = new QCheckBox("Pop video out when leaving the Video tab", playbackOptionsGroup);
+    hideStartupSwitchSummaryCheckBox_ =
+        new QCheckBox("Hide the scheduled switches summary at startup", playbackOptionsGroup);
     playbackOptionsLayout->addWidget(autoPictureInPictureCheckBox_);
+    playbackOptionsLayout->addWidget(hideStartupSwitchSummaryCheckBox_);
 
     auto *cacheOptionsGroup = new QGroupBox("Guide Cache", configPage_);
     auto *cacheOptionsForm = new QFormLayout(cacheOptionsGroup);
@@ -3569,15 +3566,33 @@ void MainWindow::buildUi()
     stopButton_->setEnabled(false);
     stopWatchButton_->setEnabled(false);
     muteButton_->setCheckable(true);
+    const auto setStableButtonWidth = [](QPushButton *button, const QStringList &labels) {
+        if (button == nullptr) {
+            return;
+        }
+
+        const QFontMetrics metrics(button->font());
+        int width = button->sizeHint().width();
+        for (const QString &label : labels) {
+            width = std::max(width, metrics.horizontalAdvance(label) + 24);
+        }
+        button->setFixedWidth(width);
+    };
+    setStableButtonWidth(watchButton_, {"Watch Selected"});
+    setStableButtonWidth(stopWatchButton_, {"Stop Watching"});
+    setStableButtonWidth(openFileButton_, {"Open File"});
+    setStableButtonWidth(fullscreenButton_, {"Fullscreen", "Exit Fullscreen"});
+    setStableButtonWidth(muteButton_, {"Mute", "Unmute"});
     volumeSlider_->setRange(0, 100);
     volumeSlider_->setValue(85);
     volumeSlider_->setMinimumWidth(120);
     volumeSlider_->setMaximumWidth(220);
     playbackStatusLabel_->setMinimumWidth(100);
     playbackStatusLabel_->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Preferred);
-    currentShowLabel_->setMinimumWidth(160);
-    currentShowLabel_->setSizePolicy(QSizePolicy::MinimumExpanding, QSizePolicy::Preferred);
-    currentShowLabel_->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+    currentShowLabel_->setMinimumWidth(220);
+    currentShowLabel_->setWordWrap(true);
+    currentShowLabel_->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Preferred);
+    currentShowLabel_->setAlignment(Qt::AlignLeft | Qt::AlignTop);
     currentShowLabel_->setTextInteractionFlags(Qt::TextSelectableByMouse);
     currentShowSynopsisLabel_->setWordWrap(true);
     currentShowSynopsisLabel_->setAlignment(Qt::AlignLeft | Qt::AlignTop);
@@ -3598,7 +3613,7 @@ void MainWindow::buildUi()
 
     contentSplitter_ = new QSplitter(Qt::Horizontal, watchPage_);
     videoWidget_ = new QVideoWidget(contentSplitter_);
-    videoWidget_->setMinimumHeight(360);
+    videoWidget_->setMinimumHeight(240);
     videoWidget_->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
     videoWidget_->setStyleSheet("background: #000;");
     videoDetachedPlaceholderLabel_ = new QLabel("Video is playing in the floating mini-player.", watchPage_);
@@ -3654,10 +3669,10 @@ void MainWindow::buildUi()
     statusContainer_ = new QWidget(watchPage_);
     auto *statusRow = new QHBoxLayout(statusContainer_);
     statusRow->setContentsMargins(0, 0, 0, 0);
-    statusRow->setSpacing(8);
-    statusRow->addWidget(playbackStatusLabel_);
-    statusRow->addStretch(1);
-    statusRow->addWidget(currentShowLabel_, 1);
+    statusRow->setSpacing(12);
+    statusRow->addWidget(playbackStatusLabel_, 0, Qt::AlignTop);
+    statusRow->addWidget(currentShowSynopsisLabel_, 6);
+    statusRow->addWidget(currentShowLabel_, 4);
 
     favoritesLayout->addLayout(favoritesControlsRow);
     favoritesLayout->addWidget(favoritesLabel);
@@ -3668,7 +3683,6 @@ void MainWindow::buildUi()
     watchLayout->addWidget(videoDetachedPlaceholderLabel_);
     watchLayout->addWidget(favoritesContainer_);
     watchLayout->addWidget(statusContainer_);
-    watchLayout->addWidget(currentShowSynopsisLabel_);
 
     pipWindow_ = new QWidget(this, Qt::Tool | Qt::WindowStaysOnTopHint);
     pipWindow_->setWindowTitle("Voncloft TV Mini Player");
@@ -3737,6 +3751,10 @@ void MainWindow::buildUi()
             this,
             &MainWindow::handleAutoFavoriteShowSchedulingToggled);
     connect(autoPictureInPictureCheckBox_, &QCheckBox::toggled, this, &MainWindow::handleAutoPictureInPictureToggled);
+    connect(hideStartupSwitchSummaryCheckBox_,
+            &QCheckBox::toggled,
+            this,
+            &MainWindow::handleHideStartupSwitchSummaryToggled);
     connect(guideRefreshIntervalSpin_,
             qOverload<int>(&QSpinBox::valueChanged),
             this,
@@ -3910,6 +3928,12 @@ void MainWindow::handleAutoPictureInPictureToggled(bool checked)
     if (tabs_ != nullptr) {
         handleCurrentTabChanged(tabs_->currentIndex());
     }
+}
+
+void MainWindow::handleHideStartupSwitchSummaryToggled(bool checked)
+{
+    QSettings settings("tv_tuner_gui", "watcher");
+    settings.setValue(kHideStartupSwitchSummarySetting, checked);
 }
 
 void MainWindow::handleGuideRefreshIntervalChanged(int minutes)
@@ -5351,10 +5375,11 @@ bool MainWindow::purgeExpiredGuideCacheFiles(bool clearLoadedState)
     }
 
     const QDateTime nowUtc = QDateTime::currentDateTimeUtc();
-    bool removedPrimaryCache = false;
+    bool updatedPrimaryCache = false;
     bool removedAny = false;
     const QString primaryCachePath = resolveGuideCachePath();
-    if (pruneGuideCacheFile(primaryCachePath, nowUtc, retentionHours, &removedPrimaryCache)) {
+    if (pruneGuideCacheFile(primaryCachePath, nowUtc, retentionHours)) {
+        updatedPrimaryCache = true;
         removedAny = true;
     }
 
@@ -5363,7 +5388,7 @@ bool MainWindow::purgeExpiredGuideCacheFiles(bool clearLoadedState)
         removedAny = true;
     }
 
-    if (removedPrimaryCache && clearLoadedState) {
+    if (updatedPrimaryCache && clearLoadedState) {
         clearLoadedGuideCache();
     }
     return removedAny;
@@ -6376,7 +6401,11 @@ void MainWindow::autoScheduleFavoriteShowsFromGuideCache(bool promptForConflict,
 
 void MainWindow::showStartupSwitchSummary()
 {
-    if (startupSwitchSummaryShown_ || !obeyScheduledSwitches_) {
+    const bool hideStartupSwitchSummary =
+        hideStartupSwitchSummaryCheckBox_ != nullptr
+            ? hideStartupSwitchSummaryCheckBox_->isChecked()
+            : QSettings("tv_tuner_gui", "watcher").value(kHideStartupSwitchSummarySetting, false).toBool();
+    if (startupSwitchSummaryShown_ || !obeyScheduledSwitches_ || hideStartupSwitchSummary) {
         return;
     }
     startupSwitchSummaryShown_ = true;
@@ -7670,11 +7699,9 @@ void MainWindow::setCurrentShowStatus(const QString &text,
     }
 
     currentShowLabel_->setText(text);
-    currentShowLabel_->setToolTip(toolTip.trimmed());
     if (currentShowSynopsisLabel_ != nullptr) {
         const QString trimmedSynopsis = synopsisText.trimmed();
         currentShowSynopsisLabel_->setText(trimmedSynopsis);
-        currentShowSynopsisLabel_->setToolTip(trimmedSynopsis);
         currentShowSynopsisLabel_->setVisible(!fullscreenActive_ && !trimmedSynopsis.isEmpty());
         currentShowSynopsisLabel_->updateGeometry();
     }
@@ -7741,8 +7768,9 @@ bool MainWindow::applyCurrentShowStatusFromGuideCache()
     }
 
     QStringList lines;
+    QStringList detailLines;
     QStringList toolTips;
-    QString synopsisText;
+    QString detailText;
     QDateTime refreshUtc;
 
     if (foundCurrent) {
@@ -7751,17 +7779,17 @@ bool MainWindow::applyCurrentShowStatusFromGuideCache()
         if (!currentParts.episodeTitle.isEmpty()) {
             lines << QString("Episode: %1").arg(currentParts.episodeTitle);
         }
-        toolTips << guideEntryToolTipText(currentEntry);
-        if (synopsisText.isEmpty()) {
-            QStringList detailLines;
-            if (!currentParts.episodeTitle.isEmpty()) {
-                detailLines << QString("Episode: %1").arg(currentParts.episodeTitle);
-            }
-            if (!currentParts.synopsisBody.isEmpty()) {
-                detailLines << QString("Synopsis: %1").arg(currentParts.synopsisBody);
-            }
-            synopsisText = detailLines.join('\n');
+        if (!currentParts.title.isEmpty()) {
+            detailLines << currentParts.title;
         }
+        if (!currentParts.episodeTitle.isEmpty()) {
+            detailLines << QString("Episode: %1").arg(currentParts.episodeTitle);
+        }
+        if (!currentParts.synopsisBody.isEmpty()) {
+            detailLines << QString("Synopsis: %1").arg(currentParts.synopsisBody);
+        }
+        toolTips << guideEntryToolTipText(currentEntry);
+        detailText = detailLines.join('\n');
         refreshUtc = currentEntry.endUtc.addSecs(1);
     } else {
         lines << "Current: NO EIT DATA";
@@ -7776,15 +7804,17 @@ bool MainWindow::applyCurrentShowStatusFromGuideCache()
             lines << QString("Next Episode: %1").arg(nextParts.episodeTitle);
         }
         toolTips << guideEntryToolTipText(nextEntry);
-        if (synopsisText.isEmpty()) {
-            QStringList detailLines;
+        if (detailText.isEmpty()) {
+            if (!nextParts.title.isEmpty()) {
+                detailLines << nextParts.title;
+            }
             if (!nextParts.episodeTitle.isEmpty()) {
                 detailLines << QString("Episode: %1").arg(nextParts.episodeTitle);
             }
             if (!nextParts.synopsisBody.isEmpty()) {
                 detailLines << QString("Synopsis: %1").arg(nextParts.synopsisBody);
             }
-            synopsisText = detailLines.join('\n');
+            detailText = detailLines.join('\n');
         }
         if (!refreshUtc.isValid()) {
             refreshUtc = nextEntry.startUtc.addSecs(1);
@@ -7793,7 +7823,7 @@ bool MainWindow::applyCurrentShowStatusFromGuideCache()
 
     setCurrentShowStatus(lines.join('\n'),
                          toolTips.join("\n\n"),
-                         synopsisText);
+                         detailText);
     scheduleCurrentShowRefresh(refreshUtc);
     return true;
 }
@@ -8487,13 +8517,21 @@ void MainWindow::triggerReconnect()
 
 void MainWindow::handleMuteToggled(bool checked)
 {
-    audioOutput_->setMuted(checked);
+    if (checked) {
+        audioOutput_->setVolume(0.0f);
+    } else {
+        audioOutput_->setVolume(static_cast<float>(volumeSlider_->value()) / 100.0f);
+    }
     muteButton_->setText(checked ? "Unmute" : "Mute");
 }
 
 void MainWindow::handleVolumeChanged(int value)
 {
-    audioOutput_->setVolume(static_cast<float>(value) / 100.0f);
+    if (muteButton_ != nullptr && muteButton_->isChecked()) {
+        audioOutput_->setVolume(0.0f);
+    } else {
+        audioOutput_->setVolume(static_cast<float>(value) / 100.0f);
+    }
     QSettings settings("tv_tuner_gui", "watcher");
     settings.setValue("volume_percent", value);
 }

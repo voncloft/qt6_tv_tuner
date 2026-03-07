@@ -72,6 +72,7 @@ private slots:
     void handleGuideShowFavoritesOnlyToggled(bool checked);
     void handleAutoFavoriteShowSchedulingToggled(bool checked);
     void handleAutoPictureInPictureToggled(bool checked);
+    void handleHideStartupSwitchSummaryToggled(bool checked);
     void handleGuideRefreshIntervalChanged(int minutes);
     void handleGuideCacheRetentionChanged(int hours);
     void exportSchedulesDirectJson();
@@ -215,6 +216,7 @@ private:
     QCheckBox *obeyScheduledSwitchesCheckBox_{};
     QCheckBox *autoFavoriteShowSchedulingCheckBox_{};
     QCheckBox *autoPictureInPictureCheckBox_{};
+    QCheckBox *hideStartupSwitchSummaryCheckBox_{};
     QCheckBox *useSchedulesDirectGuideCheckBox_{};
     QSpinBox *guideRefreshIntervalSpin_{};
     QSpinBox *guideCacheRetentionSpin_{};
