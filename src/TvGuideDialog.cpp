@@ -1,6 +1,6 @@
 #include "TvGuideDialog.h"
 
-#include <QCheckBox>
+#include <QAbstractItemView>
 #include <QColor>
 #include <QFrame>
 #include <QFontMetrics>
@@ -9,12 +9,14 @@
 #include <QHBoxLayout>
 #include <QGridLayout>
 #include <QLabel>
+#include <QLineEdit>
+#include <QListWidget>
+#include <QMouseEvent>
 #include <QPainter>
 #include <QPlainTextEdit>
 #include <QPushButton>
 #include <QScrollArea>
 #include <QScrollBar>
-#include <QSettings>
 #include <QTabWidget>
 #include <QTextDocument>
 #include <QTimer>
@@ -26,8 +28,6 @@
 
 namespace {
 
-constexpr auto kHideNoEitChannelsSetting = "tvGuide/hideChannelsWithoutEit";
-constexpr auto kShowFavoritesOnlySetting = "tvGuide/showOnlyFavorites";
 constexpr int kGuideChannelLabelWidth = 190;
 constexpr int kGuideSlotWidth = 150;
 constexpr int kGuideVisibleColumnCount = 3;
@@ -35,6 +35,26 @@ constexpr int kGuideHeaderHeight = 40;
 constexpr int kGuideRowHeight = 132;
 constexpr int kGuideGridLineWidth = 2;
 constexpr int kGuideBoxBorderWidth = 2;
+constexpr int kGuideScheduleCheckboxSize = 16;
+
+bool guideEntriesMatch(const TvGuideEntry &left, const TvGuideEntry &right)
+{
+    return left.startUtc == right.startUtc
+           && left.endUtc == right.endUtc
+           && left.title.trimmed() == right.title.trimmed();
+}
+
+bool scheduledSwitchMatchesEntry(const TvGuideScheduledSwitch &scheduledSwitch,
+                                 const QString &channelName,
+                                 const TvGuideEntry &entry)
+{
+    return scheduledSwitch.channelName.trimmed() == channelName.trimmed()
+           && guideEntriesMatch(TvGuideEntry{scheduledSwitch.startUtc,
+                                             scheduledSwitch.endUtc,
+                                             scheduledSwitch.title,
+                                             scheduledSwitch.synopsis},
+                                entry);
+}
 
 QString formatEntryLabel(const TvGuideEntry &entry)
 {
@@ -204,6 +224,8 @@ public:
                            int slotMinutes,
                            int slotCount,
                            int timelineWidth,
+                           std::function<bool(const TvGuideEntry &)> isEntryScheduled,
+                           std::function<void(const TvGuideEntry &, bool)> toggleSchedule,
                            QWidget *parent = nullptr)
         : QWidget(parent)
         , entries_(entries)
@@ -211,6 +233,8 @@ public:
         , slotMinutes_(slotMinutes)
         , slotCount_(slotCount)
         , timelineWidth_(timelineWidth)
+        , isEntryScheduled_(std::move(isEntryScheduled))
+        , toggleSchedule_(std::move(toggleSchedule))
     {
         setMouseTracking(true);
         setMinimumWidth(std::max(timelineWidth_, 1));
@@ -246,11 +270,13 @@ protected:
         }
 
         const QDateTime windowEndUtc = windowStartUtc_.addSecs(totalSeconds);
+        const QDateTime nowUtc = QDateTime::currentDateTimeUtc();
         bool renderedAny = false;
         QList<TvGuideEntry> entries = entries_;
         std::sort(entries.begin(), entries.end(), [](const TvGuideEntry &a, const TvGuideEntry &b) {
             return a.startUtc < b.startUtc;
         });
+        scheduleToggleTargets_.clear();
 
         for (const TvGuideEntry &entry : entries) {
             if (!entry.startUtc.isValid() || !entry.endUtc.isValid() || entry.endUtc <= entry.startUtc) {
@@ -274,14 +300,43 @@ protected:
                                          width());
             QRect box(left + 2, 5, std::max(28, right - left - 4), height() - 10);
 
-            const bool airingNow = entry.startUtc <= QDateTime::currentDateTimeUtc() &&
-                                   entry.endUtc > QDateTime::currentDateTimeUtc();
+            const bool airingNow = entry.startUtc <= nowUtc && entry.endUtc > nowUtc;
+            const bool canSchedule = entry.startUtc > nowUtc;
+            const bool scheduled = canSchedule && isEntryScheduled_ && isEntryScheduled_(entry);
+            const int checkboxInset = canSchedule ? (kGuideScheduleCheckboxSize + 16) : 10;
+            QRect checkboxRect;
+            if (canSchedule) {
+                checkboxRect = QRect(box.right() - kGuideScheduleCheckboxSize - 8,
+                                     box.top() + 8,
+                                     kGuideScheduleCheckboxSize,
+                                     kGuideScheduleCheckboxSize);
+            }
             painter.setPen(QPen(QColor(120, 120, 120), kGuideBoxBorderWidth));
             painter.setBrush(airingNow ? QColor(28, 28, 28) : QColor(16, 16, 16));
             painter.drawRect(box);
 
+            if (canSchedule) {
+                painter.setPen(QPen(QColor(205, 205, 205), 1));
+                painter.setBrush(scheduled ? QColor(255, 96, 96) : QColor(0, 0, 0));
+                painter.drawRect(checkboxRect);
+                if (scheduled) {
+                    painter.setRenderHint(QPainter::Antialiasing, true);
+                    painter.setPen(QPen(QColor(255, 255, 255), 2));
+                    painter.drawLine(checkboxRect.left() + 3,
+                                     checkboxRect.center().y(),
+                                     checkboxRect.left() + 7,
+                                     checkboxRect.bottom() - 3);
+                    painter.drawLine(checkboxRect.left() + 7,
+                                     checkboxRect.bottom() - 3,
+                                     checkboxRect.right() - 2,
+                                     checkboxRect.top() + 3);
+                    painter.setRenderHint(QPainter::Antialiasing, false);
+                }
+                scheduleToggleTargets_.append({checkboxRect, box, entry, scheduled});
+            }
+
             painter.setPen(QColor(255, 255, 255));
-            drawEntryText(painter, box.adjusted(10, 8, -10, -8), entry);
+            drawEntryText(painter, box.adjusted(10, 8, -checkboxInset, -8), entry);
             renderedAny = true;
         }
 
@@ -300,7 +355,64 @@ protected:
         }
     }
 
+    void mouseMoveEvent(QMouseEvent *event) override
+    {
+        if (event == nullptr) {
+            return;
+        }
+
+        const ScheduleToggleTarget *target = targetAt(event->position().toPoint());
+        if (target != nullptr) {
+            setCursor(target->checkboxRect.contains(event->position().toPoint())
+                          ? Qt::PointingHandCursor
+                          : Qt::ArrowCursor);
+            return;
+        }
+
+        unsetCursor();
+    }
+
+    void leaveEvent(QEvent *event) override
+    {
+        QWidget::leaveEvent(event);
+        unsetCursor();
+    }
+
+    void mousePressEvent(QMouseEvent *event) override
+    {
+        if (event == nullptr || event->button() != Qt::LeftButton) {
+            QWidget::mousePressEvent(event);
+            return;
+        }
+
+        const ScheduleToggleTarget *target = targetAt(event->position().toPoint());
+        if (target == nullptr || !target->checkboxRect.contains(event->position().toPoint()) || !toggleSchedule_) {
+            QWidget::mousePressEvent(event);
+            return;
+        }
+
+        toggleSchedule_(target->entry, !target->scheduled);
+        event->accept();
+    }
+
 private:
+    struct ScheduleToggleTarget {
+        QRect checkboxRect;
+        QRect boxRect;
+        TvGuideEntry entry;
+        bool scheduled{false};
+    };
+
+    const ScheduleToggleTarget *targetAt(const QPoint &point) const
+    {
+        for (const ScheduleToggleTarget &target : scheduleToggleTargets_) {
+            if (target.checkboxRect.contains(point) || target.boxRect.contains(point)) {
+                return &target;
+            }
+        }
+        return nullptr;
+    }
+
     int preferredRowHeight() const
     {
         const qint64 totalSeconds = static_cast<qint64>(slotMinutes_) * std::max(slotCount_, 1) * 60;
@@ -333,7 +445,10 @@ private:
                                          left + 1,
                                          totalWidth);
             const int boxWidth = std::max(28, right - left - 4);
-            const int textWidth = std::max(8, boxWidth - 20);
+            const int textWidth = std::max(8,
+                                           boxWidth - 20 - (entry.startUtc > QDateTime::currentDateTimeUtc()
+                                                                ? (kGuideScheduleCheckboxSize + 16)
+                                                                : 0));
             const int textHeight = measureEntryTextHeight(font(), textWidth, entry);
             preferred = std::max(preferred, textHeight + 26);
         }
@@ -347,24 +462,25 @@ private:
     int slotCount_{0};
     int timelineWidth_{0};
     int rowHeight_{kGuideRowHeight};
+    std::function<bool(const TvGuideEntry &)> isEntryScheduled_;
+    std::function<void(const TvGuideEntry &, bool)> toggleSchedule_;
+    QList<ScheduleToggleTarget> scheduleToggleTargets_;
 };
 
 }
 
 TvGuideDialog::TvGuideDialog(QWidget *parent)
-    : QDialog(parent)
+    : QWidget(parent)
 {
-    setWindowTitle("TV Guide");
-    resize(1240, 700);
-
     auto *layout = new QVBoxLayout(this);
     setStyleSheet(
-        "QDialog { background-color: #000000; color: #ffffff; }"
+        "QWidget { background-color: #000000; color: #ffffff; }"
         "QPushButton { background-color: #0f0f0f; color: #ffffff; border: 1px solid #444444; padding: 6px 12px; }"
         "QPushButton:disabled { color: #888888; border-color: #222222; }"
         "QTabWidget::pane { border: 1px solid #4a4a4a; top: -1px; }"
         "QTabBar::tab { background-color: #0a0a0a; color: #ffffff; border: 1px solid #4a4a4a; padding: 8px 14px; min-width: 110px; }"
         "QTabBar::tab:selected { background-color: #111111; }"
+        "QLineEdit, QListWidget { background-color: #050505; color: #ffffff; border: 1px solid #4a4a4a; }"
         "QPlainTextEdit { background-color: #000000; color: #ffffff; border: 1px solid #4a4a4a; }"
         "QTableWidget { background-color: #000000; alternate-background-color: #090909; color: #ffffff; gridline-color: #4a4a4a; }"
         "QHeaderView::section { background-color: #000000; color: #ffffff; border: 1px solid #4a4a4a; padding: 4px; }");
@@ -383,28 +499,6 @@ TvGuideDialog::TvGuideDialog(QWidget *parent)
     auto *guideTab = new QWidget(this);
     auto *guideLayout = new QVBoxLayout(guideTab);
     guideLayout->setContentsMargins(0, 0, 0, 0);
-
-    hideNoEitCheckBox_ = new QCheckBox("Hide channels without EIT data", guideTab);
-    hideNoEitCheckBox_->setChecked(QSettings("tv_tuner_gui", "watcher")
-                                       .value(kHideNoEitChannelsSetting, false)
-                                       .toBool());
-    connect(hideNoEitCheckBox_, &QCheckBox::toggled, this, [this](bool checked) {
-        QSettings settings("tv_tuner_gui", "watcher");
-        settings.setValue(kHideNoEitChannelsSetting, checked);
-        renderGuideTable();
-    });
-    guideLayout->addWidget(hideNoEitCheckBox_);
-
-    showFavoritesOnlyCheckBox_ = new QCheckBox("Show only favorites", guideTab);
-    showFavoritesOnlyCheckBox_->setChecked(QSettings("tv_tuner_gui", "watcher")
-                                               .value(kShowFavoritesOnlySetting, false)
-                                               .toBool());
-    connect(showFavoritesOnlyCheckBox_, &QCheckBox::toggled, this, [this](bool checked) {
-        QSettings settings("tv_tuner_gui", "watcher");
-        settings.setValue(kShowFavoritesOnlySetting, checked);
-        renderGuideTable();
-    });
-    guideLayout->addWidget(showFavoritesOnlyCheckBox_);
 
     auto *guideMatrix = new QWidget(guideTab);
     auto *guideMatrixLayout = new QGridLayout(guideMatrix);
@@ -465,7 +559,44 @@ TvGuideDialog::TvGuideDialog(QWidget *parent)
         }
         guideChannelsContent_->move(0, -value);
     });
-    tabs_->addTab(guideTab, "EIT Data");
+    tabs_->addTab(guideTab, "Guide");
+
+    auto *searchTab = new QWidget(this);
+    auto *searchLayout = new QVBoxLayout(searchTab);
+
+    auto *searchRow = new QHBoxLayout();
+    auto *searchLabel = new QLabel("Find show:", searchTab);
+    showSearchEdit_ = new QLineEdit(searchTab);
+    showSearchEdit_->setClearButtonEnabled(true);
+    showSearchEdit_->setPlaceholderText("Search current guide data");
+    searchRow->addWidget(searchLabel, 0);
+    searchRow->addWidget(showSearchEdit_, 1);
+    searchLayout->addLayout(searchRow);
+
+    showSearchSummaryLabel_ = new QLabel("Search the current guide cache by title or synopsis.", searchTab);
+    showSearchSummaryLabel_->setWordWrap(true);
+    searchLayout->addWidget(showSearchSummaryLabel_);
+
+    showSearchResultsList_ = new QListWidget(searchTab);
+    showSearchResultsList_->setAlternatingRowColors(true);
+    showSearchResultsList_->setSelectionMode(QAbstractItemView::SingleSelection);
+    searchLayout->addWidget(showSearchResultsList_, 1);
+
+    scheduleSearchResultButton_ = new QPushButton("Add Favorite Switch", searchTab);
+    scheduleSearchResultButton_->setEnabled(false);
+    searchLayout->addWidget(scheduleSearchResultButton_, 0, Qt::AlignRight);
+
+    connect(showSearchEdit_, &QLineEdit::textChanged, this, [this]() {
+        updateSearchResults();
+    });
+    connect(showSearchResultsList_, &QListWidget::itemSelectionChanged, this, [this]() {
+        updateSearchActionState();
+    });
+    connect(showSearchResultsList_, &QListWidget::itemDoubleClicked, this, [this](QListWidgetItem *) {
+        scheduleSelectedSearchResult();
+    });
+    connect(scheduleSearchResultButton_, &QPushButton::clicked, this, &TvGuideDialog::scheduleSelectedSearchResult);
+    tabs_->addTab(searchTab, "Search");
 
     auto *logsTab = new QWidget(this);
     auto *logsLayout = new QVBoxLayout(logsTab);
@@ -476,7 +607,7 @@ TvGuideDialog::TvGuideDialog(QWidget *parent)
     logsView_->setLineWrapMode(QPlainTextEdit::NoWrap);
     logsView_->setPlainText("No guide data loaded yet.");
     logsLayout->addWidget(logsView_);
-    tabs_->addTab(logsTab, "Logs");
+    tabs_->addTab(logsTab, "Status");
 }
 
 void TvGuideDialog::setLoadingState(const QString &message)
@@ -484,6 +615,30 @@ void TvGuideDialog::setLoadingState(const QString &message)
     logsView_->setPlainText(message);
     refreshButton_->setEnabled(false);
     tabs_->setCurrentIndex(0);
+}
+
+void TvGuideDialog::setGuideFilters(bool hideChannelsWithoutEitData, bool showFavoritesOnly)
+{
+    hideChannelsWithoutEitData_ = hideChannelsWithoutEitData;
+    showFavoritesOnly_ = showFavoritesOnly;
+    if (slotCount_ > 0) {
+        renderGuideTable();
+    }
+}
+
+void TvGuideDialog::syncToCurrentTime()
+{
+    pendingSyncToCurrentTime_ = true;
+
+    if (slotCount_ <= 0
+        || !isVisible()
+        || guideScrollArea_ == nullptr
+        || guideScrollArea_->viewport() == nullptr
+        || guideScrollArea_->viewport()->width() <= 0) {
+        return;
+    }
+
+    renderGuideTable();
 }
 
 QString TvGuideDialog::entryLabel(const TvGuideEntry &entry) const
@@ -498,7 +653,7 @@ QString TvGuideDialog::entryToolTip(const TvGuideEntry &entry) const
 
 void TvGuideDialog::resizeEvent(QResizeEvent *event)
 {
-    QDialog::resizeEvent(event);
+    QWidget::resizeEvent(event);
 
     if (event == nullptr || slotCount_ <= 0 || guideScrollArea_ == nullptr) {
         return;
@@ -511,9 +666,9 @@ void TvGuideDialog::resizeEvent(QResizeEvent *event)
 
 void TvGuideDialog::showEvent(QShowEvent *event)
 {
-    QDialog::showEvent(event);
+    QWidget::showEvent(event);
 
-    if (!pendingGuideRender_ && slotCount_ <= 0) {
+    if (!pendingGuideRender_ && !pendingSyncToCurrentTime_) {
         return;
     }
 
@@ -521,8 +676,10 @@ void TvGuideDialog::showEvent(QShowEvent *event)
         if (!isVisible()) {
             return;
         }
-        pendingGuideRender_ = false;
-        renderGuideTable();
+        if (pendingGuideRender_ || (pendingSyncToCurrentTime_ && slotCount_ > 0)) {
+            pendingGuideRender_ = false;
+            renderGuideTable();
+        }
     });
 }
 
@@ -549,27 +706,8 @@ void TvGuideDialog::applyGuideHorizontalScroll(int value)
         return;
     }
 
-    const int slotWidth = std::max(1, currentGuideSlotPixelWidth_);
-    const int snappedValue = std::clamp(static_cast<int>(std::llround(static_cast<double>(value) / slotWidth)) * slotWidth,
-                                        0,
-                                        bar->maximum());
-
-    if (applyingGuideHorizontalScroll_) {
-        if (guideHeaderContent_ != nullptr) {
-            guideHeaderContent_->move(-snappedValue, 0);
-        }
-        return;
-    }
-
-    if (snappedValue != value) {
-        applyingGuideHorizontalScroll_ = true;
-        bar->setValue(snappedValue);
-        applyingGuideHorizontalScroll_ = false;
-        return;
-    }
-
     if (guideHeaderContent_ != nullptr) {
-        guideHeaderContent_->move(-snappedValue, 0);
+        guideHeaderContent_->move(-std::clamp(value, 0, bar->maximum()), 0);
     }
 }
 
@@ -579,6 +717,7 @@ void TvGuideDialog::setGuideData(const QStringList &channelOrder,
                                  const QDateTime &windowStartUtc,
                                  int slotMinutes,
                                  int slotCount,
+                                 const QList<TvGuideScheduledSwitch> &scheduledSwitches,
                                  const QString &statusText)
 {
     refreshButton_->setEnabled(true);
@@ -587,9 +726,11 @@ void TvGuideDialog::setGuideData(const QStringList &channelOrder,
     favoriteChannels_ = favoriteChannels;
     favoriteChannels_.removeDuplicates();
     entriesByChannel_ = entriesByChannel;
+    scheduledSwitches_ = scheduledSwitches;
     windowStartUtc_ = windowStartUtc;
     slotMinutes_ = slotMinutes;
     slotCount_ = slotCount;
+    updateSearchResults();
 
     if (!isVisible()
         || guideScrollArea_ == nullptr
@@ -601,6 +742,111 @@ void TvGuideDialog::setGuideData(const QStringList &channelOrder,
 
     pendingGuideRender_ = false;
     renderGuideTable();
+}
+
+void TvGuideDialog::updateSearchResults()
+{
+    if (showSearchResultsList_ == nullptr || showSearchSummaryLabel_ == nullptr || showSearchEdit_ == nullptr) {
+        return;
+    }
+
+    searchResults_.clear();
+    showSearchResultsList_->clear();
+
+    const QString query = showSearchEdit_->text().simplified();
+    if (query.isEmpty()) {
+        showSearchSummaryLabel_->setText("Search the current guide cache by title or synopsis.");
+        updateSearchActionState();
+        return;
+    }
+
+    QStringList orderedChannels = channelOrder_;
+    for (auto it = entriesByChannel_.cbegin(); it != entriesByChannel_.cend(); ++it) {
+        if (!orderedChannels.contains(it.key())) {
+            orderedChannels.append(it.key());
+        }
+    }
+
+    QList<SearchResult> matchedResults;
+    for (const QString &channelName : orderedChannels) {
+        const QList<TvGuideEntry> entries = entriesByChannel_.value(channelName);
+        for (const TvGuideEntry &entry : entries) {
+            const QString title = entry.title.trimmed();
+            const QString synopsis = entry.synopsis.trimmed();
+            if (title.isEmpty()) {
+                continue;
+            }
+            if (!title.contains(query, Qt::CaseInsensitive)
+                && !synopsis.contains(query, Qt::CaseInsensitive)) {
+                continue;
+            }
+
+            SearchResult result;
+            result.channelName = channelName;
+            result.entry = entry;
+            matchedResults.append(result);
+        }
+    }
+
+    std::sort(matchedResults.begin(), matchedResults.end(), [](const SearchResult &left, const SearchResult &right) {
+        if (left.entry.startUtc == right.entry.startUtc) {
+            if (left.channelName == right.channelName) {
+                return left.entry.title.localeAwareCompare(right.entry.title) < 0;
+            }
+            return left.channelName.localeAwareCompare(right.channelName) < 0;
+        }
+        return left.entry.startUtc < right.entry.startUtc;
+    });
+
+    searchResults_ = matchedResults;
+    for (const SearchResult &result : searchResults_) {
+        const QString synopsis = result.entry.synopsis.trimmed();
+        QStringList lines;
+        lines << result.entry.title.trimmed();
+        lines << QString("%1 - %2 | %3")
+                     .arg(result.entry.startUtc.toLocalTime().toString("ddd h:mm AP"),
+                          result.entry.endUtc.toLocalTime().toString("h:mm AP"),
+                          result.channelName);
+        if (!synopsis.isEmpty()) {
+            lines << synopsis;
+        }
+        showSearchResultsList_->addItem(lines.join('\n'));
+    }
+
+    if (searchResults_.isEmpty()) {
+        showSearchSummaryLabel_->setText(QString("No guide entries matched \"%1\".").arg(query));
+    } else {
+        showSearchSummaryLabel_->setText(QString("%1 matching guide entr%2 found.")
+                                             .arg(searchResults_.size())
+                                             .arg(searchResults_.size() == 1 ? "y" : "ies"));
+    }
+
+    updateSearchActionState();
+}
+
+void TvGuideDialog::updateSearchActionState()
+{
+    if (scheduleSearchResultButton_ == nullptr || showSearchResultsList_ == nullptr) {
+        return;
+    }
+
+    const int row = showSearchResultsList_->currentRow();
+    scheduleSearchResultButton_->setEnabled(row >= 0 && row < searchResults_.size());
+}
+
+void TvGuideDialog::scheduleSelectedSearchResult()
+{
+    if (showSearchResultsList_ == nullptr) {
+        return;
+    }
+
+    const int row = showSearchResultsList_->currentRow();
+    if (row < 0 || row >= searchResults_.size()) {
+        return;
+    }
+
+    const SearchResult result = searchResults_.at(row);
+    emit searchScheduleRequested(result.entry.title.simplified(), result.channelName, result.entry);
 }
 
 bool TvGuideDialog::channelHasVisibleData(const QString &channel) const
@@ -626,6 +872,16 @@ bool TvGuideDialog::channelHasVisibleData(const QString &channel) const
     return false;
 }
 
+bool TvGuideDialog::isEntryScheduled(const QString &channelName, const TvGuideEntry &entry) const
+{
+    for (const TvGuideScheduledSwitch &scheduledSwitch : scheduledSwitches_) {
+        if (scheduledSwitchMatchesEntry(scheduledSwitch, channelName, entry)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 void TvGuideDialog::renderGuideTable()
 {
     auto *guideHeaderLayout = qobject_cast<QVBoxLayout *>(guideHeaderContent_ != nullptr ? guideHeaderContent_->layout() : nullptr);
@@ -641,12 +897,10 @@ void TvGuideDialog::renderGuideTable()
     QStringList visibleChannels;
     visibleChannels.reserve(channelOrder_.size());
     for (const QString &channel : channelOrder_) {
-        if (showFavoritesOnlyCheckBox_ != nullptr
-            && showFavoritesOnlyCheckBox_->isChecked()
-            && !favoriteChannels_.contains(channel)) {
+        if (showFavoritesOnly_ && !favoriteChannels_.contains(channel)) {
             continue;
         }
-        if (hideNoEitCheckBox_->isChecked() && !channelHasVisibleData(channel)) {
+        if (hideChannelsWithoutEitData_ && !channelHasVisibleData(channel)) {
             continue;
         }
         visibleChannels << channel;
@@ -673,6 +927,12 @@ void TvGuideDialog::renderGuideTable()
                                                       slotMinutes_,
                                                       slotCount_,
                                                       timelineWidth,
+                                                      [this, channel](const TvGuideEntry &entry) {
+                                                          return isEntryScheduled(channel, entry);
+                                                      },
+                                                      [this, channel](const TvGuideEntry &entry, bool enabled) {
+                                                          emit scheduleSwitchRequested(channel, entry, enabled);
+                                                      },
                                                       guideContent_);
         const int rowHeight = bandWidget->sizeHint().height();
 
@@ -711,8 +971,11 @@ void TvGuideDialog::renderGuideTable()
     guideContent_->setFixedSize(timelineWidth, rowsHeight);
 
     if (guideScrollArea_ != nullptr) {
-        guideScrollArea_->horizontalScrollBar()->setSingleStep(currentGuideSlotPixelWidth_);
-        guideScrollArea_->horizontalScrollBar()->setPageStep(currentGuideSlotPixelWidth_ * kGuideVisibleColumnCount);
+        guideScrollArea_->horizontalScrollBar()->setSingleStep(std::max(12, currentGuideSlotPixelWidth_ / 8));
+        guideScrollArea_->horizontalScrollBar()->setPageStep(
+            guideScrollArea_->viewport() != nullptr
+                ? std::max(24, guideScrollArea_->viewport()->width() - 48)
+                : currentGuideSlotPixelWidth_ * kGuideVisibleColumnCount);
         guideScrollArea_->horizontalScrollBar()->setValue(horizontalScroll);
         guideScrollArea_->verticalScrollBar()->setValue(verticalScroll);
     }
@@ -722,4 +985,51 @@ void TvGuideDialog::renderGuideTable()
     if (guideChannelsContent_ != nullptr) {
         guideChannelsContent_->move(0, -verticalScroll);
     }
+
+    if (pendingSyncToCurrentTime_) {
+        pendingSyncToCurrentTime_ = false;
+        scrollGuideToCurrentTime(true);
+    }
+}
+
+void TvGuideDialog::scrollGuideToCurrentTime(bool force)
+{
+    if (!windowStartUtc_.isValid()
+        || slotMinutes_ <= 0
+        || slotCount_ <= 0
+        || guideScrollArea_ == nullptr
+        || guideScrollArea_->viewport() == nullptr) {
+        return;
+    }
+
+    QScrollBar *horizontalBar = guideScrollArea_->horizontalScrollBar();
+    if (horizontalBar == nullptr) {
+        return;
+    }
+
+    const qint64 totalSeconds = static_cast<qint64>(slotMinutes_) * slotCount_ * 60;
+    if (totalSeconds <= 0) {
+        return;
+    }
+
+    const qint64 nowOffset = windowStartUtc_.secsTo(QDateTime::currentDateTimeUtc());
+    if (nowOffset < 0 || nowOffset > totalSeconds) {
+        return;
+    }
+
+    const int timelineWidth = std::max(1, slotCount_) * std::max(1, currentGuideSlotPixelWidth_);
+    const int nowX = std::clamp(static_cast<int>(std::llround(static_cast<double>(nowOffset) * timelineWidth / totalSeconds)),
+                                0,
+                                std::max(0, timelineWidth - 1));
+    const int viewportWidth = guideScrollArea_->viewport()->width();
+    const int left = horizontalBar->value();
+    const int right = left + viewportWidth;
+    if (!force && nowX >= left && nowX <= right - std::max(1, currentGuideSlotPixelWidth_ / 2)) {
+        return;
+    }
+
+    const int target = std::clamp(nowX - std::max(1, currentGuideSlotPixelWidth_),
+                                  0,
+                                  horizontalBar->maximum());
+    horizontalBar->setValue(target);
 }

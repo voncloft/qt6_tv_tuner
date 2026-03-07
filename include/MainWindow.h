@@ -18,6 +18,7 @@ class QTableWidget;
 class QSpinBox;
 class QAudioOutput;
 class QVideoWidget;
+class QListWidget;
 class QListWidgetItem;
 class QLabel;
 class QSlider;
@@ -27,6 +28,9 @@ class QCloseEvent;
 class QWidget;
 class QSplitter;
 class QTabWidget;
+class QVBoxLayout;
+class QCheckBox;
+class QSpinBox;
 
 class MainWindow : public QMainWindow
 {
@@ -62,8 +66,21 @@ private slots:
     void toggleFullscreen();
     void handleFullscreenChanged(bool fullScreen);
     void openMediaFile();
-    void openTvGuide();
     void refreshTvGuide();
+    void handleCurrentTabChanged(int index);
+    void handleGuideHideNoEitToggled(bool checked);
+    void handleGuideShowFavoritesOnlyToggled(bool checked);
+    void handleAutoFavoriteShowSchedulingToggled(bool checked);
+    void handleAutoPictureInPictureToggled(bool checked);
+    void handleGuideRefreshIntervalChanged(int minutes);
+    void handleGuideCacheRetentionChanged(int hours);
+    void handleSearchScheduleRequested(const QString &favoriteShowTitle,
+                                       const QString &channelName,
+                                       const TvGuideEntry &entry);
+    void addTestingBugItem();
+    void removeSelectedTestingBugItem();
+    void removeSelectedFavoriteShowRule();
+    void removeSelectedScheduledSwitch();
 
 private:
     static constexpr int kQuickFavoriteCount = 10;
@@ -109,6 +126,36 @@ private:
     void saveChannelSidebarSizing();
     void restoreChannelSidebarSizing();
     void restoreLastPlayedChannel();
+    void handleGuideScheduleToggle(const QString &channelName, const TvGuideEntry &entry, bool enabled);
+    void handleObeyScheduledSwitchesChanged(bool obey);
+    bool saveScheduledSwitches() const;
+    bool loadScheduledSwitches();
+    bool pruneExpiredScheduledSwitches();
+    void refreshScheduledSwitchTimer();
+    void processScheduledSwitches();
+    void loadFavoriteShowRules();
+    void saveFavoriteShowRules() const;
+    void refreshFavoriteShowRuleList();
+    void refreshScheduledSwitchList();
+    void loadTestingBugItems();
+    void saveTestingBugItems() const;
+    bool addTestingBugItemEntry(const QString &text, bool checked);
+    bool addFavoriteShowRule(const QString &title);
+    bool resolveScheduledSwitchChoices(const QList<TvGuideScheduledSwitch> &candidates,
+                                       const QString &sourceDescription,
+                                       bool promptForConflict);
+    bool addScheduledSwitchCandidate(const TvGuideScheduledSwitch &candidate,
+                                     const QString &sourceDescription,
+                                     bool promptForConflict);
+    void autoScheduleFavoriteShowsFromGuideCache(bool promptForConflict, bool forceCurrentCacheSearch);
+    void showStartupSwitchSummary();
+    bool shouldDetachVideoForCurrentTab(int index) const;
+    void detachVideoToPip();
+    void attachVideoFromPip();
+    void applyGuideFilterSettings();
+    void applyGuideRefreshIntervalSetting();
+    bool purgeExpiredGuideCacheFiles(bool clearLoadedState);
+    void clearLoadedGuideCache();
 
     QComboBox *frontendTypeCombo_{};
     QLineEdit *countryEdit_{};
@@ -129,16 +176,38 @@ private:
     QPlainTextEdit *logOutput_{};
     QTableWidget *channelsTable_{};
     QVideoWidget *videoWidget_{};
+    QVideoWidget *pipVideoWidget_{};
+    QLabel *videoDetachedPlaceholderLabel_{};
+    QWidget *pipWindow_{};
     QLabel *playbackStatusLabel_{};
     QLabel *currentShowLabel_{};
     QLabel *currentShowSynopsisLabel_{};
     QSlider *volumeSlider_{};
+    QCheckBox *hideNoEitChannelsCheckBox_{};
+    QCheckBox *showFavoritesOnlyCheckBox_{};
+    QCheckBox *obeyScheduledSwitchesCheckBox_{};
+    QCheckBox *autoFavoriteShowSchedulingCheckBox_{};
+    QCheckBox *autoPictureInPictureCheckBox_{};
+    QSpinBox *guideRefreshIntervalSpin_{};
+    QSpinBox *guideCacheRetentionSpin_{};
+    QLineEdit *favoriteShowRuleEdit_{};
+    QLineEdit *testingBugItemEdit_{};
+    QListWidget *favoriteShowRulesList_{};
+    QListWidget *scheduledSwitchesList_{};
+    QListWidget *testingBugItemsList_{};
+    QPushButton *addFavoriteShowRuleButton_{};
+    QPushButton *saveTestingBugItemButton_{};
+    QPushButton *removeTestingBugItemButton_{};
+    QPushButton *removeFavoriteShowRuleButton_{};
+    QPushButton *removeScheduledSwitchButton_{};
     QTabWidget *tabs_{};
     QWidget *watchPage_{};
+    QWidget *configPage_{};
     QWidget *watchControlsContainer_{};
     QWidget *favoritesContainer_{};
     QWidget *statusContainer_{};
     QSplitter *contentSplitter_{};
+    QVBoxLayout *pipWindowLayout_{};
 
     QProcess *scanProcess_{};
     QProcess *zapProcess_{};
@@ -151,6 +220,7 @@ private:
     QString logFilePath_;
     QStringList channelLines_;
     QStringList favorites_;
+    QStringList favoriteShowRules_;
     QHash<QString, QString> xspfNumberByTuneKey_;
     QHash<QString, QString> xspfProgramByChannel_;
     QString currentChannelName_;
@@ -161,7 +231,9 @@ private:
     QDateTime lastGuideWindowStartUtc_;
     int lastGuideSlotMinutes_{30};
     int lastGuideSlotCount_{12};
+    QString lastGuideCacheGeneratedUtc_;
     QString lastGuideStatusText_;
+    QString lastAutoFavoriteScheduleStamp_;
     QSet<QString> noAutoCurrentShowLookupChannels_;
     int reconnectAttemptCount_{0};
     const int maxReconnectAttempts_{6};
@@ -175,7 +247,7 @@ private:
     bool bridgeSawCodecParameterFailure_{false};
     bool waitingForDvrReady_{false};
     bool guideRefreshInProgress_{false};
-    QString lastStatusBarMessage_{"Ready"};
+    QString lastStatusBarMessage_{};
     bool fullscreenActive_{false};
     bool wasMaximizedBeforeFullscreen_{false};
     bool menuBarWasVisibleBeforeFullscreen_{true};
@@ -190,7 +262,14 @@ private:
     QTimer *playbackAttachTimer_{};
     QTimer *guideRefreshTimer_{};
     QTimer *guideCachePollTimer_{};
+    QTimer *scheduledSwitchTimer_{};
     TvGuideDialog *tvGuideDialog_{};
     int currentShowLookupSerial_{0};
     int playbackStartSerial_{0};
+    QList<TvGuideScheduledSwitch> scheduledSwitches_;
+    bool obeyScheduledSwitches_{true};
+    bool videoDetachedToPip_{false};
+    bool autoFavoriteShowSchedulingEnabled_{true};
+    bool autoPictureInPictureEnabled_{true};
+    bool startupSwitchSummaryShown_{false};
 };

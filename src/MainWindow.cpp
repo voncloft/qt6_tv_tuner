@@ -2,12 +2,16 @@
 #include "TvGuideDialog.h"
 
 #include <QAbstractItemView>
+#include <QAbstractButton>
 #include <QApplication>
 #include <QAudioOutput>
+#include <QCheckBox>
 #include <QComboBox>
 #include <QCloseEvent>
 #include <QDateTime>
 #include <QAction>
+#include <QDialog>
+#include <QDialogButtonBox>
 #include <QDir>
 #include <QElapsedTimer>
 #include <QEvent>
@@ -28,6 +32,7 @@
 #include <QKeyEvent>
 #include <QLabel>
 #include <QLineEdit>
+#include <QListWidget>
 #include <QListWidgetItem>
 #include <QMediaPlayer>
 #include <QKeySequence>
@@ -40,6 +45,7 @@
 #include <QPushButton>
 #include <QRegularExpression>
 #include <QSaveFile>
+#include <QSignalBlocker>
 #include <QSettings>
 #include <QSizePolicy>
 #include <QSlider>
@@ -74,10 +80,22 @@
 #include <functional>
 #include <thread>
 #include <vector>
+#include <limits>
 
 namespace {
 constexpr auto kChannelSidebarSplitterStateSetting = "watch/channel_sidebar_splitter_state";
 constexpr auto kLastPlayedChannelSetting = "watch/last_played_channel";
+constexpr auto kObeyScheduledSwitchesSetting = "tvGuide/obeyScheduledSwitches";
+constexpr auto kHideNoEitChannelsSetting = "tvGuide/hideChannelsWithoutEit";
+constexpr auto kShowFavoritesOnlySetting = "tvGuide/showOnlyFavorites";
+constexpr auto kAutoFavoriteShowSchedulingSetting = "tvGuide/autoFavoriteShowScheduling";
+constexpr auto kFavoriteShowRulesSetting = "tvGuide/favoriteShowRules";
+constexpr auto kTestingBugItemsSetting = "testing/bugItems";
+constexpr auto kAutoPictureInPictureSetting = "video/autoPictureInPicture";
+constexpr auto kGuideRefreshIntervalMinutesSetting = "tvGuide/refreshIntervalMinutes";
+constexpr auto kGuideCacheRetentionHoursSetting = "tvGuide/cacheRetentionHours";
+constexpr int kDefaultGuideRefreshIntervalMinutes = 60;
+constexpr int kDefaultGuideCacheRetentionHours = 24;
 
 QString quoteArg(const QString &arg)
 {
@@ -168,6 +186,128 @@ QString resolveGuideCacheBetaPath()
         return {};
     }
     return QDir(appDataPath).filePath("guide_cache_beta.json");
+}
+
+QString resolveGuideSchedulePath()
+{
+    const QString appDataPath = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
+    if (appDataPath.isEmpty()) {
+        return {};
+    }
+    return QDir(appDataPath).filePath("guide_scheduled_switches.json");
+}
+
+QString normalizeFavoriteShowRule(const QString &title)
+{
+    return title.simplified().toCaseFolded();
+}
+
+bool guideEntryMatchesScheduledSwitch(const QString &channelName,
+                                      const TvGuideEntry &entry,
+                                      const TvGuideScheduledSwitch &scheduledSwitch)
+{
+    return scheduledSwitch.channelName.trimmed() == channelName.trimmed()
+           && scheduledSwitch.startUtc == entry.startUtc
+           && scheduledSwitch.endUtc == entry.endUtc
+           && scheduledSwitch.title.trimmed() == entry.title.trimmed();
+}
+
+bool scheduledSwitchesMatch(const TvGuideScheduledSwitch &left, const TvGuideScheduledSwitch &right)
+{
+    return left.channelName.trimmed() == right.channelName.trimmed()
+           && left.startUtc == right.startUtc
+           && left.endUtc == right.endUtc
+           && left.title.trimmed() == right.title.trimmed();
+}
+
+bool scheduledSwitchesOverlap(const TvGuideScheduledSwitch &left, const TvGuideScheduledSwitch &right)
+{
+    return left.startUtc < right.endUtc && left.endUtc > right.startUtc;
+}
+
+QString scheduledSwitchLabel(const TvGuideScheduledSwitch &scheduledSwitch)
+{
+    const QString title = scheduledSwitch.title.trimmed().isEmpty()
+                              ? scheduledSwitch.channelName.trimmed()
+                              : scheduledSwitch.title.trimmed();
+    return QString("%1 on %2 at %3")
+        .arg(title,
+             scheduledSwitch.channelName.trimmed(),
+             scheduledSwitch.startUtc.toLocalTime().toString("ddd h:mm AP"));
+}
+
+QString scheduledSwitchListLabel(const TvGuideScheduledSwitch &scheduledSwitch)
+{
+    const QString title = scheduledSwitch.title.trimmed().isEmpty()
+                              ? scheduledSwitch.channelName.trimmed()
+                              : scheduledSwitch.title.trimmed();
+    return QString("%1 | %2 | %3 - %4")
+        .arg(title,
+             scheduledSwitch.channelName.trimmed(),
+             scheduledSwitch.startUtc.toLocalTime().toString("ddd h:mm AP"),
+             scheduledSwitch.endUtc.toLocalTime().toString("h:mm AP"));
+}
+
+struct ScheduledSwitchChoiceOption {
+    TvGuideScheduledSwitch scheduledSwitch;
+    bool isExisting{false};
+    int existingIndex{-1};
+};
+
+QJsonObject scheduledSwitchToJsonObject(const TvGuideScheduledSwitch &scheduledSwitch)
+{
+    QJsonObject object;
+    object.insert("channelName", scheduledSwitch.channelName);
+    object.insert("startUtc", scheduledSwitch.startUtc.toString(Qt::ISODateWithMs));
+    object.insert("endUtc", scheduledSwitch.endUtc.toString(Qt::ISODateWithMs));
+    object.insert("title", scheduledSwitch.title);
+    object.insert("synopsis", scheduledSwitch.synopsis);
+    return object;
+}
+
+QList<TvGuideScheduledSwitch> scheduledSwitchesFromJsonArray(const QJsonArray &array)
+{
+    QList<TvGuideScheduledSwitch> scheduledSwitches;
+    for (const QJsonValue &value : array) {
+        if (!value.isObject()) {
+            continue;
+        }
+
+        const QJsonObject object = value.toObject();
+        TvGuideScheduledSwitch scheduledSwitch;
+        scheduledSwitch.channelName = object.value("channelName").toString().trimmed();
+        scheduledSwitch.startUtc = QDateTime::fromString(object.value("startUtc").toString(), Qt::ISODateWithMs);
+        scheduledSwitch.endUtc = QDateTime::fromString(object.value("endUtc").toString(), Qt::ISODateWithMs);
+        scheduledSwitch.title = object.value("title").toString().trimmed();
+        scheduledSwitch.synopsis = object.value("synopsis").toString().trimmed();
+
+        if (scheduledSwitch.channelName.isEmpty()
+            || !scheduledSwitch.startUtc.isValid()
+            || !scheduledSwitch.endUtc.isValid()
+            || scheduledSwitch.endUtc <= scheduledSwitch.startUtc) {
+            continue;
+        }
+
+        bool duplicate = false;
+        for (const TvGuideScheduledSwitch &existing : scheduledSwitches) {
+            if (scheduledSwitchesMatch(existing, scheduledSwitch)) {
+                duplicate = true;
+                break;
+            }
+        }
+        if (!duplicate) {
+            scheduledSwitches.append(scheduledSwitch);
+        }
+    }
+
+    std::sort(scheduledSwitches.begin(), scheduledSwitches.end(), [](const TvGuideScheduledSwitch &left,
+                                                                     const TvGuideScheduledSwitch &right) {
+        if (left.startUtc == right.startUtc) {
+            return left.channelName < right.channelName;
+        }
+        return left.startUtc < right.startUtc;
+    });
+    return scheduledSwitches;
 }
 
 QScreen *screenForWidget(QWidget *widget)
@@ -965,7 +1105,6 @@ constexpr int kGuideCaptureMaxMs = 3600;
 constexpr int kGuideLookupTotalMaxMs = 4000;
 constexpr int kGuideProbeIntervalMs = 350;
 constexpr int kGuideCapturePacketCount = 60000;
-constexpr int kGuideRefreshIntervalMs = 60 * 60 * 1000;
 constexpr int kGuideCachePollIntervalMs = 5000;
 
 quint8 byteAt(const QByteArray &data, int index)
@@ -2026,16 +2165,55 @@ MainWindow::MainWindow(QWidget *parent)
     playbackAttachTimer_ = new QTimer(this);
     guideRefreshTimer_ = new QTimer(this);
     guideCachePollTimer_ = new QTimer(this);
+    scheduledSwitchTimer_ = new QTimer(this);
     reconnectTimer_->setSingleShot(true);
     currentShowTimer_->setSingleShot(true);
     playbackAttachTimer_->setSingleShot(true);
+    scheduledSwitchTimer_->setSingleShot(true);
 
     mediaPlayer_->setAudioOutput(audioOutput_);
     mediaPlayer_->setVideoOutput(videoWidget_);
     QSettings settings("tv_tuner_gui", "watcher");
     const int savedVolume = std::clamp(settings.value("volume_percent", 85).toInt(), 0, 100);
+    obeyScheduledSwitches_ = settings.value(kObeyScheduledSwitchesSetting, true).toBool();
+    autoFavoriteShowSchedulingEnabled_ = settings.value(kAutoFavoriteShowSchedulingSetting, true).toBool();
+    autoPictureInPictureEnabled_ = settings.value(kAutoPictureInPictureSetting, true).toBool();
     audioOutput_->setVolume(static_cast<float>(savedVolume) / 100.0f);
     volumeSlider_->setValue(savedVolume);
+    if (hideNoEitChannelsCheckBox_ != nullptr) {
+        const QSignalBlocker blocker(hideNoEitChannelsCheckBox_);
+        hideNoEitChannelsCheckBox_->setChecked(settings.value(kHideNoEitChannelsSetting, false).toBool());
+    }
+    if (showFavoritesOnlyCheckBox_ != nullptr) {
+        const QSignalBlocker blocker(showFavoritesOnlyCheckBox_);
+        showFavoritesOnlyCheckBox_->setChecked(settings.value(kShowFavoritesOnlySetting, false).toBool());
+    }
+    if (obeyScheduledSwitchesCheckBox_ != nullptr) {
+        const QSignalBlocker blocker(obeyScheduledSwitchesCheckBox_);
+        obeyScheduledSwitchesCheckBox_->setChecked(obeyScheduledSwitches_);
+    }
+    if (autoFavoriteShowSchedulingCheckBox_ != nullptr) {
+        const QSignalBlocker blocker(autoFavoriteShowSchedulingCheckBox_);
+        autoFavoriteShowSchedulingCheckBox_->setChecked(autoFavoriteShowSchedulingEnabled_);
+    }
+    if (autoPictureInPictureCheckBox_ != nullptr) {
+        const QSignalBlocker blocker(autoPictureInPictureCheckBox_);
+        autoPictureInPictureCheckBox_->setChecked(autoPictureInPictureEnabled_);
+    }
+    if (guideRefreshIntervalSpin_ != nullptr) {
+        const QSignalBlocker blocker(guideRefreshIntervalSpin_);
+        guideRefreshIntervalSpin_->setValue(settings.value(kGuideRefreshIntervalMinutesSetting,
+                                                           kDefaultGuideRefreshIntervalMinutes)
+                                                .toInt());
+    }
+    if (guideCacheRetentionSpin_ != nullptr) {
+        const QSignalBlocker blocker(guideCacheRetentionSpin_);
+        guideCacheRetentionSpin_->setValue(settings.value(kGuideCacheRetentionHoursSetting,
+                                                          kDefaultGuideCacheRetentionHours)
+                                               .toInt());
+    }
+    applyGuideFilterSettings();
+    applyGuideRefreshIntervalSetting();
 
     connect(scanProcess_, &QProcess::readyReadStandardOutput, this, &MainWindow::handleStdOut);
     connect(scanProcess_, &QProcess::readyReadStandardError, this, &MainWindow::handleStdErr);
@@ -2120,9 +2298,9 @@ MainWindow::MainWindow(QWidget *parent)
         appendLog("player: DVR ready signal timeout; attempting playback anyway.");
         startPlaybackFromDvr(pendingDvrPath_);
     });
-    guideRefreshTimer_->setInterval(kGuideRefreshIntervalMs);
+    connect(scheduledSwitchTimer_, &QTimer::timeout, this, &MainWindow::processScheduledSwitches);
     connect(guideRefreshTimer_, &QTimer::timeout, this, [this]() {
-        appendLog("guide-bg: hourly guide cache refresh triggered.");
+        appendLog("guide-bg: scheduled guide cache refresh triggered.");
         if (refreshGuideData(false, false)) {
             loadGuideCacheFile();
             applyCurrentShowStatusFromGuideCache();
@@ -2155,12 +2333,20 @@ MainWindow::MainWindow(QWidget *parent)
 
     logFilePath_ = resolveProjectLogPath();
     loadFavorites();
+    loadFavoriteShowRules();
+    loadTestingBugItems();
     loadXspfChannelHints();
     loadChannelsFileIfPresent();
+    purgeExpiredGuideCacheFiles(true);
+    loadScheduledSwitches();
     loadGuideCacheFile();
+    refreshFavoriteShowRuleList();
+    refreshScheduledSwitchList();
     refreshQuickButtons();
     playbackStatusLabel_->setText(playbackStatusText());
     setCurrentShowStatus("NO EIT DATA");
+    updateTvGuideDialogFromCurrentCache(false);
+    refreshScheduledSwitchTimer();
     guideCachePollTimer_->start();
 
     QTimer::singleShot(0, this, [this]() {
@@ -2176,8 +2362,11 @@ MainWindow::MainWindow(QWidget *parent)
             }
         }
         guideRefreshTimer_->start();
+        setStatusBarStateMessage(lastStatusBarMessage_);
         restoreChannelSidebarSizing();
         restoreLastPlayedChannel();
+        processScheduledSwitches();
+        showStartupSwitchSummary();
     });
 }
 
@@ -2201,9 +2390,16 @@ MainWindow::~MainWindow()
     if (guideCachePollTimer_ != nullptr) {
         guideCachePollTimer_->stop();
     }
+    if (scheduledSwitchTimer_ != nullptr) {
+        scheduledSwitchTimer_->stop();
+    }
     if (mediaPlayer_ != nullptr) {
         mediaPlayer_->stop();
         mediaPlayer_->setSource(QUrl());
+    }
+
+    if (pipWindow_ != nullptr) {
+        pipWindow_->hide();
     }
 
     suppressBridgeExitReconnect_ = true;
@@ -2220,6 +2416,9 @@ MainWindow::~MainWindow()
 void MainWindow::closeEvent(QCloseEvent *event)
 {
     appendLog("Application closing: releasing tuner resources.");
+    if (pipWindow_ != nullptr) {
+        pipWindow_->hide();
+    }
     exitFullscreen();
     saveChannelSidebarSizing();
     stopWatching();
@@ -2231,6 +2430,15 @@ bool MainWindow::eventFilter(QObject *watched, QEvent *event)
 {
     if (watched == videoWidget_ && event->type() == QEvent::MouseButtonDblClick) {
         toggleFullscreen();
+        return true;
+    }
+
+    if (watched == pipVideoWidget_ && event->type() == QEvent::MouseButtonDblClick) {
+        if (tabs_ != nullptr && watchPage_ != nullptr) {
+            tabs_->setCurrentWidget(watchPage_);
+        } else {
+            attachVideoFromPip();
+        }
         return true;
     }
 
@@ -2274,12 +2482,6 @@ void MainWindow::buildUi()
             QString("Created by Voncloft\nVersion %1").arg(QStringLiteral(TV_TUNER_GUI_VERSION)));
     });
 
-    QMenu *viewMenu = menuBar()->addMenu("View");
-    QAction *tvGuideAction = viewMenu->addAction("TV Guide");
-    tvGuideAction->setShortcut(QKeySequence(Qt::CTRL | Qt::Key_G));
-    tvGuideAction->setShortcutContext(Qt::WindowShortcut);
-    connect(tvGuideAction, &QAction::triggered, this, &MainWindow::openTvGuide);
-
     auto *root = new QWidget(this);
     auto *mainLayout = new QVBoxLayout(root);
     mainLayout->setContentsMargins(0, 0, 0, 0);
@@ -2297,8 +2499,17 @@ void MainWindow::buildUi()
     auto *tuningPage = new QWidget(tabs_);
     auto *tuningLayout = new QVBoxLayout(tuningPage);
 
+    configPage_ = new QWidget(tabs_);
+    auto *configLayout = new QVBoxLayout(configPage_);
+
+    auto *metaManagementPage = new QWidget(tabs_);
+    auto *metaManagementLayout = new QVBoxLayout(metaManagementPage);
+
     auto *logsPage = new QWidget(tabs_);
     auto *logsLayout = new QVBoxLayout(logsPage);
+
+    auto *testingBugsPage = new QWidget(tabs_);
+    auto *testingBugsLayout = new QVBoxLayout(testingBugsPage);
 
     auto *scanGroup = new QGroupBox("Scan Settings", tuningPage);
     auto *form = new QFormLayout(scanGroup);
@@ -2349,6 +2560,89 @@ void MainWindow::buildUi()
     tuningLayout->addWidget(scanGroup);
     tuningLayout->addLayout(scanActionsRow);
     tuningLayout->addStretch(1);
+
+    auto *guideOptionsGroup = new QGroupBox("TV Guide", configPage_);
+    auto *guideOptionsLayout = new QVBoxLayout(guideOptionsGroup);
+    hideNoEitChannelsCheckBox_ = new QCheckBox("Hide channels without EIT data", guideOptionsGroup);
+    showFavoritesOnlyCheckBox_ = new QCheckBox("Show only favorites in TV Guide", guideOptionsGroup);
+    obeyScheduledSwitchesCheckBox_ = new QCheckBox("Obey scheduled tuner switches", guideOptionsGroup);
+    autoFavoriteShowSchedulingCheckBox_ = new QCheckBox("Automatically schedule favorite show matches", guideOptionsGroup);
+    guideOptionsLayout->addWidget(hideNoEitChannelsCheckBox_);
+    guideOptionsLayout->addWidget(showFavoritesOnlyCheckBox_);
+    guideOptionsLayout->addWidget(obeyScheduledSwitchesCheckBox_);
+    guideOptionsLayout->addWidget(autoFavoriteShowSchedulingCheckBox_);
+
+    auto *playbackOptionsGroup = new QGroupBox("Playback", configPage_);
+    auto *playbackOptionsLayout = new QVBoxLayout(playbackOptionsGroup);
+    autoPictureInPictureCheckBox_ = new QCheckBox("Pop video out when leaving the Video tab", playbackOptionsGroup);
+    playbackOptionsLayout->addWidget(autoPictureInPictureCheckBox_);
+
+    auto *cacheOptionsGroup = new QGroupBox("Guide Cache", configPage_);
+    auto *cacheOptionsForm = new QFormLayout(cacheOptionsGroup);
+    guideRefreshIntervalSpin_ = new QSpinBox(cacheOptionsGroup);
+    guideRefreshIntervalSpin_->setRange(5, 1440);
+    guideRefreshIntervalSpin_->setSuffix(" min");
+    guideCacheRetentionSpin_ = new QSpinBox(cacheOptionsGroup);
+    guideCacheRetentionSpin_->setRange(0, 168);
+    guideCacheRetentionSpin_->setSpecialValueText("Never");
+    guideCacheRetentionSpin_->setSuffix(" hr");
+    cacheOptionsForm->addRow("Refresh guide JSON every:", guideRefreshIntervalSpin_);
+    cacheOptionsForm->addRow("Delete guide cache after:", guideCacheRetentionSpin_);
+
+    auto *favoriteShowsGroup = new QGroupBox("Favorite Shows", metaManagementPage);
+    auto *favoriteShowsLayout = new QVBoxLayout(favoriteShowsGroup);
+    auto *favoriteShowsAddRow = new QHBoxLayout();
+    favoriteShowRuleEdit_ = new QLineEdit(favoriteShowsGroup);
+    favoriteShowRuleEdit_->setPlaceholderText("Add favorite show name");
+    addFavoriteShowRuleButton_ = new QPushButton("Add Favorite Show", favoriteShowsGroup);
+    addFavoriteShowRuleButton_->setEnabled(false);
+    favoriteShowsAddRow->addWidget(favoriteShowRuleEdit_, 1);
+    favoriteShowsAddRow->addWidget(addFavoriteShowRuleButton_, 0);
+    favoriteShowRulesList_ = new QListWidget(favoriteShowsGroup);
+    favoriteShowRulesList_->setSelectionMode(QAbstractItemView::SingleSelection);
+    favoriteShowRulesList_->setAlternatingRowColors(true);
+    removeFavoriteShowRuleButton_ = new QPushButton("Remove Selected Favorite Show", favoriteShowsGroup);
+    removeFavoriteShowRuleButton_->setEnabled(false);
+    favoriteShowsLayout->addLayout(favoriteShowsAddRow);
+    favoriteShowsLayout->addWidget(favoriteShowRulesList_, 1);
+    favoriteShowsLayout->addWidget(removeFavoriteShowRuleButton_, 0);
+
+    auto *scheduledSwitchesGroup = new QGroupBox("Scheduled Switches", metaManagementPage);
+    auto *scheduledSwitchesLayout = new QVBoxLayout(scheduledSwitchesGroup);
+    scheduledSwitchesList_ = new QListWidget(scheduledSwitchesGroup);
+    scheduledSwitchesList_->setSelectionMode(QAbstractItemView::SingleSelection);
+    scheduledSwitchesList_->setAlternatingRowColors(true);
+    removeScheduledSwitchButton_ = new QPushButton("Remove Selected Switch", scheduledSwitchesGroup);
+    removeScheduledSwitchButton_->setEnabled(false);
+    scheduledSwitchesLayout->addWidget(scheduledSwitchesList_, 1);
+    scheduledSwitchesLayout->addWidget(removeScheduledSwitchButton_, 0);
+
+    configLayout->addWidget(guideOptionsGroup);
+    configLayout->addWidget(playbackOptionsGroup);
+    configLayout->addWidget(cacheOptionsGroup);
+    configLayout->addStretch(1);
+
+    metaManagementLayout->addWidget(favoriteShowsGroup, 1);
+    metaManagementLayout->addWidget(scheduledSwitchesGroup, 1);
+
+    auto *testingBugsGroup = new QGroupBox("Testing / Bugs", testingBugsPage);
+    auto *testingBugsGroupLayout = new QVBoxLayout(testingBugsGroup);
+    auto *testingBugsEntryRow = new QHBoxLayout();
+    testingBugItemEdit_ = new QLineEdit(testingBugsGroup);
+    testingBugItemEdit_->setPlaceholderText("Add something to test or watch for");
+    saveTestingBugItemButton_ = new QPushButton("Save Item", testingBugsGroup);
+    saveTestingBugItemButton_->setEnabled(false);
+    testingBugsEntryRow->addWidget(testingBugItemEdit_, 1);
+    testingBugsEntryRow->addWidget(saveTestingBugItemButton_, 0);
+    testingBugItemsList_ = new QListWidget(testingBugsGroup);
+    testingBugItemsList_->setSelectionMode(QAbstractItemView::SingleSelection);
+    testingBugItemsList_->setAlternatingRowColors(true);
+    removeTestingBugItemButton_ = new QPushButton("Delete Selected Item", testingBugsGroup);
+    removeTestingBugItemButton_->setEnabled(false);
+    testingBugsGroupLayout->addLayout(testingBugsEntryRow);
+    testingBugsGroupLayout->addWidget(testingBugItemsList_, 1);
+    testingBugsGroupLayout->addWidget(removeTestingBugItemButton_, 0);
+    testingBugsLayout->addWidget(testingBugsGroup, 1);
 
     watchControlsContainer_ = new QWidget(watchPage_);
     auto *watchControlsRow = new QHBoxLayout(watchControlsContainer_);
@@ -2401,6 +2695,11 @@ void MainWindow::buildUi()
     videoWidget_->setMinimumHeight(360);
     videoWidget_->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
     videoWidget_->setStyleSheet("background: #000;");
+    videoDetachedPlaceholderLabel_ = new QLabel("Video is playing in the floating mini-player.", watchPage_);
+    videoDetachedPlaceholderLabel_->setAlignment(Qt::AlignCenter);
+    videoDetachedPlaceholderLabel_->setWordWrap(true);
+    videoDetachedPlaceholderLabel_->setStyleSheet("QLabel { background: #000000; color: #b8b8b8; padding: 24px; }");
+    videoDetachedPlaceholderLabel_->hide();
 
     channelsTable_ = new QTableWidget(contentSplitter_);
     channelsTable_->setColumnCount(3);
@@ -2460,9 +2759,24 @@ void MainWindow::buildUi()
 
     watchLayout->addWidget(watchControlsContainer_);
     watchLayout->addWidget(contentSplitter_, 1);
+    watchLayout->addWidget(videoDetachedPlaceholderLabel_);
     watchLayout->addWidget(favoritesContainer_);
     watchLayout->addWidget(statusContainer_);
     watchLayout->addWidget(currentShowSynopsisLabel_);
+
+    pipWindow_ = new QWidget(this, Qt::Tool | Qt::WindowStaysOnTopHint);
+    pipWindow_->setWindowTitle("Voncloft TV Mini Player");
+    pipWindow_->resize(480, 270);
+    pipWindow_->setMinimumSize(320, 180);
+    pipWindow_->setStyleSheet("background: #000;");
+    pipWindowLayout_ = new QVBoxLayout(pipWindow_);
+    pipWindowLayout_->setContentsMargins(0, 0, 0, 0);
+    pipWindowLayout_->setSpacing(0);
+    pipVideoWidget_ = new QVideoWidget(pipWindow_);
+    pipVideoWidget_->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
+    pipVideoWidget_->setStyleSheet("background: #000;");
+    pipWindowLayout_->addWidget(pipVideoWidget_, 1);
+    pipWindow_->hide();
 
     logOutput_ = new QPlainTextEdit(logsPage);
     logOutput_->setReadOnly(true);
@@ -2470,15 +2784,33 @@ void MainWindow::buildUi()
     logOutput_->setPlaceholderText("w_scan2 and tuning output will appear here...");
     logsLayout->addWidget(logOutput_);
 
+    tvGuideDialog_ = new TvGuideDialog(tabs_);
     tabs_->addTab(watchPage_, "Video");
+    tabs_->addTab(tvGuideDialog_, "TV Guide");
+    tabs_->addTab(metaManagementPage, "Meta Management");
     tabs_->addTab(tuningPage, "Tuning");
+    tabs_->addTab(configPage_, "Config");
+    tabs_->addTab(testingBugsPage, "Testing/bugs");
     tabs_->addTab(logsPage, "Logs");
     mainLayout->addWidget(tabs_, 1);
     setCentralWidget(root);
 
     videoWidget_->installEventFilter(this);
+    pipVideoWidget_->installEventFilter(this);
 
-    setStatusBarStateMessage("Ready");
+    setStatusBarStateMessage(QString());
+    connect(statusBar(), &QStatusBar::messageChanged, this, [this](const QString &message) {
+        if (!message.trimmed().isEmpty()) {
+            return;
+        }
+        QTimer::singleShot(0, this, [this]() {
+            if (statusBar() == nullptr || !statusBar()->currentMessage().trimmed().isEmpty()) {
+                return;
+            }
+            const QString fallback = lastStatusBarMessage_.trimmed();
+            setStatusBarStateMessage(fallback);
+        });
+    });
 
     connect(startButton_, &QPushButton::clicked, this, &MainWindow::startScan);
     connect(stopButton_, &QPushButton::clicked, this, &MainWindow::stopScan);
@@ -2487,10 +2819,1229 @@ void MainWindow::buildUi()
     connect(openFileButton_, &QPushButton::clicked, this, &MainWindow::openMediaFile);
     connect(addFavoriteButton_, &QPushButton::clicked, this, &MainWindow::addSelectedFavorite);
     connect(removeFavoriteButton_, &QPushButton::clicked, this, &MainWindow::removeSelectedFavorite);
+    connect(tvGuideDialog_, &TvGuideDialog::refreshRequested, this, &MainWindow::refreshTvGuide);
+    connect(tvGuideDialog_, &TvGuideDialog::scheduleSwitchRequested, this, &MainWindow::handleGuideScheduleToggle);
+    connect(tvGuideDialog_, &TvGuideDialog::searchScheduleRequested, this, &MainWindow::handleSearchScheduleRequested);
+    connect(tabs_, &QTabWidget::currentChanged, this, &MainWindow::handleCurrentTabChanged);
+    connect(hideNoEitChannelsCheckBox_, &QCheckBox::toggled, this, &MainWindow::handleGuideHideNoEitToggled);
+    connect(showFavoritesOnlyCheckBox_, &QCheckBox::toggled, this, &MainWindow::handleGuideShowFavoritesOnlyToggled);
+    connect(obeyScheduledSwitchesCheckBox_, &QCheckBox::toggled, this, &MainWindow::handleObeyScheduledSwitchesChanged);
+    connect(autoFavoriteShowSchedulingCheckBox_,
+            &QCheckBox::toggled,
+            this,
+            &MainWindow::handleAutoFavoriteShowSchedulingToggled);
+    connect(autoPictureInPictureCheckBox_, &QCheckBox::toggled, this, &MainWindow::handleAutoPictureInPictureToggled);
+    connect(guideRefreshIntervalSpin_,
+            qOverload<int>(&QSpinBox::valueChanged),
+            this,
+            &MainWindow::handleGuideRefreshIntervalChanged);
+    connect(guideCacheRetentionSpin_,
+            qOverload<int>(&QSpinBox::valueChanged),
+            this,
+            &MainWindow::handleGuideCacheRetentionChanged);
     connect(channelsTable_, &QTableWidget::cellDoubleClicked, this, [this](int, int) {
         watchSelectedChannel();
     });
+    connect(favoriteShowRulesList_, &QListWidget::itemSelectionChanged, this, [this]() {
+        if (removeFavoriteShowRuleButton_ != nullptr) {
+            removeFavoriteShowRuleButton_->setEnabled(favoriteShowRulesList_ != nullptr
+                                                      && favoriteShowRulesList_->currentRow() >= 0);
+        }
+    });
+    connect(favoriteShowRuleEdit_, &QLineEdit::textChanged, this, [this](const QString &text) {
+        if (addFavoriteShowRuleButton_ != nullptr) {
+            addFavoriteShowRuleButton_->setEnabled(!text.simplified().isEmpty());
+        }
+    });
+    const auto addManualFavoriteShowRule = [this]() {
+        if (favoriteShowRuleEdit_ == nullptr) {
+            return;
+        }
+
+        const QString showName = favoriteShowRuleEdit_->text().simplified();
+        if (showName.isEmpty()) {
+            return;
+        }
+
+        if (!addFavoriteShowRule(showName)) {
+            QMessageBox::information(this,
+                                     "Favorite show already saved",
+                                     QString("%1 is already in your favorite show list.").arg(showName));
+            return;
+        }
+
+        favoriteShowRuleEdit_->clear();
+        if (autoFavoriteShowSchedulingEnabled_) {
+            autoScheduleFavoriteShowsFromGuideCache(true, true);
+        }
+    };
+    connect(addFavoriteShowRuleButton_, &QPushButton::clicked, this, addManualFavoriteShowRule);
+    connect(favoriteShowRuleEdit_, &QLineEdit::returnPressed, this, addManualFavoriteShowRule);
+    connect(scheduledSwitchesList_, &QListWidget::itemSelectionChanged, this, [this]() {
+        if (removeScheduledSwitchButton_ != nullptr) {
+            removeScheduledSwitchButton_->setEnabled(scheduledSwitchesList_ != nullptr
+                                                     && scheduledSwitchesList_->currentRow() >= 0);
+        }
+    });
+    connect(testingBugItemEdit_, &QLineEdit::textChanged, this, [this](const QString &text) {
+        if (saveTestingBugItemButton_ != nullptr) {
+            saveTestingBugItemButton_->setEnabled(!text.simplified().isEmpty());
+        }
+    });
+    connect(testingBugItemEdit_, &QLineEdit::returnPressed, this, &MainWindow::addTestingBugItem);
+    connect(saveTestingBugItemButton_, &QPushButton::clicked, this, &MainWindow::addTestingBugItem);
+    connect(testingBugItemsList_, &QListWidget::itemSelectionChanged, this, [this]() {
+        if (removeTestingBugItemButton_ != nullptr) {
+            removeTestingBugItemButton_->setEnabled(testingBugItemsList_ != nullptr
+                                                    && testingBugItemsList_->currentRow() >= 0);
+        }
+    });
+    connect(testingBugItemsList_, &QListWidget::itemChanged, this, [this](QListWidgetItem *) {
+        saveTestingBugItems();
+    });
+    connect(removeTestingBugItemButton_, &QPushButton::clicked, this, &MainWindow::removeSelectedTestingBugItem);
+    connect(removeFavoriteShowRuleButton_, &QPushButton::clicked, this, &MainWindow::removeSelectedFavoriteShowRule);
+    connect(removeScheduledSwitchButton_, &QPushButton::clicked, this, &MainWindow::removeSelectedScheduledSwitch);
     connect(fullscreenButton_, &QPushButton::clicked, this, &MainWindow::toggleFullscreen);
+}
+
+void MainWindow::handleGuideHideNoEitToggled(bool checked)
+{
+    QSettings settings("tv_tuner_gui", "watcher");
+    settings.setValue(kHideNoEitChannelsSetting, checked);
+    applyGuideFilterSettings();
+}
+
+void MainWindow::handleGuideShowFavoritesOnlyToggled(bool checked)
+{
+    QSettings settings("tv_tuner_gui", "watcher");
+    settings.setValue(kShowFavoritesOnlySetting, checked);
+    applyGuideFilterSettings();
+}
+
+void MainWindow::handleAutoFavoriteShowSchedulingToggled(bool checked)
+{
+    autoFavoriteShowSchedulingEnabled_ = checked;
+    QSettings settings("tv_tuner_gui", "watcher");
+    settings.setValue(kAutoFavoriteShowSchedulingSetting, autoFavoriteShowSchedulingEnabled_);
+    if (autoFavoriteShowSchedulingCheckBox_ != nullptr
+        && autoFavoriteShowSchedulingCheckBox_->isChecked() != autoFavoriteShowSchedulingEnabled_) {
+        autoFavoriteShowSchedulingCheckBox_->setChecked(autoFavoriteShowSchedulingEnabled_);
+    }
+    if (autoFavoriteShowSchedulingEnabled_) {
+        autoScheduleFavoriteShowsFromGuideCache(true, true);
+    }
+}
+
+void MainWindow::handleObeyScheduledSwitchesChanged(bool obey)
+{
+    obeyScheduledSwitches_ = obey;
+    QSettings settings("tv_tuner_gui", "watcher");
+    settings.setValue(kObeyScheduledSwitchesSetting, obeyScheduledSwitches_);
+    if (obeyScheduledSwitchesCheckBox_ != nullptr && obeyScheduledSwitchesCheckBox_->isChecked() != obeyScheduledSwitches_) {
+        obeyScheduledSwitchesCheckBox_->setChecked(obeyScheduledSwitches_);
+    }
+    updateTvGuideDialogFromCurrentCache(false);
+    refreshScheduledSwitchTimer();
+    if (obeyScheduledSwitches_) {
+        processScheduledSwitches();
+    }
+}
+
+void MainWindow::handleAutoPictureInPictureToggled(bool checked)
+{
+    autoPictureInPictureEnabled_ = checked;
+    QSettings settings("tv_tuner_gui", "watcher");
+    settings.setValue(kAutoPictureInPictureSetting, autoPictureInPictureEnabled_);
+
+    if (!autoPictureInPictureEnabled_) {
+        attachVideoFromPip();
+        if (pipWindow_ != nullptr) {
+            pipWindow_->hide();
+        }
+        return;
+    }
+
+    if (tabs_ != nullptr) {
+        handleCurrentTabChanged(tabs_->currentIndex());
+    }
+}
+
+void MainWindow::handleGuideRefreshIntervalChanged(int minutes)
+{
+    QSettings settings("tv_tuner_gui", "watcher");
+    settings.setValue(kGuideRefreshIntervalMinutesSetting, minutes);
+    applyGuideRefreshIntervalSetting();
+    setStatusBarStateMessage(lastStatusBarMessage_);
+}
+
+void MainWindow::handleGuideCacheRetentionChanged(int hours)
+{
+    QSettings settings("tv_tuner_gui", "watcher");
+    settings.setValue(kGuideCacheRetentionHoursSetting, hours);
+    setStatusBarStateMessage("Purging old cached data");
+    const bool removed = purgeExpiredGuideCacheFiles(true);
+    if (!removed) {
+        loadGuideCacheFile();
+    }
+    applyCurrentShowStatusFromGuideCache();
+    updateTvGuideDialogFromCurrentCache(false);
+    setStatusBarStateMessage(removed ? "Old cached data purged"
+                                     : "Guide cache retention updated");
+}
+
+void MainWindow::applyGuideFilterSettings()
+{
+    if (tvGuideDialog_ == nullptr) {
+        return;
+    }
+
+    const bool hideNoEit = hideNoEitChannelsCheckBox_ != nullptr && hideNoEitChannelsCheckBox_->isChecked();
+    const bool showFavoritesOnly = showFavoritesOnlyCheckBox_ != nullptr && showFavoritesOnlyCheckBox_->isChecked();
+    tvGuideDialog_->setGuideFilters(hideNoEit, showFavoritesOnly);
+}
+
+void MainWindow::applyGuideRefreshIntervalSetting()
+{
+    if (guideRefreshTimer_ == nullptr) {
+        return;
+    }
+
+    const int minutes = std::clamp(guideRefreshIntervalSpin_ != nullptr ? guideRefreshIntervalSpin_->value()
+                                                                        : kDefaultGuideRefreshIntervalMinutes,
+                                   5,
+                                   1440);
+    guideRefreshTimer_->setInterval(minutes * 60 * 1000);
+    if (guideRefreshTimer_->isActive()) {
+        guideRefreshTimer_->start();
+    }
+}
+
+void MainWindow::clearLoadedGuideCache()
+{
+    guideEntriesCache_.clear();
+    lastGuideChannelOrder_.clear();
+    lastGuideWindowStartUtc_ = QDateTime();
+    lastGuideSlotMinutes_ = 30;
+    lastGuideSlotCount_ = 12;
+    lastGuideCacheGeneratedUtc_.clear();
+    lastGuideStatusText_ = "Guide cache expired and was removed.";
+    lastAutoFavoriteScheduleStamp_.clear();
+    noAutoCurrentShowLookupChannels_.clear();
+}
+
+void MainWindow::loadFavoriteShowRules()
+{
+    favoriteShowRules_.clear();
+
+    QSettings settings("tv_tuner_gui", "watcher");
+    const QStringList storedRules = settings.value(kFavoriteShowRulesSetting).toStringList();
+    QSet<QString> seenRules;
+    for (const QString &storedRule : storedRules) {
+        const QString trimmedRule = storedRule.simplified();
+        if (trimmedRule.isEmpty()) {
+            continue;
+        }
+        const QString normalizedRule = normalizeFavoriteShowRule(trimmedRule);
+        if (seenRules.contains(normalizedRule)) {
+            continue;
+        }
+        seenRules.insert(normalizedRule);
+        favoriteShowRules_.append(trimmedRule);
+    }
+
+    std::sort(favoriteShowRules_.begin(),
+              favoriteShowRules_.end(),
+              [](const QString &left, const QString &right) {
+                  return left.localeAwareCompare(right) < 0;
+              });
+}
+
+void MainWindow::saveFavoriteShowRules() const
+{
+    QSettings settings("tv_tuner_gui", "watcher");
+    settings.setValue(kFavoriteShowRulesSetting, favoriteShowRules_);
+}
+
+void MainWindow::refreshFavoriteShowRuleList()
+{
+    if (favoriteShowRulesList_ == nullptr) {
+        return;
+    }
+
+    favoriteShowRulesList_->clear();
+    for (const QString &rule : favoriteShowRules_) {
+        favoriteShowRulesList_->addItem(rule);
+    }
+    if (removeFavoriteShowRuleButton_ != nullptr) {
+        removeFavoriteShowRuleButton_->setEnabled(false);
+    }
+}
+
+void MainWindow::refreshScheduledSwitchList()
+{
+    if (scheduledSwitchesList_ == nullptr) {
+        return;
+    }
+
+    scheduledSwitchesList_->clear();
+    for (const TvGuideScheduledSwitch &scheduledSwitch : scheduledSwitches_) {
+        scheduledSwitchesList_->addItem(scheduledSwitchListLabel(scheduledSwitch));
+    }
+    if (removeScheduledSwitchButton_ != nullptr) {
+        removeScheduledSwitchButton_->setEnabled(false);
+    }
+}
+
+void MainWindow::loadTestingBugItems()
+{
+    if (testingBugItemsList_ == nullptr) {
+        return;
+    }
+
+    const QSignalBlocker blocker(testingBugItemsList_);
+    testingBugItemsList_->clear();
+
+    QSettings settings("tv_tuner_gui", "watcher");
+    const QString serializedItems = settings.value(kTestingBugItemsSetting).toString().trimmed();
+    if (serializedItems.isEmpty()) {
+        return;
+    }
+
+    QJsonParseError parseError{};
+    const QJsonDocument document = QJsonDocument::fromJson(serializedItems.toUtf8(), &parseError);
+    if (parseError.error != QJsonParseError::NoError || !document.isArray()) {
+        return;
+    }
+
+    for (const QJsonValue &value : document.array()) {
+        if (!value.isObject()) {
+            continue;
+        }
+
+        const QJsonObject object = value.toObject();
+        addTestingBugItemEntry(object.value("text").toString(), object.value("checked").toBool(false));
+    }
+    if (removeTestingBugItemButton_ != nullptr) {
+        removeTestingBugItemButton_->setEnabled(false);
+    }
+}
+
+void MainWindow::saveTestingBugItems() const
+{
+    if (testingBugItemsList_ == nullptr) {
+        return;
+    }
+
+    QJsonArray itemsArray;
+    for (int index = 0; index < testingBugItemsList_->count(); ++index) {
+        QListWidgetItem *item = testingBugItemsList_->item(index);
+        if (item == nullptr) {
+            continue;
+        }
+
+        const QString text = item->text().simplified();
+        if (text.isEmpty()) {
+            continue;
+        }
+
+        QJsonObject object;
+        object.insert("text", text);
+        object.insert("checked", item->checkState() == Qt::Checked);
+        itemsArray.append(object);
+    }
+
+    QSettings settings("tv_tuner_gui", "watcher");
+    settings.setValue(kTestingBugItemsSetting,
+                      QString::fromUtf8(QJsonDocument(itemsArray).toJson(QJsonDocument::Compact)));
+}
+
+bool MainWindow::addTestingBugItemEntry(const QString &text, bool checked)
+{
+    if (testingBugItemsList_ == nullptr) {
+        return false;
+    }
+
+    const QString trimmedText = text.simplified();
+    if (trimmedText.isEmpty()) {
+        return false;
+    }
+
+    for (int index = 0; index < testingBugItemsList_->count(); ++index) {
+        QListWidgetItem *existingItem = testingBugItemsList_->item(index);
+        if (existingItem != nullptr && existingItem->text().compare(trimmedText, Qt::CaseInsensitive) == 0) {
+            return false;
+        }
+    }
+
+    auto *item = new QListWidgetItem(trimmedText, testingBugItemsList_);
+    item->setFlags(item->flags() | Qt::ItemIsUserCheckable | Qt::ItemIsEnabled | Qt::ItemIsSelectable);
+    item->setCheckState(checked ? Qt::Checked : Qt::Unchecked);
+    return true;
+}
+
+void MainWindow::addTestingBugItem()
+{
+    if (testingBugItemEdit_ == nullptr) {
+        return;
+    }
+
+    const QString text = testingBugItemEdit_->text().simplified();
+    if (text.isEmpty()) {
+        return;
+    }
+
+    if (!addTestingBugItemEntry(text, false)) {
+        QMessageBox::information(this,
+                                 "Item already saved",
+                                 QString("%1 is already in your Testing/bugs list.").arg(text));
+        return;
+    }
+
+    testingBugItemEdit_->clear();
+    saveTestingBugItems();
+}
+
+void MainWindow::removeSelectedTestingBugItem()
+{
+    if (testingBugItemsList_ == nullptr) {
+        return;
+    }
+
+    const int row = testingBugItemsList_->currentRow();
+    if (row < 0) {
+        return;
+    }
+
+    delete testingBugItemsList_->takeItem(row);
+    if (removeTestingBugItemButton_ != nullptr) {
+        removeTestingBugItemButton_->setEnabled(false);
+    }
+    saveTestingBugItems();
+}
+
+bool MainWindow::addFavoriteShowRule(const QString &title)
+{
+    const QString trimmedTitle = title.simplified();
+    if (trimmedTitle.isEmpty()) {
+        return false;
+    }
+
+    const QString normalizedTitle = normalizeFavoriteShowRule(trimmedTitle);
+    for (const QString &existingRule : favoriteShowRules_) {
+        if (normalizeFavoriteShowRule(existingRule) == normalizedTitle) {
+            return false;
+        }
+    }
+
+    favoriteShowRules_.append(trimmedTitle);
+    std::sort(favoriteShowRules_.begin(),
+              favoriteShowRules_.end(),
+              [](const QString &left, const QString &right) {
+                  return left.localeAwareCompare(right) < 0;
+              });
+    saveFavoriteShowRules();
+    refreshFavoriteShowRuleList();
+    appendLog(QString("favorite-show: added %1").arg(trimmedTitle));
+    return true;
+}
+
+void MainWindow::handleCurrentTabChanged(int index)
+{
+    if (tabs_ == nullptr) {
+        return;
+    }
+
+    if (tabs_->widget(index) == tvGuideDialog_ && tvGuideDialog_ != nullptr) {
+        tvGuideDialog_->syncToCurrentTime();
+    }
+
+    if (tabs_->widget(index) == watchPage_) {
+        attachVideoFromPip();
+        return;
+    }
+
+    if (fullscreenActive_) {
+        exitFullscreen();
+    }
+
+    if (shouldDetachVideoForCurrentTab(index)) {
+        detachVideoToPip();
+    } else if (videoDetachedToPip_) {
+        attachVideoFromPip();
+    }
+}
+
+bool MainWindow::shouldDetachVideoForCurrentTab(int index) const
+{
+    if (!autoPictureInPictureEnabled_
+        || tabs_ == nullptr
+        || watchPage_ == nullptr
+        || currentChannelName_.trimmed().isEmpty()
+        || fullscreenActive_) {
+        return false;
+    }
+
+    return index >= 0 && tabs_->widget(index) != watchPage_;
+}
+
+void MainWindow::detachVideoToPip()
+{
+    if (videoDetachedToPip_
+        || videoWidget_ == nullptr
+        || pipVideoWidget_ == nullptr
+        || pipWindowLayout_ == nullptr
+        || pipWindow_ == nullptr) {
+        return;
+    }
+
+    if (videoDetachedPlaceholderLabel_ != nullptr) {
+        videoDetachedPlaceholderLabel_->show();
+    }
+    if (mediaPlayer_ != nullptr) {
+        mediaPlayer_->setVideoOutput(pipVideoWidget_);
+    }
+    pipVideoWidget_->show();
+    videoDetachedToPip_ = true;
+
+    if (pipWindow_->pos() == QPoint(0, 0)) {
+        if (QScreen *targetScreen = screenForWidget(this)) {
+            const QRect available = targetScreen->availableGeometry();
+            pipWindow_->move(available.right() - pipWindow_->width() - 24, available.top() + 24);
+        }
+    }
+
+    pipWindow_->show();
+    pipWindow_->raise();
+}
+
+void MainWindow::attachVideoFromPip()
+{
+    if (!videoDetachedToPip_
+        || videoWidget_ == nullptr
+        || pipVideoWidget_ == nullptr) {
+        return;
+    }
+
+    if (videoDetachedPlaceholderLabel_ != nullptr) {
+        videoDetachedPlaceholderLabel_->hide();
+    }
+    if (pipWindow_ != nullptr) {
+        pipWindow_->hide();
+    }
+    if (mediaPlayer_ != nullptr) {
+        mediaPlayer_->setVideoOutput(videoWidget_);
+    }
+    videoWidget_->show();
+    videoDetachedToPip_ = false;
+}
+
+bool MainWindow::purgeExpiredGuideCacheFiles(bool clearLoadedState)
+{
+    const int retentionHours = std::max(0,
+                                        guideCacheRetentionSpin_ != nullptr
+                                            ? guideCacheRetentionSpin_->value()
+                                            : QSettings("tv_tuner_gui", "watcher")
+                                                  .value(kGuideCacheRetentionHoursSetting,
+                                                         kDefaultGuideCacheRetentionHours)
+                                                  .toInt());
+    if (retentionHours <= 0) {
+        return false;
+    }
+
+    const QDateTime cutoffUtc = QDateTime::currentDateTimeUtc().addSecs(-static_cast<qint64>(retentionHours) * 3600);
+    const auto cacheExpired = [&cutoffUtc](const QString &cachePath) {
+        if (cachePath.isEmpty()) {
+            return false;
+        }
+
+        QFileInfo cacheInfo(cachePath);
+        if (!cacheInfo.exists()) {
+            return false;
+        }
+
+        QDateTime generatedUtc;
+        QFile cacheFile(cachePath);
+        if (cacheFile.open(QIODevice::ReadOnly | QIODevice::Text)) {
+            const QJsonDocument document = QJsonDocument::fromJson(cacheFile.readAll());
+            if (document.isObject()) {
+                generatedUtc = QDateTime::fromString(document.object().value("generatedUtc").toString(),
+                                                     Qt::ISODateWithMs);
+            }
+        }
+        if (!generatedUtc.isValid()) {
+            generatedUtc = cacheInfo.lastModified().toUTC();
+        }
+        return generatedUtc.isValid() && generatedUtc < cutoffUtc;
+    };
+
+    bool removedPrimaryCache = false;
+    bool removedAny = false;
+    const QString primaryCachePath = resolveGuideCachePath();
+    if (cacheExpired(primaryCachePath) && QFile::remove(primaryCachePath)) {
+        removedPrimaryCache = true;
+        removedAny = true;
+    }
+    const QString betaCachePath = resolveGuideCacheBetaPath();
+    if (cacheExpired(betaCachePath) && QFile::remove(betaCachePath)) {
+        removedAny = true;
+    }
+
+    if (removedPrimaryCache && clearLoadedState) {
+        clearLoadedGuideCache();
+    }
+    return removedAny;
+}
+
+bool MainWindow::saveScheduledSwitches() const
+{
+    const QString schedulePath = resolveGuideSchedulePath();
+    if (schedulePath.isEmpty()) {
+        return false;
+    }
+
+    QFileInfo scheduleInfo(schedulePath);
+    QDir scheduleDir = scheduleInfo.dir();
+    if (!scheduleDir.exists() && !scheduleDir.mkpath(".")) {
+        return false;
+    }
+
+    QJsonObject root;
+    root.insert("version", 1);
+    root.insert("savedUtc", QDateTime::currentDateTimeUtc().toString(Qt::ISODateWithMs));
+
+    QJsonArray switchesArray;
+    for (const TvGuideScheduledSwitch &scheduledSwitch : scheduledSwitches_) {
+        switchesArray.append(scheduledSwitchToJsonObject(scheduledSwitch));
+    }
+    root.insert("switches", switchesArray);
+
+    QSaveFile scheduleFile(schedulePath);
+    if (!scheduleFile.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+        return false;
+    }
+    const QByteArray payload = QJsonDocument(root).toJson(QJsonDocument::Indented);
+    if (scheduleFile.write(payload) != payload.size()) {
+        scheduleFile.cancelWriting();
+        return false;
+    }
+    return scheduleFile.commit();
+}
+
+bool MainWindow::loadScheduledSwitches()
+{
+    scheduledSwitches_.clear();
+    refreshScheduledSwitchList();
+
+    const QString schedulePath = resolveGuideSchedulePath();
+    if (schedulePath.isEmpty()) {
+        return false;
+    }
+
+    QFile scheduleFile(schedulePath);
+    if (!scheduleFile.exists()) {
+        return false;
+    }
+    if (!scheduleFile.open(QIODevice::ReadOnly | QIODevice::Text)) {
+        return false;
+    }
+
+    QJsonParseError parseError{};
+    const QJsonDocument document = QJsonDocument::fromJson(scheduleFile.readAll(), &parseError);
+    if (parseError.error != QJsonParseError::NoError || !document.isObject()) {
+        return false;
+    }
+
+    scheduledSwitches_ = scheduledSwitchesFromJsonArray(document.object().value("switches").toArray());
+    const bool pruned = pruneExpiredScheduledSwitches();
+    if (pruned) {
+        saveScheduledSwitches();
+    }
+    refreshScheduledSwitchList();
+    return !scheduledSwitches_.isEmpty();
+}
+
+bool MainWindow::pruneExpiredScheduledSwitches()
+{
+    const QDateTime nowUtc = QDateTime::currentDateTimeUtc();
+    QList<TvGuideScheduledSwitch> cleaned;
+    bool changed = false;
+
+    std::sort(scheduledSwitches_.begin(), scheduledSwitches_.end(), [](const TvGuideScheduledSwitch &left,
+                                                                       const TvGuideScheduledSwitch &right) {
+        if (left.startUtc == right.startUtc) {
+            return left.channelName < right.channelName;
+        }
+        return left.startUtc < right.startUtc;
+    });
+
+    for (const TvGuideScheduledSwitch &scheduledSwitch : scheduledSwitches_) {
+        if (scheduledSwitch.channelName.trimmed().isEmpty()
+            || !scheduledSwitch.startUtc.isValid()
+            || !scheduledSwitch.endUtc.isValid()
+            || scheduledSwitch.endUtc <= scheduledSwitch.startUtc
+            || scheduledSwitch.endUtc <= nowUtc) {
+            changed = true;
+            continue;
+        }
+
+        bool duplicate = false;
+        for (const TvGuideScheduledSwitch &existing : cleaned) {
+            if (scheduledSwitchesMatch(existing, scheduledSwitch)) {
+                duplicate = true;
+                break;
+            }
+        }
+        if (duplicate) {
+            changed = true;
+            continue;
+        }
+        cleaned.append(scheduledSwitch);
+    }
+
+    if (cleaned.size() != scheduledSwitches_.size()) {
+        changed = true;
+    }
+    scheduledSwitches_ = cleaned;
+    return changed;
+}
+
+void MainWindow::refreshScheduledSwitchTimer()
+{
+    if (scheduledSwitchTimer_ == nullptr) {
+        return;
+    }
+
+    const bool changed = pruneExpiredScheduledSwitches();
+    if (changed) {
+        saveScheduledSwitches();
+        refreshScheduledSwitchList();
+        updateTvGuideDialogFromCurrentCache(false);
+    }
+
+    scheduledSwitchTimer_->stop();
+    if (!obeyScheduledSwitches_ || scheduledSwitches_.isEmpty()) {
+        return;
+    }
+
+    const QDateTime nextStartUtc = scheduledSwitches_.first().startUtc;
+    const qint64 delayMs = std::max<qint64>(0, QDateTime::currentDateTimeUtc().msecsTo(nextStartUtc));
+    scheduledSwitchTimer_->start(static_cast<int>(std::min<qint64>(delayMs, std::numeric_limits<int>::max())));
+}
+
+void MainWindow::processScheduledSwitches()
+{
+    const bool changed = pruneExpiredScheduledSwitches();
+    if (changed) {
+        saveScheduledSwitches();
+        refreshScheduledSwitchList();
+        updateTvGuideDialogFromCurrentCache(false);
+    }
+
+    if (!obeyScheduledSwitches_ || scheduledSwitches_.isEmpty()) {
+        refreshScheduledSwitchTimer();
+        return;
+    }
+
+    const QDateTime nowUtc = QDateTime::currentDateTimeUtc();
+    for (int index = 0; index < scheduledSwitches_.size(); ++index) {
+        const TvGuideScheduledSwitch scheduledSwitch = scheduledSwitches_.at(index);
+        if (scheduledSwitch.startUtc > nowUtc) {
+            break;
+        }
+        if (scheduledSwitch.endUtc <= nowUtc) {
+            continue;
+        }
+
+        if (scanProcess_ != nullptr && scanProcess_->state() != QProcess::NotRunning) {
+            appendLog(QString("schedule: %1 is due, but a scan is still running. Retrying in 30 seconds.")
+                          .arg(scheduledSwitchLabel(scheduledSwitch)));
+            scheduledSwitchTimer_->start(30000);
+            return;
+        }
+
+        if (currentChannelName_ == scheduledSwitch.channelName) {
+            appendLog(QString("schedule: already tuned for %1; removing completed switch.")
+                          .arg(scheduledSwitchLabel(scheduledSwitch)));
+            scheduledSwitches_.removeAt(index);
+            saveScheduledSwitches();
+            refreshScheduledSwitchList();
+            updateTvGuideDialogFromCurrentCache(false);
+            refreshScheduledSwitchTimer();
+            return;
+        }
+
+        appendLog(QString("schedule: obeying %1").arg(scheduledSwitchLabel(scheduledSwitch)));
+        if (tabs_ != nullptr && watchPage_ != nullptr) {
+            tabs_->setCurrentWidget(watchPage_);
+        }
+
+        if (startWatchingChannel(scheduledSwitch.channelName, false)) {
+            scheduledSwitches_.removeAt(index);
+            saveScheduledSwitches();
+            refreshScheduledSwitchList();
+            updateTvGuideDialogFromCurrentCache(false);
+            setStatusBarStateMessage("Applying scheduled switch");
+            refreshScheduledSwitchTimer();
+            return;
+        }
+
+        appendLog(QString("schedule: failed to switch to %1; will retry while the program is still airing.")
+                      .arg(scheduledSwitch.channelName));
+        scheduledSwitchTimer_->start(static_cast<int>(std::min<qint64>(30000,
+                                                                       std::max<qint64>(1000,
+                                                                                        nowUtc.msecsTo(scheduledSwitch.endUtc)))));
+        return;
+    }
+
+    refreshScheduledSwitchTimer();
+}
+
+bool MainWindow::resolveScheduledSwitchChoices(const QList<TvGuideScheduledSwitch> &candidates,
+                                               const QString &sourceDescription,
+                                               bool promptForConflict)
+{
+    QList<TvGuideScheduledSwitch> uniqueCandidates;
+    for (const TvGuideScheduledSwitch &candidate : candidates) {
+        if (candidate.channelName.trimmed().isEmpty()
+            || !candidate.startUtc.isValid()
+            || !candidate.endUtc.isValid()
+            || candidate.endUtc <= candidate.startUtc) {
+            continue;
+        }
+
+        bool duplicateCandidate = false;
+        for (const TvGuideScheduledSwitch &existingCandidate : uniqueCandidates) {
+            if (scheduledSwitchesMatch(existingCandidate, candidate)) {
+                duplicateCandidate = true;
+                break;
+            }
+        }
+        if (!duplicateCandidate) {
+            uniqueCandidates.append(candidate);
+        }
+    }
+
+    if (uniqueCandidates.isEmpty()) {
+        return false;
+    }
+
+    QList<ScheduledSwitchChoiceOption> choices;
+    QSet<int> relevantExistingIndexSet;
+    for (int index = 0; index < scheduledSwitches_.size(); ++index) {
+        const TvGuideScheduledSwitch &existing = scheduledSwitches_.at(index);
+        bool relevant = false;
+        for (const TvGuideScheduledSwitch &candidate : uniqueCandidates) {
+            if (scheduledSwitchesMatch(existing, candidate) || scheduledSwitchesOverlap(existing, candidate)) {
+                relevant = true;
+                break;
+            }
+        }
+        if (!relevant) {
+            continue;
+        }
+
+        relevantExistingIndexSet.insert(index);
+        choices.append(ScheduledSwitchChoiceOption{existing, true, index});
+    }
+
+    for (const TvGuideScheduledSwitch &candidate : uniqueCandidates) {
+        bool represented = false;
+        for (const ScheduledSwitchChoiceOption &choice : choices) {
+            if (scheduledSwitchesMatch(choice.scheduledSwitch, candidate)) {
+                represented = true;
+                break;
+            }
+        }
+        if (!represented) {
+            choices.append(ScheduledSwitchChoiceOption{candidate, false, -1});
+        }
+    }
+
+    if (choices.isEmpty()) {
+        return false;
+    }
+
+    int chosenIndex = -1;
+    if (choices.size() == 1) {
+        chosenIndex = 0;
+    } else if (!promptForConflict) {
+        for (int index = 0; index < choices.size(); ++index) {
+            if (choices.at(index).isExisting) {
+                chosenIndex = index;
+                break;
+            }
+        }
+        if (chosenIndex < 0) {
+            chosenIndex = 0;
+        }
+    } else {
+        QDialog dialog(this);
+        dialog.setWindowTitle("Schedule conflict");
+        dialog.setModal(true);
+
+        auto *layout = new QVBoxLayout(&dialog);
+        auto *titleLabel = new QLabel("Overlapping shows were found. Choose the one to keep scheduled.", &dialog);
+        titleLabel->setWordWrap(true);
+        layout->addWidget(titleLabel);
+
+        auto *detailLabel = new QLabel("Only one scheduled switch can remain for this overlapping time window.",
+                                       &dialog);
+        detailLabel->setWordWrap(true);
+        layout->addWidget(detailLabel);
+
+        auto *choicesList = new QListWidget(&dialog);
+        int defaultRow = -1;
+        for (int index = 0; index < choices.size(); ++index) {
+            const ScheduledSwitchChoiceOption &choice = choices.at(index);
+            QString label = scheduledSwitchListLabel(choice.scheduledSwitch);
+            if (choice.isExisting) {
+                label += " | existing";
+                if (defaultRow < 0) {
+                    defaultRow = index;
+                }
+            }
+            choicesList->addItem(label);
+        }
+        if (defaultRow < 0) {
+            defaultRow = 0;
+        }
+        choicesList->setCurrentRow(defaultRow);
+        choicesList->setSelectionMode(QAbstractItemView::SingleSelection);
+        layout->addWidget(choicesList, 1);
+
+        auto *buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dialog);
+        QPushButton *keepSelectedButton = buttons->button(QDialogButtonBox::Ok);
+        QPushButton *cancelButton = buttons->button(QDialogButtonBox::Cancel);
+        if (keepSelectedButton != nullptr) {
+            keepSelectedButton->setText("Keep Selected");
+        }
+        if (cancelButton != nullptr) {
+            cancelButton->setText(relevantExistingIndexSet.isEmpty() ? "Leave Unchanged" : "Keep Existing");
+        }
+        layout->addWidget(buttons);
+
+        connect(buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
+        connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+        connect(choicesList, &QListWidget::itemDoubleClicked, &dialog, [&dialog](QListWidgetItem *) {
+            dialog.accept();
+        });
+
+        if (dialog.exec() != QDialog::Accepted || choicesList->currentRow() < 0) {
+            appendLog(QString("%1 left overlapping scheduled shows unchanged.").arg(sourceDescription));
+            return false;
+        }
+
+        chosenIndex = choicesList->currentRow();
+    }
+
+    if (chosenIndex < 0 || chosenIndex >= choices.size()) {
+        return false;
+    }
+
+    const ScheduledSwitchChoiceOption chosen = choices.at(chosenIndex);
+    bool changed = false;
+
+    QList<int> relevantExistingIndexes = relevantExistingIndexSet.values();
+    std::sort(relevantExistingIndexes.begin(), relevantExistingIndexes.end(), std::greater<int>());
+    for (const int index : relevantExistingIndexes) {
+        if (chosen.isExisting && index == chosen.existingIndex) {
+            continue;
+        }
+        if (index < 0 || index >= scheduledSwitches_.size()) {
+            continue;
+        }
+        appendLog(QString("%1 removed conflicting switch %2")
+                      .arg(sourceDescription, scheduledSwitchLabel(scheduledSwitches_.at(index))));
+        scheduledSwitches_.removeAt(index);
+        changed = true;
+    }
+
+    if (!chosen.isExisting) {
+        bool alreadyScheduled = false;
+        for (const TvGuideScheduledSwitch &existing : scheduledSwitches_) {
+            if (scheduledSwitchesMatch(existing, chosen.scheduledSwitch)) {
+                alreadyScheduled = true;
+                break;
+            }
+        }
+        if (!alreadyScheduled) {
+            scheduledSwitches_.append(chosen.scheduledSwitch);
+            changed = true;
+        }
+    }
+
+    if (!changed) {
+        return false;
+    }
+
+    std::sort(scheduledSwitches_.begin(), scheduledSwitches_.end(), [](const TvGuideScheduledSwitch &left,
+                                                                       const TvGuideScheduledSwitch &right) {
+        if (left.startUtc == right.startUtc) {
+            return left.channelName < right.channelName;
+        }
+        return left.startUtc < right.startUtc;
+    });
+    saveScheduledSwitches();
+    refreshScheduledSwitchList();
+    updateTvGuideDialogFromCurrentCache(false);
+    refreshScheduledSwitchTimer();
+    appendLog(QString("%1 kept %2").arg(sourceDescription, scheduledSwitchLabel(chosen.scheduledSwitch)));
+    return true;
+}
+
+bool MainWindow::addScheduledSwitchCandidate(const TvGuideScheduledSwitch &candidate,
+                                             const QString &sourceDescription,
+                                             bool promptForConflict)
+{
+    return resolveScheduledSwitchChoices(QList<TvGuideScheduledSwitch>{candidate},
+                                         sourceDescription,
+                                         promptForConflict);
+}
+
+void MainWindow::handleGuideScheduleToggle(const QString &channelName, const TvGuideEntry &entry, bool enabled)
+{
+    const QString trimmedChannelName = channelName.trimmed();
+    if (trimmedChannelName.isEmpty()
+        || !entry.startUtc.isValid()
+        || !entry.endUtc.isValid()
+        || entry.endUtc <= entry.startUtc) {
+        updateTvGuideDialogFromCurrentCache(false);
+        return;
+    }
+
+    TvGuideScheduledSwitch candidate;
+    candidate.channelName = trimmedChannelName;
+    candidate.startUtc = entry.startUtc;
+    candidate.endUtc = entry.endUtc;
+    candidate.title = entry.title.trimmed();
+    candidate.synopsis = entry.synopsis.trimmed();
+
+    if (enabled) {
+        if (candidate.startUtc <= QDateTime::currentDateTimeUtc()) {
+            QMessageBox::information(this, "Only future shows",
+                                     "Only future TV Guide entries can be scheduled for automatic tuning.");
+            updateTvGuideDialogFromCurrentCache(false);
+            return;
+        }
+        addScheduledSwitchCandidate(candidate, "schedule:", true);
+    } else {
+        bool removed = false;
+        for (int index = scheduledSwitches_.size() - 1; index >= 0; --index) {
+            if (!guideEntryMatchesScheduledSwitch(trimmedChannelName, entry, scheduledSwitches_.at(index))) {
+                continue;
+            }
+            scheduledSwitches_.removeAt(index);
+            removed = true;
+        }
+        if (removed) {
+            saveScheduledSwitches();
+            refreshScheduledSwitchList();
+            appendLog(QString("schedule: removed %1").arg(scheduledSwitchLabel(candidate)));
+        }
+    }
+
+    updateTvGuideDialogFromCurrentCache(false);
+    refreshScheduledSwitchTimer();
+}
+
+void MainWindow::handleSearchScheduleRequested(const QString &favoriteShowTitle,
+                                               const QString &channelName,
+                                               const TvGuideEntry &entry)
+{
+    const QString trimmedChannelName = channelName.trimmed();
+    const QString trimmedFavoriteTitle = favoriteShowTitle.simplified();
+    if (trimmedChannelName.isEmpty()
+        || trimmedFavoriteTitle.isEmpty()
+        || !entry.startUtc.isValid()
+        || !entry.endUtc.isValid()
+        || entry.endUtc <= entry.startUtc) {
+        return;
+    }
+
+    const bool addedFavoriteRule = addFavoriteShowRule(trimmedFavoriteTitle);
+    const bool entryIsFuture = entry.startUtc > QDateTime::currentDateTimeUtc();
+    TvGuideScheduledSwitch candidate;
+    candidate.channelName = trimmedChannelName;
+    candidate.startUtc = entry.startUtc;
+    candidate.endUtc = entry.endUtc;
+    candidate.title = entry.title.trimmed();
+    candidate.synopsis = entry.synopsis.trimmed();
+
+    if (entryIsFuture) {
+        addScheduledSwitchCandidate(candidate, "favorite-show:", true);
+    } else {
+        appendLog(QString("favorite-show: saved %1 without scheduling %2 because the selected airing is not in the future.")
+                      .arg(trimmedFavoriteTitle, scheduledSwitchLabel(candidate)));
+    }
+
+    if (autoFavoriteShowSchedulingEnabled_) {
+        autoScheduleFavoriteShowsFromGuideCache(true, true);
+    } else if (addedFavoriteRule && entryIsFuture) {
+        updateTvGuideDialogFromCurrentCache(false);
+    }
+}
+
+void MainWindow::removeSelectedFavoriteShowRule()
+{
+    if (favoriteShowRulesList_ == nullptr) {
+        return;
+    }
+
+    const int row = favoriteShowRulesList_->currentRow();
+    if (row < 0 || row >= favoriteShowRules_.size()) {
+        return;
+    }
+
+    const QString removedRule = favoriteShowRules_.at(row);
+    favoriteShowRules_.removeAt(row);
+    saveFavoriteShowRules();
+    refreshFavoriteShowRuleList();
+    appendLog(QString("favorite-show: removed %1").arg(removedRule));
+}
+
+void MainWindow::removeSelectedScheduledSwitch()
+{
+    if (scheduledSwitchesList_ == nullptr) {
+        return;
+    }
+
+    const int row = scheduledSwitchesList_->currentRow();
+    if (row < 0 || row >= scheduledSwitches_.size()) {
+        return;
+    }
+
+    const TvGuideScheduledSwitch removedSwitch = scheduledSwitches_.at(row);
+    scheduledSwitches_.removeAt(row);
+    saveScheduledSwitches();
+    refreshScheduledSwitchList();
+    updateTvGuideDialogFromCurrentCache(false);
+    refreshScheduledSwitchTimer();
+    appendLog(QString("schedule: removed %1").arg(scheduledSwitchLabel(removedSwitch)));
+}
+
+void MainWindow::autoScheduleFavoriteShowsFromGuideCache(bool promptForConflict, bool forceCurrentCacheSearch)
+{
+    if ((!autoFavoriteShowSchedulingEnabled_ && !forceCurrentCacheSearch)
+        || favoriteShowRules_.isEmpty()
+        || guideEntriesCache_.isEmpty()) {
+        return;
+    }
+
+    QString currentCacheStamp = lastGuideCacheGeneratedUtc_.trimmed();
+    if (currentCacheStamp.isEmpty()) {
+        currentCacheStamp = QString("%1|%2|%3")
+                                .arg(lastGuideWindowStartUtc_.toString(Qt::ISODateWithMs))
+                                .arg(lastGuideSlotMinutes_)
+                                .arg(lastGuideSlotCount_);
+    }
+
+    if (!forceCurrentCacheSearch
+        && !currentCacheStamp.isEmpty()
+        && currentCacheStamp == lastAutoFavoriteScheduleStamp_) {
+        return;
+    }
+
+    const QDateTime nowUtc = QDateTime::currentDateTimeUtc();
+    QStringList orderedChannels = lastGuideChannelOrder_;
+    for (auto it = guideEntriesCache_.cbegin(); it != guideEntriesCache_.cend(); ++it) {
+        if (!orderedChannels.contains(it.key())) {
+            orderedChannels.append(it.key());
+        }
+    }
+
+    QList<TvGuideScheduledSwitch> matchedCandidates;
+    for (const QString &favoriteRule : favoriteShowRules_) {
+        const QString normalizedRule = normalizeFavoriteShowRule(favoriteRule);
+        if (normalizedRule.isEmpty()) {
+            continue;
+        }
+
+        for (const QString &channelName : orderedChannels) {
+            const QList<TvGuideEntry> entries = guideEntriesCache_.value(channelName);
+            for (const TvGuideEntry &entry : entries) {
+                if (!entry.startUtc.isValid()
+                    || !entry.endUtc.isValid()
+                    || entry.endUtc <= entry.startUtc
+                    || entry.startUtc <= nowUtc
+                    || normalizeFavoriteShowRule(entry.title) != normalizedRule) {
+                    continue;
+                }
+
+                TvGuideScheduledSwitch candidate;
+                candidate.channelName = channelName.trimmed();
+                candidate.startUtc = entry.startUtc;
+                candidate.endUtc = entry.endUtc;
+                candidate.title = entry.title.trimmed();
+                candidate.synopsis = entry.synopsis.trimmed();
+
+                bool duplicateCandidate = false;
+                for (const TvGuideScheduledSwitch &existingCandidate : matchedCandidates) {
+                    if (scheduledSwitchesMatch(existingCandidate, candidate)) {
+                        duplicateCandidate = true;
+                        break;
+                    }
+                }
+                if (!duplicateCandidate) {
+                    matchedCandidates.append(candidate);
+                }
+            }
+        }
+    }
+
+    std::sort(matchedCandidates.begin(), matchedCandidates.end(), [](const TvGuideScheduledSwitch &left,
+                                                                     const TvGuideScheduledSwitch &right) {
+        if (left.startUtc == right.startUtc) {
+            if (left.endUtc == right.endUtc) {
+                if (left.channelName == right.channelName) {
+                    return left.title.localeAwareCompare(right.title) < 0;
+                }
+                return left.channelName.localeAwareCompare(right.channelName) < 0;
+            }
+            return left.endUtc < right.endUtc;
+        }
+        return left.startUtc < right.startUtc;
+    });
+
+    for (int index = 0; index < matchedCandidates.size();) {
+        QList<TvGuideScheduledSwitch> overlapGroup;
+        overlapGroup.append(matchedCandidates.at(index));
+        QDateTime overlapEndUtc = matchedCandidates.at(index).endUtc;
+        ++index;
+
+        while (index < matchedCandidates.size() && matchedCandidates.at(index).startUtc < overlapEndUtc) {
+            overlapGroup.append(matchedCandidates.at(index));
+            if (matchedCandidates.at(index).endUtc > overlapEndUtc) {
+                overlapEndUtc = matchedCandidates.at(index).endUtc;
+            }
+            ++index;
+        }
+
+        resolveScheduledSwitchChoices(overlapGroup, "favorite-show auto:", promptForConflict);
+    }
+
+    lastAutoFavoriteScheduleStamp_ = currentCacheStamp;
+}
+
+void MainWindow::showStartupSwitchSummary()
+{
+    if (startupSwitchSummaryShown_ || !obeyScheduledSwitches_) {
+        return;
+    }
+    startupSwitchSummaryShown_ = true;
+
+    QString message;
+    if (scheduledSwitches_.isEmpty()) {
+        message = "No scheduled switches are currently saved.";
+    } else {
+        QStringList lines;
+        for (const TvGuideScheduledSwitch &scheduledSwitch : scheduledSwitches_) {
+            lines.append(scheduledSwitchListLabel(scheduledSwitch));
+        }
+        message = lines.join('\n');
+    }
+
+    QMessageBox::information(this, "Scheduled switches at startup", message);
 }
 
 QStringList MainWindow::makeArguments() const
@@ -2815,21 +4366,7 @@ void MainWindow::openMediaFile()
 
     appendLog("player: Opened local media file: " + filePath);
     playbackStatusLabel_->setText(playbackStatusText());
-    setStatusBarStateMessage("Opening local file...");
-}
-
-void MainWindow::openTvGuide()
-{
-    if (tvGuideDialog_ == nullptr) {
-        tvGuideDialog_ = new TvGuideDialog(this);
-        connect(tvGuideDialog_, &TvGuideDialog::refreshRequested, this, &MainWindow::refreshTvGuide);
-    }
-
-    loadGuideCacheFile();
-    updateTvGuideDialogFromCurrentCache(false);
-    tvGuideDialog_->show();
-    tvGuideDialog_->raise();
-    tvGuideDialog_->activateWindow();
+    setStatusBarStateMessage("Opening media file");
 }
 
 bool MainWindow::refreshGuideData(bool interactive, bool updateDialog)
@@ -2841,11 +4378,6 @@ bool MainWindow::refreshGuideData(bool interactive, bool updateDialog)
             appendLog("guide-bg: skipped guide refresh while a scan is in progress.");
         }
         return false;
-    }
-
-    if (updateDialog && tvGuideDialog_ == nullptr) {
-        tvGuideDialog_ = new TvGuideDialog(this);
-        connect(tvGuideDialog_, &TvGuideDialog::refreshRequested, this, &MainWindow::refreshTvGuide);
     }
 
     if (channelLines_.isEmpty()) {
@@ -3286,6 +4818,7 @@ bool MainWindow::refreshGuideData(bool interactive, bool updateDialog)
                                      lastGuideWindowStartUtc_,
                                      lastGuideSlotMinutes_,
                                      lastGuideSlotCount_,
+                                     scheduledSwitches_,
                                      lastGuideStatusText_);
     }
     setStatusBarStateMessage(statusText.section('\n', 0, 0));
@@ -3404,6 +4937,10 @@ bool writeGuideCacheBetaFile(const QStringList &channelOrder,
 
 bool MainWindow::loadGuideCacheFile()
 {
+    if (purgeExpiredGuideCacheFiles(true)) {
+        return false;
+    }
+
     const QString cachePath = resolveGuideCachePath();
     if (cachePath.isEmpty()) {
         return false;
@@ -3445,6 +4982,7 @@ bool MainWindow::loadGuideCacheFile()
 
     guideEntriesCache_ = loadedEntries;
     lastGuideChannelOrder_ = storedChannelOrder;
+    lastGuideCacheGeneratedUtc_ = root.value("generatedUtc").toString().trimmed();
     lastGuideWindowStartUtc_ = QDateTime::fromString(root.value("windowStartUtc").toString(), Qt::ISODateWithMs);
     lastGuideSlotMinutes_ = root.value("slotMinutes").toInt(30);
     lastGuideSlotCount_ = root.value("slotCount").toInt(12);
@@ -3457,6 +4995,7 @@ bool MainWindow::loadGuideCacheFile()
             noAutoCurrentShowLookupChannels_.remove(channelName);
         }
     }
+    autoScheduleFavoriteShowsFromGuideCache(true, false);
     return true;
 }
 
@@ -3474,9 +5013,11 @@ void MainWindow::setCurrentShowStatus(const QString &text,
     currentShowLabel_->setToolTip(QString());
     if (currentShowSynopsisLabel_ != nullptr) {
         const QString trimmedSynopsis = synopsisText.trimmed();
-        currentShowSynopsisLabel_->setText(trimmedSynopsis);
+        currentShowSynopsisLabel_->setText(trimmedSynopsis.isEmpty()
+                                               ? QString()
+                                               : QString("Synopsis: %1").arg(trimmedSynopsis));
         currentShowSynopsisLabel_->setToolTip(QString());
-        currentShowSynopsisLabel_->setVisible(!trimmedSynopsis.isEmpty());
+        currentShowSynopsisLabel_->setVisible(!fullscreenActive_ && !trimmedSynopsis.isEmpty());
         currentShowSynopsisLabel_->updateGeometry();
     }
 }
@@ -3543,14 +5084,14 @@ bool MainWindow::applyCurrentShowStatusFromGuideCache()
 
     QStringList lines;
     QStringList toolTips;
-    QStringList synopsisBlocks;
+    QString synopsisText;
     QDateTime refreshUtc;
 
     if (foundCurrent) {
         lines << QString("Current: %1").arg(currentEntry.title);
         toolTips << guideEntryToolTipText(currentEntry);
-        if (!currentEntry.synopsis.trimmed().isEmpty()) {
-            synopsisBlocks << QString("Current: %1").arg(currentEntry.synopsis.trimmed());
+        if (synopsisText.isEmpty() && !currentEntry.synopsis.trimmed().isEmpty()) {
+            synopsisText = currentEntry.synopsis.trimmed();
         }
         refreshUtc = currentEntry.endUtc.addSecs(1);
     } else {
@@ -3562,8 +5103,8 @@ bool MainWindow::applyCurrentShowStatusFromGuideCache()
                      .arg(nextEntry.startUtc.toLocalTime().toString("h:mm AP"),
                           nextEntry.title);
         toolTips << guideEntryToolTipText(nextEntry);
-        if (!nextEntry.synopsis.trimmed().isEmpty()) {
-            synopsisBlocks << QString("Next: %1").arg(nextEntry.synopsis.trimmed());
+        if (synopsisText.isEmpty() && !nextEntry.synopsis.trimmed().isEmpty()) {
+            synopsisText = nextEntry.synopsis.trimmed();
         }
         if (!refreshUtc.isValid()) {
             refreshUtc = nextEntry.startUtc.addSecs(1);
@@ -3572,7 +5113,7 @@ bool MainWindow::applyCurrentShowStatusFromGuideCache()
 
     setCurrentShowStatus(lines.join('\n'),
                          toolTips.join("\n\n"),
-                         synopsisBlocks.join("\n\n"));
+                         synopsisText);
     scheduleCurrentShowRefresh(refreshUtc);
     return true;
 }
@@ -3738,13 +5279,17 @@ bool MainWindow::startWatchingChannel(const QString &channelName, bool reconnect
 
     stopWatchButton_->setEnabled(true);
     playbackStatusLabel_->setText(playbackStatusText());
-    setStatusBarStateMessage("Starting live playback...");
+    setStatusBarStateMessage("Buffering channel");
     return true;
 }
 
 void MainWindow::stopWatching()
 {
     exitFullscreen();
+    attachVideoFromPip();
+    if (pipWindow_ != nullptr) {
+        pipWindow_->hide();
+    }
     userStoppedWatching_ = true;
     reconnectTimer_->stop();
     currentShowTimer_->stop();
@@ -3784,7 +5329,7 @@ void MainWindow::stopWatching()
     playbackStatusLabel_->setText(playbackStatusText());
     setCurrentShowStatus("NO EIT DATA");
     if (scanProcess_->state() == QProcess::NotRunning) {
-        setStatusBarStateMessage("Ready");
+        setStatusBarStateMessage(QString());
     }
 }
 
@@ -4017,7 +5562,16 @@ void MainWindow::addSelectedFavorite()
     favorites_.append(channelName);
     saveFavorites();
     refreshQuickButtons();
-    statusBar()->showMessage(QString("Added %1 to favorites.").arg(channelName), 3000);
+    const QString previousStatusMessage = lastStatusBarMessage_;
+    if (statusBar() != nullptr) {
+        statusBar()->showMessage(QString("Added %1 to favorites.").arg(channelName), 3000);
+    }
+    QTimer::singleShot(3100, this, [this, previousStatusMessage]() {
+        if (statusBar() == nullptr || !statusBar()->currentMessage().trimmed().isEmpty()) {
+            return;
+        }
+        setStatusBarStateMessage(previousStatusMessage);
+    });
 }
 
 void MainWindow::removeSelectedFavorite()
@@ -4081,6 +5635,18 @@ void MainWindow::setStatusBarStateMessage(const QString &text)
         message += "Getting latest EIT data...";
     }
 
+    if (guideRefreshTimer_ != nullptr && guideRefreshTimer_->isActive()) {
+        const int remainingMs = guideRefreshTimer_->remainingTime();
+        if (remainingMs >= 0) {
+            const QDateTime nextRefreshUtc = QDateTime::currentDateTimeUtc().addMSecs(remainingMs);
+            if (!message.isEmpty()) {
+                message += " | ";
+            }
+            message += QString("Next JSON update %1")
+                           .arg(nextRefreshUtc.toLocalTime().toString("h:mm AP"));
+        }
+    }
+
     if (statusBar() != nullptr) {
         statusBar()->showMessage(message);
     }
@@ -4104,11 +5670,12 @@ void MainWindow::updateTvGuideDialogFromCurrentCache(bool showStatusMessage)
                                  lastGuideWindowStartUtc_,
                                  lastGuideSlotMinutes_,
                                  lastGuideSlotCount_,
+                                 scheduledSwitches_,
                                  statusText);
 
     if (showStatusMessage) {
-        setStatusBarStateMessage(hasGuideCache ? "TV guide reloaded from cache."
-                                               : "No cached TV guide data is available yet.");
+        setStatusBarStateMessage(hasGuideCache ? "Guide cache reloaded"
+                                               : "No cached guide data");
     }
 }
 
@@ -4121,9 +5688,9 @@ void MainWindow::handleMediaStatusChanged(QMediaPlayer::MediaStatus status)
         if (status == QMediaPlayer::InvalidMedia) {
             setStatusBarStateMessage(isLocalFile ? "Local file error" : "Playback error");
         } else if (mediaPlayer_->playbackState() == QMediaPlayer::PlayingState) {
-            setStatusBarStateMessage(isLocalFile ? "Playing local file" : "Watching");
+            setStatusBarStateMessage(QString());
         } else {
-            setStatusBarStateMessage(isLocalFile ? "Opening local file..." : "Starting live playback...");
+            setStatusBarStateMessage(isLocalFile ? "Opening media file" : "Buffering channel");
         }
     }
     if (!currentChannelName_.isEmpty() && status == QMediaPlayer::InvalidMedia && !userStoppedWatching_) {
@@ -4315,6 +5882,8 @@ void MainWindow::enterFullscreen()
         return;
     }
 
+    attachVideoFromPip();
+
     QScreen *targetScreen = screenForWidget(this);
     if (targetScreen == nullptr) {
         targetScreen = QGuiApplication::screenAt(QCursor::pos());
@@ -4340,6 +5909,9 @@ void MainWindow::enterFullscreen()
     favoritesContainer_->hide();
     if (statusContainer_ != nullptr) {
         statusContainer_->hide();
+    }
+    if (currentShowSynopsisLabel_ != nullptr) {
+        currentShowSynopsisLabel_->hide();
     }
     channelsTable_->hide();
     tabs_->tabBar()->hide();
@@ -4384,6 +5956,9 @@ void MainWindow::exitFullscreen()
     }
     if (statusContainer_ != nullptr) {
         statusContainer_->show();
+    }
+    if (currentShowSynopsisLabel_ != nullptr) {
+        currentShowSynopsisLabel_->setVisible(!currentShowSynopsisLabel_->text().trimmed().isEmpty());
     }
     if (channelsTable_ != nullptr) {
         channelsTable_->show();
