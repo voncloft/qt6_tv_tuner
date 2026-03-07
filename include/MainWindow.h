@@ -144,12 +144,20 @@ private:
     void saveTestingBugItems() const;
     bool addTestingBugItemEntry(const QString &text, bool checked);
     bool addFavoriteShowRule(const QString &title);
+    bool isScheduledSwitchLockedIn(const TvGuideScheduledSwitch &scheduledSwitch) const;
+    void setScheduledSwitchLockedIn(const TvGuideScheduledSwitch &scheduledSwitch, bool lockedIn);
+    void pruneLockedScheduledSwitches();
+    void saveLockedScheduledSwitches() const;
     bool resolveScheduledSwitchChoices(const QList<TvGuideScheduledSwitch> &candidates,
                                        const QString &sourceDescription,
                                        bool promptForConflict);
     bool addScheduledSwitchCandidate(const TvGuideScheduledSwitch &candidate,
                                      const QString &sourceDescription,
                                      bool promptForConflict);
+    void scheduleMatchingGuideEntriesForTitle(const QString &favoriteShowTitle,
+                                              const TvGuideScheduledSwitch &seedCandidate,
+                                              const QString &sourceDescription,
+                                              bool promptForConflict);
     void autoScheduleFavoriteShowsFromGuideCache(bool promptForConflict, bool forceCurrentCacheSearch);
     void showStartupSwitchSummary();
     bool shouldDetachVideoForCurrentTab(int index) const;
@@ -277,5 +285,6 @@ private:
     bool deferStartupAutoFavoriteScheduling_{true};
     QStringList dismissedAutoFavoriteCandidates_;
     QStringList lockedAutoFavoriteSelections_;
+    QStringList lockedScheduledSwitches_;
     bool startupSwitchSummaryShown_{false};
 };

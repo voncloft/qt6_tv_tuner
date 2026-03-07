@@ -19,6 +19,7 @@
 #include <QFile>
 #include <QFileDialog>
 #include <QFileInfo>
+#include <QFontMetrics>
 #include <QFormLayout>
 #include <QGridLayout>
 #include <QGuiApplication>
@@ -97,6 +98,7 @@ constexpr auto kTestingBugItemsSetting = "testing/bugItems";
 constexpr auto kAutoPictureInPictureSetting = "video/autoPictureInPicture";
 constexpr auto kGuideRefreshIntervalMinutesSetting = "tvGuide/refreshIntervalMinutes";
 constexpr auto kGuideCacheRetentionHoursSetting = "tvGuide/cacheRetentionHours";
+constexpr auto kLockedScheduledSwitchesSetting = "tvGuide/lockedScheduledSwitches";
 constexpr int kDefaultGuideRefreshIntervalMinutes = 60;
 constexpr int kDefaultGuideCacheRetentionHours = 24;
 
@@ -429,6 +431,15 @@ QString summarizeScheduledSwitchesDebug(const QList<TvGuideScheduledSwitch> &swi
         parts.append(QString("... +%1 more").arg(switches.size() - limit));
     }
     return parts.join(" || ");
+}
+
+QString lockedScheduledSwitchKey(const TvGuideScheduledSwitch &scheduledSwitch)
+{
+    return QString("%1||%2||%3||%4")
+        .arg(scheduledSwitch.channelName.trimmed(),
+             QString::number(scheduledSwitch.startUtc.toMSecsSinceEpoch()),
+             QString::number(scheduledSwitch.endUtc.toMSecsSinceEpoch()),
+             normalizeFavoriteShowRule(scheduledSwitch.title));
 }
 
 struct ScheduledSwitchChoiceOption {
@@ -2456,6 +2467,7 @@ MainWindow::MainWindow(QWidget *parent)
         settings.value(kDismissedAutoFavoriteCandidatesStampSetting).toString().trimmed();
     dismissedAutoFavoriteCandidates_ = settings.value(kDismissedAutoFavoriteCandidatesSetting).toStringList();
     lockedAutoFavoriteSelections_ = settings.value(kLockedAutoFavoriteSelectionsSetting).toStringList();
+    lockedScheduledSwitches_ = settings.value(kLockedScheduledSwitchesSetting).toStringList();
     audioOutput_->setVolume(static_cast<float>(savedVolume) / 100.0f);
     volumeSlider_->setValue(savedVolume);
     if (hideNoEitChannelsCheckBox_ != nullptr) {
@@ -3373,17 +3385,10 @@ void MainWindow::refreshScheduledSwitchList()
         return;
     }
 
-    const QString cacheStamp = currentGuideCacheStamp(lastGuideCacheGeneratedUtc_,
-                                                      lastGuideWindowStartUtc_,
-                                                      lastGuideSlotMinutes_,
-                                                      lastGuideSlotCount_);
     scheduledSwitchesList_->clear();
     for (const TvGuideScheduledSwitch &scheduledSwitch : scheduledSwitches_) {
-        scheduledSwitchesList_->addItem(
-            scheduledSwitchManagementLabel(scheduledSwitch,
-                                           isAutoFavoriteLockedIn(lockedAutoFavoriteSelections_,
-                                                                  cacheStamp,
-                                                                  scheduledSwitch)));
+        scheduledSwitchesList_->addItem(scheduledSwitchManagementLabel(scheduledSwitch,
+                                                                       isScheduledSwitchLockedIn(scheduledSwitch)));
     }
     if (removeScheduledSwitchButton_ != nullptr) {
         removeScheduledSwitchButton_->setEnabled(false);
@@ -3541,6 +3546,68 @@ bool MainWindow::addFavoriteShowRule(const QString &title)
     refreshFavoriteShowRuleList();
     appendLog(QString("favorite-show: added %1").arg(trimmedTitle));
     return true;
+}
+
+bool MainWindow::isScheduledSwitchLockedIn(const TvGuideScheduledSwitch &scheduledSwitch) const
+{
+    if (lockedScheduledSwitches_.contains(lockedScheduledSwitchKey(scheduledSwitch))) {
+        return true;
+    }
+
+    const QString cacheStamp = currentGuideCacheStamp(lastGuideCacheGeneratedUtc_,
+                                                      lastGuideWindowStartUtc_,
+                                                      lastGuideSlotMinutes_,
+                                                      lastGuideSlotCount_);
+    return isAutoFavoriteLockedIn(lockedAutoFavoriteSelections_, cacheStamp, scheduledSwitch);
+}
+
+void MainWindow::saveLockedScheduledSwitches() const
+{
+    QSettings settings("tv_tuner_gui", "watcher");
+    settings.setValue(kLockedScheduledSwitchesSetting, lockedScheduledSwitches_);
+}
+
+void MainWindow::setScheduledSwitchLockedIn(const TvGuideScheduledSwitch &scheduledSwitch, bool lockedIn)
+{
+    const QString key = lockedScheduledSwitchKey(scheduledSwitch);
+    if (key.isEmpty()) {
+        return;
+    }
+
+    const bool alreadyLocked = lockedScheduledSwitches_.contains(key);
+    if (alreadyLocked == lockedIn) {
+        return;
+    }
+
+    lockedScheduledSwitches_.removeAll(key);
+    if (lockedIn) {
+        lockedScheduledSwitches_.append(key);
+    }
+    saveLockedScheduledSwitches();
+}
+
+void MainWindow::pruneLockedScheduledSwitches()
+{
+    QStringList activeKeys;
+    activeKeys.reserve(scheduledSwitches_.size());
+    for (const TvGuideScheduledSwitch &scheduledSwitch : scheduledSwitches_) {
+        activeKeys.append(lockedScheduledSwitchKey(scheduledSwitch));
+    }
+
+    QStringList prunedLocks;
+    prunedLocks.reserve(lockedScheduledSwitches_.size());
+    for (const QString &lockedKey : lockedScheduledSwitches_) {
+        if (activeKeys.contains(lockedKey) && !prunedLocks.contains(lockedKey)) {
+            prunedLocks.append(lockedKey);
+        }
+    }
+
+    if (prunedLocks == lockedScheduledSwitches_) {
+        return;
+    }
+
+    lockedScheduledSwitches_ = prunedLocks;
+    saveLockedScheduledSwitches();
 }
 
 void MainWindow::handleCurrentTabChanged(int index)
@@ -3774,6 +3841,7 @@ bool MainWindow::pruneExpiredScheduledSwitches()
         changed = true;
     }
     scheduledSwitches_ = cleaned;
+    pruneLockedScheduledSwitches();
     return changed;
 }
 
@@ -3956,6 +4024,24 @@ bool MainWindow::resolveScheduledSwitchChoices(const QList<TvGuideScheduledSwitc
         return false;
     }
 
+    int lockedChoiceIndex = -1;
+    for (int index = 0; index < choices.size(); ++index) {
+        const ScheduledSwitchChoiceOption &choice = choices.at(index);
+        if (!choice.isExisting || !isScheduledSwitchLockedIn(choice.scheduledSwitch)) {
+            continue;
+        }
+        lockedChoiceIndex = index;
+        break;
+    }
+    if (lockedChoiceIndex < 0) {
+        for (int index = 0; index < choices.size(); ++index) {
+            if (isScheduledSwitchLockedIn(choices.at(index).scheduledSwitch)) {
+                lockedChoiceIndex = index;
+                break;
+            }
+        }
+    }
+
     QStringList choiceLabels;
     for (const ScheduledSwitchChoiceOption &choice : choices) {
         choiceLabels.append(scheduledSwitchChoiceDebugLabel(choice));
@@ -3973,10 +4059,13 @@ bool MainWindow::resolveScheduledSwitchChoices(const QList<TvGuideScheduledSwitc
     if (choices.size() == 1) {
         chosenIndex = 0;
     } else if (!promptForConflict) {
-        for (int index = 0; index < choices.size(); ++index) {
-            if (choices.at(index).isExisting) {
-                chosenIndex = index;
-                break;
+        chosenIndex = lockedChoiceIndex;
+        if (chosenIndex < 0) {
+            for (int index = 0; index < choices.size(); ++index) {
+                if (choices.at(index).isExisting) {
+                    chosenIndex = index;
+                    break;
+                }
             }
         }
         if (chosenIndex < 0) {
@@ -3999,22 +4088,36 @@ bool MainWindow::resolveScheduledSwitchChoices(const QList<TvGuideScheduledSwitc
 
         auto *choicesList = new QListWidget(&dialog);
         int defaultRow = -1;
+        int widestChoiceText = 0;
+        const QFontMetrics choiceMetrics(choicesList->font());
         for (int index = 0; index < choices.size(); ++index) {
             const ScheduledSwitchChoiceOption &choice = choices.at(index);
             QString label = scheduledSwitchListLabel(choice.scheduledSwitch);
             if (choice.isExisting) {
                 label += " | existing";
-                if (defaultRow < 0) {
+            }
+            if (isScheduledSwitchLockedIn(choice.scheduledSwitch)) {
+                label += " | locked in";
+            }
+            widestChoiceText = std::max(widestChoiceText, choiceMetrics.horizontalAdvance(label));
+            choicesList->addItem(label);
+        }
+
+        defaultRow = lockedChoiceIndex;
+        if (defaultRow < 0) {
+            for (int index = 0; index < choices.size(); ++index) {
+                if (choices.at(index).isExisting) {
                     defaultRow = index;
+                    break;
                 }
             }
-            choicesList->addItem(label);
         }
         if (defaultRow < 0) {
             defaultRow = 0;
         }
         choicesList->setCurrentRow(defaultRow);
         choicesList->setSelectionMode(QAbstractItemView::SingleSelection);
+        choicesList->setHorizontalScrollBarPolicy(Qt::ScrollBarAsNeeded);
         layout->addWidget(choicesList, 1);
 
         auto *buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dialog);
@@ -4033,6 +4136,17 @@ bool MainWindow::resolveScheduledSwitchChoices(const QList<TvGuideScheduledSwitc
         connect(choicesList, &QListWidget::itemDoubleClicked, &dialog, [&dialog](QListWidgetItem *) {
             dialog.accept();
         });
+
+        const QScreen *screen = dialog.screen() != nullptr ? dialog.screen() : QGuiApplication::primaryScreen();
+        const int availableWidth = screen != nullptr ? screen->availableGeometry().width() : 1280;
+        const int availableHeight = screen != nullptr ? screen->availableGeometry().height() : 800;
+        const int targetWidth = std::clamp(widestChoiceText + 140, 620, std::max(620, availableWidth - 120));
+        const int visibleRows = std::clamp(static_cast<int>(choices.size()), 3, 8);
+        const int targetHeight = std::clamp((visibleRows * choicesList->sizeHintForRow(0)) + 180,
+                                            260,
+                                            std::max(260, availableHeight - 120));
+        choicesList->setMinimumWidth(targetWidth - 80);
+        dialog.resize(targetWidth, targetHeight);
 
         if (dialog.exec() != QDialog::Accepted || choicesList->currentRow() < 0) {
             appendLog(QString("%1 left overlapping scheduled shows unchanged.").arg(sourceDescription));
@@ -4057,6 +4171,32 @@ bool MainWindow::resolveScheduledSwitchChoices(const QList<TvGuideScheduledSwitc
                                                       lastGuideSlotCount_);
     const bool persistConflictChoice = promptForConflict && choices.size() > 1 && !cacheStamp.isEmpty();
     bool conflictDecisionStateChanged = false;
+    bool scheduledLockStateChanged = false;
+    if (promptForConflict && choices.size() > 1) {
+        const bool chosenWasLockedIn = isScheduledSwitchLockedIn(chosen.scheduledSwitch);
+        setScheduledSwitchLockedIn(chosen.scheduledSwitch, true);
+        if (!chosenWasLockedIn) {
+            scheduledLockStateChanged = true;
+        }
+
+        for (int index = 0; index < choices.size(); ++index) {
+            if (index == chosenIndex) {
+                continue;
+            }
+
+            const TvGuideScheduledSwitch &other = choices.at(index).scheduledSwitch;
+            if (!scheduledSwitchesMatch(other, chosen.scheduledSwitch)
+                && !scheduledSwitchesOverlap(other, chosen.scheduledSwitch)) {
+                continue;
+            }
+
+            const bool otherWasLockedIn = isScheduledSwitchLockedIn(other);
+            setScheduledSwitchLockedIn(other, false);
+            if (otherWasLockedIn) {
+                scheduledLockStateChanged = true;
+            }
+        }
+    }
     if (persistConflictChoice) {
         const bool chosenWasLocked = isAutoFavoriteLockedIn(lockedAutoFavoriteSelections_,
                                                             cacheStamp,
@@ -4139,10 +4279,14 @@ bool MainWindow::resolveScheduledSwitchChoices(const QList<TvGuideScheduledSwitc
             savePersistedAutoFavoriteConflictState(cacheStamp,
                                                    dismissedAutoFavoriteCandidates_,
                                                    lockedAutoFavoriteSelections_);
-            if (conflictDecisionStateChanged) {
+            if (conflictDecisionStateChanged || scheduledLockStateChanged) {
                 refreshScheduledSwitchList();
                 updateTvGuideDialogFromCurrentCache(false);
             }
+        }
+        if (!persistConflictChoice && scheduledLockStateChanged) {
+            refreshScheduledSwitchList();
+            updateTvGuideDialogFromCurrentCache(false);
         }
         appendLog(QString("%1 kept %2").arg(sourceDescription, scheduledSwitchLabel(chosen.scheduledSwitch)));
         appendLog(QString("%1 resolve queue unchanged -> %2")
@@ -4157,6 +4301,7 @@ bool MainWindow::resolveScheduledSwitchChoices(const QList<TvGuideScheduledSwitc
         }
         return left.startUtc < right.startUtc;
     });
+    pruneLockedScheduledSwitches();
     if (persistConflictChoice) {
         savePersistedAutoFavoriteConflictState(cacheStamp,
                                                dismissedAutoFavoriteCandidates_,
@@ -4179,6 +4324,102 @@ bool MainWindow::addScheduledSwitchCandidate(const TvGuideScheduledSwitch &candi
     return resolveScheduledSwitchChoices(QList<TvGuideScheduledSwitch>{candidate},
                                          sourceDescription,
                                          promptForConflict);
+}
+
+void MainWindow::scheduleMatchingGuideEntriesForTitle(const QString &favoriteShowTitle,
+                                                      const TvGuideScheduledSwitch &seedCandidate,
+                                                      const QString &sourceDescription,
+                                                      bool promptForConflict)
+{
+    const QString normalizedTitle = normalizeFavoriteShowRule(favoriteShowTitle);
+    const QDateTime nowUtc = QDateTime::currentDateTimeUtc();
+    QList<TvGuideScheduledSwitch> matchingCandidates;
+    const auto appendCandidate = [&matchingCandidates](const TvGuideScheduledSwitch &candidate) {
+        if (candidate.channelName.trimmed().isEmpty()
+            || !candidate.startUtc.isValid()
+            || !candidate.endUtc.isValid()
+            || candidate.endUtc <= candidate.startUtc) {
+            return;
+        }
+
+        for (const TvGuideScheduledSwitch &existingCandidate : matchingCandidates) {
+            if (scheduledSwitchesMatch(existingCandidate, candidate)) {
+                return;
+            }
+        }
+
+        matchingCandidates.append(candidate);
+    };
+
+    if (seedCandidate.startUtc > nowUtc
+        && normalizeFavoriteShowRule(seedCandidate.title) == normalizedTitle) {
+        appendCandidate(seedCandidate);
+    }
+
+    if (!normalizedTitle.isEmpty()) {
+        QStringList orderedChannels = lastGuideChannelOrder_;
+        for (auto it = guideEntriesCache_.cbegin(); it != guideEntriesCache_.cend(); ++it) {
+            if (!orderedChannels.contains(it.key())) {
+                orderedChannels.append(it.key());
+            }
+        }
+
+        for (const QString &channelName : orderedChannels) {
+            const QList<TvGuideEntry> entries = guideEntriesCache_.value(channelName);
+            for (const TvGuideEntry &entry : entries) {
+                if (!entry.startUtc.isValid()
+                    || !entry.endUtc.isValid()
+                    || entry.endUtc <= entry.startUtc
+                    || entry.startUtc <= nowUtc
+                    || normalizeFavoriteShowRule(entry.title) != normalizedTitle) {
+                    continue;
+                }
+
+                TvGuideScheduledSwitch candidate;
+                candidate.channelName = channelName.trimmed();
+                candidate.startUtc = entry.startUtc;
+                candidate.endUtc = entry.endUtc;
+                candidate.title = entry.title.trimmed();
+                candidate.synopsis = entry.synopsis.trimmed();
+                appendCandidate(candidate);
+            }
+        }
+    }
+
+    std::sort(matchingCandidates.begin(), matchingCandidates.end(), [](const TvGuideScheduledSwitch &left,
+                                                                       const TvGuideScheduledSwitch &right) {
+        if (left.startUtc == right.startUtc) {
+            if (left.endUtc == right.endUtc) {
+                return left.channelName.localeAwareCompare(right.channelName) < 0;
+            }
+            return left.endUtc < right.endUtc;
+        }
+        return left.startUtc < right.startUtc;
+    });
+
+    const QString showTitle = !favoriteShowTitle.simplified().isEmpty()
+                                  ? favoriteShowTitle.simplified()
+                                  : (seedCandidate.title.trimmed().isEmpty() ? "<untitled>" : seedCandidate.title.trimmed());
+    appendLog(QString("%1 matched %2 guide entr%3 for %4")
+                  .arg(sourceDescription)
+                  .arg(matchingCandidates.size())
+                  .arg(matchingCandidates.size() == 1 ? "y" : "ies")
+                  .arg(showTitle));
+
+    const QString cacheStamp = currentGuideCacheStamp(lastGuideCacheGeneratedUtc_,
+                                                      lastGuideWindowStartUtc_,
+                                                      lastGuideSlotMinutes_,
+                                                      lastGuideSlotCount_);
+    for (const TvGuideScheduledSwitch &candidate : matchingCandidates) {
+        addScheduledSwitchCandidate(candidate, sourceDescription, promptForConflict);
+        if (scheduledSwitchListContains(scheduledSwitches_, candidate)) {
+            setAutoFavoriteDismissed(dismissedAutoFavoriteCandidates_, cacheStamp, candidate, false);
+        }
+    }
+
+    savePersistedAutoFavoriteConflictState(cacheStamp,
+                                           dismissedAutoFavoriteCandidates_,
+                                           lockedAutoFavoriteSelections_);
 }
 
 void MainWindow::handleGuideScheduleToggle(const QString &channelName, const TvGuideEntry &entry, bool enabled)
@@ -4212,21 +4453,8 @@ void MainWindow::handleGuideScheduleToggle(const QString &channelName, const TvG
             updateTvGuideDialogFromCurrentCache(false);
             return;
         }
-        const bool addedFavoriteRule = addFavoriteShowRule(candidate.title);
-        addScheduledSwitchCandidate(candidate, "schedule:", true);
-
-        const QString cacheStamp = currentGuideCacheStamp(lastGuideCacheGeneratedUtc_,
-                                                          lastGuideWindowStartUtc_,
-                                                          lastGuideSlotMinutes_,
-                                                          lastGuideSlotCount_);
-        if (scheduledSwitchListContains(scheduledSwitches_, candidate)) {
-            setAutoFavoriteDismissed(dismissedAutoFavoriteCandidates_, cacheStamp, candidate, false);
-            savePersistedAutoFavoriteConflictState(cacheStamp,
-                                                   dismissedAutoFavoriteCandidates_,
-                                                   lockedAutoFavoriteSelections_);
-        }
-
-        Q_UNUSED(addedFavoriteRule);
+        addFavoriteShowRule(candidate.title);
+        scheduleMatchingGuideEntriesForTitle(candidate.title, candidate, "schedule:", true);
     } else {
         const QString cacheStamp = currentGuideCacheStamp(lastGuideCacheGeneratedUtc_,
                                                           lastGuideWindowStartUtc_,
@@ -4520,7 +4748,8 @@ void MainWindow::showStartupSwitchSummary()
     } else {
         QStringList lines;
         for (const TvGuideScheduledSwitch &scheduledSwitch : scheduledSwitches_) {
-            lines.append(scheduledSwitchListLabel(scheduledSwitch));
+            lines.append(scheduledSwitchManagementLabel(scheduledSwitch,
+                                                       isScheduledSwitchLockedIn(scheduledSwitch)));
         }
         message = lines.join('\n');
     }
