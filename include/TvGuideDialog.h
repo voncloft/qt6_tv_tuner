@@ -10,7 +10,9 @@
 class QCheckBox;
 class QPlainTextEdit;
 class QPushButton;
+class QResizeEvent;
 class QScrollArea;
+class QShowEvent;
 class QTabWidget;
 class QWidget;
 
@@ -18,6 +20,7 @@ struct TvGuideEntry {
     QDateTime startUtc;
     QDateTime endUtc;
     QString title;
+    QString synopsis;
 };
 
 class TvGuideDialog : public QDialog
@@ -36,6 +39,10 @@ public:
                       int slotCount,
                       const QString &statusText);
 
+protected:
+    void resizeEvent(QResizeEvent *event) override;
+    void showEvent(QShowEvent *event) override;
+
 signals:
     void refreshRequested();
 
@@ -43,6 +50,8 @@ private:
     QString entryLabel(const TvGuideEntry &entry) const;
     QString entryToolTip(const TvGuideEntry &entry) const;
     bool channelHasVisibleData(const QString &channel) const;
+    int guideSlotPixelWidth() const;
+    void applyGuideHorizontalScroll(int value);
     void renderGuideTable();
 
     QCheckBox *hideNoEitCheckBox_{};
@@ -62,4 +71,7 @@ private:
     QDateTime windowStartUtc_;
     int slotMinutes_{30};
     int slotCount_{0};
+    int currentGuideSlotPixelWidth_{150};
+    bool applyingGuideHorizontalScroll_{false};
+    bool pendingGuideRender_{false};
 };

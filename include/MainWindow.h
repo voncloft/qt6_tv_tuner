@@ -80,16 +80,28 @@ private:
     void loadXspfChannelHints();
     void loadChannelsFileIfPresent();
     void startPlaybackFromDvr(const QString &dvrPath);
+    bool refreshGuideData(bool interactive, bool updateDialog);
+    bool writeGuideCacheFile(const QStringList &channelOrder,
+                             const QHash<QString, QList<TvGuideEntry>> &entriesByChannel,
+                             const QDateTime &windowStartUtc,
+                             int slotMinutes,
+                             int slotCount,
+                             const QString &statusText);
+    bool loadGuideCacheFile();
     void scheduleReconnect(const QString &reason);
     bool tryDynamicBridgeFallback(const QString &reason);
     QString playbackStatusText() const;
+    void setStatusBarStateMessage(const QString &text);
+    void updateTvGuideDialogFromCurrentCache(bool showStatusMessage = false);
     QStringList makeArguments() const;
     QString selectedChannelNameFromTable() const;
     QString programIdForChannel(const QString &channelName) const;
-    void probeCurrentShowBeforePlayback(const QString &channelName, int programId, bool reconnectAttempt, int lookupSerial);
+    void probeCurrentShowAfterTune(const QString &channelName, int lookupSerial);
     void refreshCurrentShowStatus();
     void scheduleCurrentShowRefresh(const QDateTime &refreshUtc);
-    void setCurrentShowStatus(const QString &text, const QString &toolTip = QString());
+    void setCurrentShowStatus(const QString &text,
+                              const QString &toolTip = QString(),
+                              const QString &synopsisText = QString());
     bool applyCurrentShowStatusFromGuideCache();
     void stopProcess(QProcess *process, int timeoutMs);
     void enterFullscreen();
@@ -119,6 +131,7 @@ private:
     QVideoWidget *videoWidget_{};
     QLabel *playbackStatusLabel_{};
     QLabel *currentShowLabel_{};
+    QLabel *currentShowSynopsisLabel_{};
     QSlider *volumeSlider_{};
     QTabWidget *tabs_{};
     QWidget *watchPage_{};
@@ -144,6 +157,11 @@ private:
     QString currentProgramId_;
     QString pendingDvrPath_;
     QHash<QString, QList<TvGuideEntry>> guideEntriesCache_;
+    QStringList lastGuideChannelOrder_;
+    QDateTime lastGuideWindowStartUtc_;
+    int lastGuideSlotMinutes_{30};
+    int lastGuideSlotCount_{12};
+    QString lastGuideStatusText_;
     QSet<QString> noAutoCurrentShowLookupChannels_;
     int reconnectAttemptCount_{0};
     const int maxReconnectAttempts_{6};
@@ -156,6 +174,8 @@ private:
     bool videoOnlyBridgeTried_{false};
     bool bridgeSawCodecParameterFailure_{false};
     bool waitingForDvrReady_{false};
+    bool guideRefreshInProgress_{false};
+    QString lastStatusBarMessage_{"Ready"};
     bool fullscreenActive_{false};
     bool wasMaximizedBeforeFullscreen_{false};
     bool menuBarWasVisibleBeforeFullscreen_{true};
@@ -168,6 +188,8 @@ private:
     QTimer *reconnectTimer_{};
     QTimer *currentShowTimer_{};
     QTimer *playbackAttachTimer_{};
+    QTimer *guideRefreshTimer_{};
+    QTimer *guideCachePollTimer_{};
     TvGuideDialog *tvGuideDialog_{};
     int currentShowLookupSerial_{0};
     int playbackStartSerial_{0};
