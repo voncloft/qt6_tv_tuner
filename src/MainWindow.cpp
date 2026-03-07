@@ -4083,7 +4083,7 @@ void MainWindow::startScan()
     const QString program = "w_scan2";
     const QStringList args = makeArguments();
 
-    appendLog("[" + QDateTime::currentDateTime().toString(Qt::ISODate) + "] Starting: " + program + " " + args.join(' '));
+    appendLog("Starting: " + program + " " + args.join(' '));
     scanProcess_->start(program, args);
 
     if (!scanProcess_->waitForStarted(2000)) {
@@ -4177,7 +4177,10 @@ void MainWindow::setScanningState(bool running)
 
 void MainWindow::appendLog(const QString &line)
 {
-    logOutput_->appendPlainText(line);
+    const QString entry = QString("[%1] %2")
+                              .arg(QDateTime::currentDateTime().toString("MM/dd/yyyy HH:mm:ss"), line);
+
+    logOutput_->appendPlainText(entry);
     QTextCursor cursor = logOutput_->textCursor();
     cursor.movePosition(QTextCursor::End);
     logOutput_->setTextCursor(cursor);
@@ -4185,9 +4188,7 @@ void MainWindow::appendLog(const QString &line)
     if (!logFilePath_.isEmpty()) {
         QFile logFile(logFilePath_);
         if (logFile.open(QIODevice::WriteOnly | QIODevice::Text | QIODevice::Append)) {
-            const QString entry = QString("[%1] %2\n")
-                                      .arg(QDateTime::currentDateTime().toString(Qt::ISODate), line);
-            logFile.write(entry.toUtf8());
+            logFile.write((entry + '\n').toUtf8());
         }
     }
 }
@@ -4280,6 +4281,27 @@ QString MainWindow::selectedChannelNameFromTable() const
         return {};
     }
     return item->text().trimmed();
+}
+
+bool MainWindow::highlightChannelInTable(const QString &channelName)
+{
+    if (channelsTable_ == nullptr || channelName.trimmed().isEmpty()) {
+        return false;
+    }
+
+    for (int row = 0; row < channelsTable_->rowCount(); ++row) {
+        QTableWidgetItem *channelItem = channelsTable_->item(row, 1);
+        if (channelItem == nullptr || channelItem->text().trimmed() != channelName.trimmed()) {
+            continue;
+        }
+
+        channelsTable_->selectRow(row);
+        channelsTable_->setCurrentCell(row, 1);
+        channelsTable_->scrollToItem(channelItem, QAbstractItemView::PositionAtCenter);
+        return true;
+    }
+
+    return false;
 }
 
 QString MainWindow::programIdForChannel(const QString &channelName) const
@@ -5274,6 +5296,8 @@ bool MainWindow::startWatchingChannel(const QString &channelName, bool reconnect
         playbackAttachTimer_->start(3500);
     }
 
+    highlightChannelInTable(channelName);
+
     QSettings settings("tv_tuner_gui", "watcher");
     settings.setValue(kLastPlayedChannelSetting, channelName);
 
@@ -5847,19 +5871,14 @@ void MainWindow::restoreLastPlayedChannel()
         return;
     }
 
-    for (int row = 0; row < channelsTable_->rowCount(); ++row) {
-        QTableWidgetItem *channelItem = channelsTable_->item(row, 1);
-        if (channelItem == nullptr || channelItem->text().trimmed() != lastChannelName) {
-            continue;
-        }
-
-        channelsTable_->setCurrentCell(row, 1);
-        channelsTable_->scrollToItem(channelItem, QAbstractItemView::PositionAtCenter);
-        startWatchingChannel(lastChannelName, false);
+    if (!highlightChannelInTable(lastChannelName)) {
+        appendLog("Saved last channel was not found in the current channel list: " + lastChannelName);
         return;
     }
 
-    appendLog("Saved last channel was not found in the current channel list: " + lastChannelName);
+    if (startWatchingChannel(lastChannelName, false)) {
+        return;
+    }
 }
 
 void MainWindow::toggleFullscreen()

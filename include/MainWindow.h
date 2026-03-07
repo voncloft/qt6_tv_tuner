@@ -113,6 +113,7 @@ private:
     QStringList makeArguments() const;
     QString selectedChannelNameFromTable() const;
     QString programIdForChannel(const QString &channelName) const;
+    bool highlightChannelInTable(const QString &channelName);
     void probeCurrentShowAfterTune(const QString &channelName, int lookupSerial);
     void refreshCurrentShowStatus();
     void scheduleCurrentShowRefresh(const QDateTime &refreshUtc);
