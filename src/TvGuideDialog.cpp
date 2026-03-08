@@ -36,6 +36,8 @@ constexpr int kGuideRowHeight = 132;
 constexpr int kGuideGridLineWidth = 2;
 constexpr int kGuideBoxBorderWidth = 2;
 constexpr int kGuideScheduleCheckboxSize = 16;
+constexpr int kGuideWatchNowButtonWidth = 118;
+constexpr int kGuideWatchNowButtonHeight = 24;
 constexpr int kDefaultFavoriteShowRating = 1;
 
 bool guideEntriesMatch(const TvGuideEntry &left, const TvGuideEntry &right)
@@ -172,6 +174,18 @@ QString formatEntryToolTip(const TvGuideEntry &entry, const QHash<QString, int> 
         text += "\n\nSynopsis: " + parts.synopsisBody;
     }
     return text;
+}
+
+QString watchActionLabelForWidth(const QFontMetrics &metrics, int width)
+{
+    const int availableTextWidth = std::max(0, width - 12);
+    if (availableTextWidth >= metrics.horizontalAdvance("Watch Now")) {
+        return "Watch Now";
+    }
+    if (availableTextWidth >= metrics.horizontalAdvance("Watch")) {
+        return "Watch";
+    }
+    return {};
 }
 
 int measureEntryTextHeight(const QFont &font,
@@ -317,6 +331,7 @@ public:
                            int timelineWidth,
                            std::function<bool(const TvGuideEntry &)> isEntryScheduled,
                            std::function<void(const TvGuideEntry &, bool)> toggleSchedule,
+                           std::function<void(const TvGuideEntry &)> watchNow,
                            QWidget *parent = nullptr)
         : QWidget(parent)
         , entries_(entries)
@@ -327,6 +342,7 @@ public:
         , timelineWidth_(timelineWidth)
         , isEntryScheduled_(std::move(isEntryScheduled))
         , toggleSchedule_(std::move(toggleSchedule))
+        , watchNow_(std::move(watchNow))
     {
         setMouseTracking(true);
         setMinimumWidth(std::max(timelineWidth_, 1));
@@ -368,7 +384,7 @@ protected:
         std::sort(entries.begin(), entries.end(), [](const TvGuideEntry &a, const TvGuideEntry &b) {
             return a.startUtc < b.startUtc;
         });
-        scheduleToggleTargets_.clear();
+        entryActionTargets_.clear();
 
         for (const TvGuideEntry &entry : entries) {
             if (!entry.startUtc.isValid() || !entry.endUtc.isValid() || entry.endUtc <= entry.startUtc) {
@@ -394,14 +410,28 @@ protected:
 
             const bool airingNow = entry.startUtc <= nowUtc && entry.endUtc > nowUtc;
             const bool canSchedule = entry.startUtc > nowUtc;
+            const bool canWatchNow = airingNow && static_cast<bool>(watchNow_);
             const bool scheduled = canSchedule && isEntryScheduled_ && isEntryScheduled_(entry);
-            const int checkboxInset = canSchedule ? (kGuideScheduleCheckboxSize + 16) : 10;
             QRect checkboxRect;
+            QRect watchRect;
+            int actionInset = canSchedule ? (kGuideScheduleCheckboxSize + 16) : 10;
             if (canSchedule) {
                 checkboxRect = QRect(box.right() - kGuideScheduleCheckboxSize - 8,
                                      box.top() + 8,
                                      kGuideScheduleCheckboxSize,
                                      kGuideScheduleCheckboxSize);
+            } else if (canWatchNow) {
+                const int maxWatchButtonWidth = std::max(0, box.width() - 18);
+                const int watchButtonWidth = std::min(kGuideWatchNowButtonWidth, maxWatchButtonWidth);
+                if (watchButtonWidth >= 44) {
+                    watchRect = QRect(box.right() - watchButtonWidth - 8,
+                                      box.top() + 6,
+                                      watchButtonWidth,
+                                      kGuideWatchNowButtonHeight);
+                    actionInset = watchButtonWidth + 16;
+                } else {
+                    watchRect = box.adjusted(6, 6, -6, -6);
+                }
             }
             painter.setPen(QPen(QColor(120, 120, 120), kGuideBoxBorderWidth));
             painter.setBrush(airingNow ? QColor(28, 28, 28) : QColor(16, 16, 16));
@@ -424,11 +454,24 @@ protected:
                                      checkboxRect.top() + 3);
                     painter.setRenderHint(QPainter::Antialiasing, false);
                 }
-                scheduleToggleTargets_.append({checkboxRect, box, entry, scheduled});
+            } else if (canWatchNow) {
+                if (watchRect.width() >= 44) {
+                    const QString watchLabel = watchActionLabelForWidth(painter.fontMetrics(), watchRect.width());
+                    painter.setPen(QPen(QColor(255, 96, 96), 1));
+                    painter.setBrush(QColor(58, 12, 12));
+                    painter.drawRoundedRect(watchRect, 4, 4);
+                    if (!watchLabel.isEmpty()) {
+                        painter.setPen(QColor(255, 255, 255));
+                        painter.drawText(watchRect.adjusted(6, 0, -6, 0),
+                                         Qt::AlignCenter,
+                                         watchLabel);
+                    }
+                }
             }
+            entryActionTargets_.append({checkboxRect, watchRect, box, entry, scheduled});
 
             painter.setPen(QColor(255, 255, 255));
-            drawEntryText(painter, box.adjusted(10, 8, -checkboxInset, -8), entry, favoriteShowRatings_);
+            drawEntryText(painter, box.adjusted(10, 8, -actionInset, -8), entry, favoriteShowRatings_);
             renderedAny = true;
         }
 
@@ -453,9 +496,10 @@ protected:
             return;
         }
 
-        const ScheduleToggleTarget *target = targetAt(event->position().toPoint());
+        const EntryActionTarget *target = targetAt(event->position().toPoint());
         if (target != nullptr) {
-            setCursor(target->checkboxRect.contains(event->position().toPoint())
+            const QPoint point = event->position().toPoint();
+            setCursor((target->checkboxRect.contains(point) || target->watchRect.contains(point))
                           ? Qt::PointingHandCursor
                           : Qt::ArrowCursor);
             return;
@@ -477,28 +521,42 @@ protected:
             return;
         }
 
-        const ScheduleToggleTarget *target = targetAt(event->position().toPoint());
-        if (target == nullptr || !target->checkboxRect.contains(event->position().toPoint()) || !toggleSchedule_) {
+        const EntryActionTarget *target = targetAt(event->position().toPoint());
+        if (target == nullptr) {
             QWidget::mousePressEvent(event);
             return;
         }
 
-        toggleSchedule_(target->entry, !target->scheduled);
-        event->accept();
+        const QPoint point = event->position().toPoint();
+        if (target->checkboxRect.contains(point) && toggleSchedule_) {
+            toggleSchedule_(target->entry, !target->scheduled);
+            event->accept();
+            return;
+        }
+        if (target->watchRect.contains(point) && watchNow_) {
+            watchNow_(target->entry);
+            event->accept();
+            return;
+        }
+
+        QWidget::mousePressEvent(event);
     }
 
 private:
-    struct ScheduleToggleTarget {
+    struct EntryActionTarget {
         QRect checkboxRect;
+        QRect watchRect;
         QRect boxRect;
         TvGuideEntry entry;
         bool scheduled{false};
     };
 
-    const ScheduleToggleTarget *targetAt(const QPoint &point) const
+    const EntryActionTarget *targetAt(const QPoint &point) const
     {
-        for (const ScheduleToggleTarget &target : scheduleToggleTargets_) {
-            if (target.checkboxRect.contains(point) || target.boxRect.contains(point)) {
+        for (const EntryActionTarget &target : entryActionTargets_) {
+            if (target.checkboxRect.contains(point)
+                || target.watchRect.contains(point)
+                || target.boxRect.contains(point)) {
                 return &target;
             }
         }
@@ -537,10 +595,15 @@ private:
                                          left + 1,
                                          totalWidth);
             const int boxWidth = std::max(28, right - left - 4);
+            const bool airingNow = entry.startUtc <= QDateTime::currentDateTimeUtc()
+                                   && entry.endUtc > QDateTime::currentDateTimeUtc();
             const int textWidth = std::max(8,
-                                           boxWidth - 20 - (entry.startUtc > QDateTime::currentDateTimeUtc()
-                                                                ? (kGuideScheduleCheckboxSize + 16)
-                                                                : 0));
+                                           boxWidth - 20
+                                               - (entry.startUtc > QDateTime::currentDateTimeUtc()
+                                                      ? (kGuideScheduleCheckboxSize + 16)
+                                                      : (airingNow && static_cast<bool>(watchNow_) && boxWidth >= 62
+                                                             ? (kGuideWatchNowButtonWidth + 16)
+                                                             : 0)));
             const int textHeight = measureEntryTextHeight(font(), textWidth, entry, favoriteShowRatings_);
             preferred = std::max(preferred, textHeight + 26);
         }
@@ -557,7 +620,8 @@ private:
     int rowHeight_{kGuideRowHeight};
     std::function<bool(const TvGuideEntry &)> isEntryScheduled_;
     std::function<void(const TvGuideEntry &, bool)> toggleSchedule_;
-    QList<ScheduleToggleTarget> scheduleToggleTargets_;
+    std::function<void(const TvGuideEntry &)> watchNow_;
+    QList<EntryActionTarget> entryActionTargets_;
 };
 
 }
@@ -1055,6 +1119,9 @@ void TvGuideDialog::renderGuideTable()
                                                       },
                                                       [this, channel](const TvGuideEntry &entry, bool enabled) {
                                                           emit scheduleSwitchRequested(channel, entry, enabled);
+                                                      },
+                                                      [this, channel](const TvGuideEntry &entry) {
+                                                          emit watchRequested(channel, entry);
                                                       },
                                                       guideContent_);
         const int rowHeight = bandWidget->sizeHint().height();

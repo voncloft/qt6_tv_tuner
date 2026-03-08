@@ -78,6 +78,7 @@ private slots:
     void handleGuideRefreshIntervalChanged(int minutes);
     void handleGuideCacheRetentionChanged(int hours);
     void exportSchedulesDirectJson();
+    void handleGuideWatchRequested(const QString &channelName, const TvGuideEntry &entry);
     void handleSearchScheduleRequested(const QString &favoriteShowTitle,
                                        const QString &channelName,
                                        const TvGuideEntry &entry);
@@ -166,7 +167,7 @@ private:
     void handleObeyScheduledSwitchesChanged(bool obey);
     bool saveScheduledSwitches() const;
     bool loadScheduledSwitches();
-    bool pruneExpiredScheduledSwitches();
+    bool pruneExpiredScheduledSwitches(bool includeStartedSwitches = false);
     void refreshScheduledSwitchTimer();
     void processScheduledSwitches();
     void loadFavoriteShowRules();
@@ -187,13 +188,10 @@ private:
     void saveTestingBugItems() const;
     bool addTestingBugItemEntry(const QString &text, bool checked);
     bool addFavoriteShowRule(const QString &title);
-    bool isScheduledSwitchLockedIn(const TvGuideScheduledSwitch &scheduledSwitch) const;
-    void setScheduledSwitchLockedIn(const TvGuideScheduledSwitch &scheduledSwitch, bool lockedIn);
-    void pruneLockedScheduledSwitches();
-    void saveLockedScheduledSwitches() const;
     bool resolveScheduledSwitchChoices(const QList<TvGuideScheduledSwitch> &candidates,
                                        const QString &sourceDescription,
-                                       bool promptForConflict);
+                                       bool promptForConflict,
+                                       bool forceRatingChoice = false);
     bool addScheduledSwitchCandidate(const TvGuideScheduledSwitch &candidate,
                                      const QString &sourceDescription,
                                      bool promptForConflict);
@@ -216,7 +214,7 @@ private:
                                            int *importedEntryCount);
     void applyGuideFilterSettings();
     void applyGuideRefreshIntervalSetting();
-    bool purgeExpiredGuideCacheFiles(bool clearLoadedState);
+    bool purgeExpiredGuideCacheFiles(bool clearLoadedState, bool includeSchedulesDirect = false);
     void clearLoadedGuideCache();
 
     QComboBox *frontendTypeCombo_{};
@@ -359,7 +357,5 @@ private:
     QString currentShowOverlayToolTip_;
     QString signalMonitorOverlayToolTip_;
     QStringList dismissedAutoFavoriteCandidates_;
-    QStringList lockedAutoFavoriteSelections_;
-    QStringList lockedScheduledSwitches_;
     bool startupSwitchSummaryShown_{false};
 };

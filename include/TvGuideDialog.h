@@ -62,6 +62,7 @@ protected:
 
 signals:
     void refreshRequested();
+    void watchRequested(const QString &channelName, const TvGuideEntry &entry);
     void scheduleSwitchRequested(const QString &channelName, const TvGuideEntry &entry, bool enabled);
     void searchScheduleRequested(const QString &favoriteShowTitle,
                                  const QString &channelName,
