@@ -91,6 +91,7 @@
 namespace {
 constexpr auto kChannelSidebarSplitterStateSetting = "watch/channel_sidebar_splitter_state";
 constexpr auto kLastPlayedChannelSetting = "watch/last_played_channel";
+constexpr auto kLastPlayedChannelLineSetting = "watch/last_played_channel_line";
 constexpr auto kObeyScheduledSwitchesSetting = "tvGuide/obeyScheduledSwitches";
 constexpr auto kHideNoEitChannelsSetting = "tvGuide/hideChannelsWithoutEit";
 constexpr auto kShowFavoritesOnlySetting = "tvGuide/showOnlyFavorites";
@@ -181,6 +182,125 @@ QString normalizeZapLine(const QString &line)
     return normalizedParts.join(':');
 }
 
+QString normalizeChannelNumberHint(const QString &channelNumber)
+{
+    QString normalized = channelNumber.trimmed();
+    if (normalized.isEmpty()) {
+        return {};
+    }
+    normalized.replace('-', ':');
+    normalized.replace('.', ':');
+    return normalized;
+}
+
+QString displayChannelNumber(const QString &channelNumber)
+{
+    QString display = normalizeChannelNumberHint(channelNumber);
+    if (display.isEmpty()) {
+        return {};
+    }
+    display.replace(':', '-');
+    return display;
+}
+
+QString channelNameFromZapLine(const QString &line)
+{
+    const QString normalizedLine = normalizeZapLine(line).trimmed();
+    if (normalizedLine.isEmpty()) {
+        return {};
+    }
+
+    const QStringList parts = normalizedLine.split(':');
+    if (parts.size() < 6) {
+        return {};
+    }
+
+    return parts.at(0).trimmed();
+}
+
+QString programIdFromZapLine(const QString &line)
+{
+    const QString normalizedLine = normalizeZapLine(line).trimmed();
+    if (normalizedLine.isEmpty()) {
+        return {};
+    }
+
+    const QStringList parts = normalizedLine.split(':');
+    if (parts.size() < 6) {
+        return {};
+    }
+
+    return parts.at(5).trimmed();
+}
+
+QString channelNumberHintForParts(const QStringList &parts,
+                                  const QHash<QString, QString> *numberByTuneKey = nullptr)
+{
+    if (parts.size() < 6) {
+        return {};
+    }
+
+    const QString storedHint =
+        numberByTuneKey != nullptr
+            ? normalizeChannelNumberHint(numberByTuneKey->value(parts.at(1).trimmed() + "|" + parts.at(5).trimmed()))
+            : QString();
+    if (!storedHint.isEmpty()) {
+        return storedHint;
+    }
+
+    bool frequencyOk = false;
+    bool serviceOk = false;
+    const qint64 frequencyHz = parts.at(1).trimmed().toLongLong(&frequencyOk);
+    const int serviceId = parts.at(5).trimmed().toInt(&serviceOk, 0);
+    if (!frequencyOk || !serviceOk || frequencyHz <= 0 || serviceId < 1001 || serviceId >= 2000) {
+        return {};
+    }
+
+    const int mhz = static_cast<int>(std::llround(static_cast<double>(frequencyHz) / 1000000.0));
+    int rfChannel = -1;
+    if (mhz >= 57 && mhz <= 81 && ((mhz - 57) % 6) == 0) {
+        rfChannel = 2 + ((mhz - 57) / 6);
+    } else if (mhz >= 177 && mhz <= 213 && ((mhz - 177) % 6) == 0) {
+        rfChannel = 7 + ((mhz - 177) / 6);
+    } else if (mhz >= 473 && mhz <= 695 && ((mhz - 473) % 6) == 0) {
+        rfChannel = 14 + ((mhz - 473) / 6);
+    }
+    if (rfChannel <= 0) {
+        return {};
+    }
+
+    return QString("%1:%2").arg(rfChannel).arg(serviceId - 1000);
+}
+
+QString channelDisplayLabel(const QString &baseName, const QString &channelNumberHint)
+{
+    const QString trimmedBaseName = baseName.trimmed();
+    const QString displayNumber = displayChannelNumber(channelNumberHint);
+    if (trimmedBaseName.isEmpty() || displayNumber.isEmpty()) {
+        return trimmedBaseName;
+    }
+    return QString("%1 %2").arg(displayNumber, trimmedBaseName);
+}
+
+QString channelDisplayLabelForParts(const QStringList &parts,
+                                    const QHash<QString, QString> *numberByTuneKey = nullptr)
+{
+    if (parts.size() < 6) {
+        return {};
+    }
+    return channelDisplayLabel(parts.at(0).trimmed(), channelNumberHintForParts(parts, numberByTuneKey));
+}
+
+QString channelDisplayLabelForLine(const QString &line,
+                                   const QHash<QString, QString> *numberByTuneKey = nullptr)
+{
+    const QString normalizedLine = normalizeZapLine(line).trimmed();
+    if (normalizedLine.isEmpty()) {
+        return {};
+    }
+    return channelDisplayLabelForParts(normalizedLine.split(':'), numberByTuneKey);
+}
+
 QString resolveProjectLogPath()
 {
     const QString envPath = qEnvironmentVariable("TV_TUNER_GUI_LOG_PATH");
@@ -252,6 +372,15 @@ QString resolveChannelHintsJsonPath()
         return {};
     }
     return QDir(appDataPath).filePath("channel_hints.json");
+}
+
+QString resolveActiveTuneChannelPath()
+{
+    const QString appDataPath = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
+    if (appDataPath.isEmpty()) {
+        return {};
+    }
+    return QDir(appDataPath).filePath("active_tune_channel.conf");
 }
 
 QString normalizeFavoriteShowRule(const QString &title)
@@ -1232,6 +1361,8 @@ QString summarizeGuideEntries(const QList<TvGuideEntry> &entries, int maxItems =
 
 struct GuideChannelInfo {
     QString name;
+    QString baseName;
+    QString channelNumber;
     qint64 frequencyHz{0};
     int serviceId{-1};
 };
@@ -1315,7 +1446,7 @@ bool parseLocalVirtualChannelHint(const QString &channelNumberHint,
 
     const QString trimmedHint = channelNumberHint.trimmed();
     if (!trimmedHint.isEmpty()) {
-        const QStringList parts = trimmedHint.split(':');
+        const QStringList parts = normalizeChannelNumberHint(trimmedHint).split(':');
         if (parts.size() >= 2) {
             bool majorOk = false;
             bool minorOk = false;
@@ -2847,7 +2978,8 @@ QSet<int> mappedProgramIdsFromParsedGuideData(const ParsedGuideData &parsed)
     return mappedPrograms;
 }
 
-QVector<GuideChannelInfo> parseGuideChannels(const QStringList &channelLines)
+QVector<GuideChannelInfo> parseGuideChannels(const QStringList &channelLines,
+                                            const QHash<QString, QString> *numberByTuneKey = nullptr)
 {
     QVector<GuideChannelInfo> channels;
     QSet<QString> dedupe;
@@ -2858,23 +2990,28 @@ QVector<GuideChannelInfo> parseGuideChannels(const QStringList &channelLines)
             continue;
         }
 
-        const QString name = parts[0].trimmed();
+        const QString baseName = parts[0].trimmed();
         bool freqOk = false;
         bool serviceOk = false;
         const qint64 frequencyHz = parts[1].trimmed().toLongLong(&freqOk);
         const int serviceId = parts[5].trimmed().toInt(&serviceOk, 0);
-        if (name.isEmpty() || !freqOk || frequencyHz <= 0 || !serviceOk || serviceId <= 0) {
+        if (baseName.isEmpty() || !freqOk || frequencyHz <= 0 || !serviceOk || serviceId <= 0) {
             continue;
         }
 
-        const QString key = QString("%1|%2|%3").arg(name).arg(frequencyHz).arg(serviceId);
+        const QString channelNumber = channelNumberHintForParts(parts, numberByTuneKey);
+        const QString displayName = channelDisplayLabel(baseName, channelNumber);
+
+        const QString key = QString("%1|%2|%3").arg(baseName).arg(frequencyHz).arg(serviceId);
         if (dedupe.contains(key)) {
             continue;
         }
         dedupe.insert(key);
 
         GuideChannelInfo info;
-        info.name = name;
+        info.name = displayName.isEmpty() ? baseName : displayName;
+        info.baseName = baseName;
+        info.channelNumber = channelNumber;
         info.frequencyHz = frequencyHz;
         info.serviceId = serviceId;
         channels.append(info);
@@ -3550,6 +3687,124 @@ void MainWindow::stopProcess(QProcess *process, int timeoutMs)
     process->close();
 }
 
+QWidget *MainWindow::modalDialogParent() const
+{
+    if (fullscreenActive_ && fullscreenWindow_ != nullptr) {
+        return fullscreenWindow_;
+    }
+    return const_cast<MainWindow *>(this);
+}
+
+void MainWindow::prepareModalWindow(QWidget *window, const QString &reason)
+{
+    if (window == nullptr || !fullscreenActive_ || fullscreenWindow_ == nullptr) {
+        return;
+    }
+
+    if (!reason.trimmed().isEmpty()) {
+        appendLog(QString("fullscreen: presenting modal UI: %1").arg(reason));
+    }
+
+    showFullscreenCursor();
+    if (fullscreenCursorHideTimer_ != nullptr) {
+        fullscreenCursorHideTimer_->stop();
+    }
+    syncFullscreenOverlayState();
+    positionFullscreenOverlay();
+    if (fullscreenOverlayContainer_ != nullptr) {
+        fullscreenOverlayContainer_->show();
+        fullscreenOverlayContainer_->raise();
+    }
+
+    fullscreenWindow_->raise();
+    fullscreenWindow_->activateWindow();
+    window->setWindowFlag(Qt::WindowStaysOnTopHint, true);
+    window->winId();
+    if (window->windowHandle() != nullptr && fullscreenWindow_->windowHandle() != nullptr) {
+        window->windowHandle()->setTransientParent(fullscreenWindow_->windowHandle());
+        if (QScreen *screen = fullscreenWindow_->windowHandle()->screen()) {
+            window->windowHandle()->setScreen(screen);
+        }
+    }
+}
+
+void MainWindow::restoreAfterModalWindow()
+{
+    if (!fullscreenActive_) {
+        return;
+    }
+
+    showFullscreenCursor();
+    restartFullscreenCursorHideTimer();
+    if (fullscreenWindow_ != nullptr) {
+        fullscreenWindow_->raise();
+        fullscreenWindow_->activateWindow();
+    }
+    if (fullscreenVideoWidget_ != nullptr) {
+        fullscreenVideoWidget_->setFocus(Qt::ActiveWindowFocusReason);
+    }
+}
+
+int MainWindow::execModalDialog(QDialog *dialog, const QString &reason)
+{
+    if (dialog == nullptr) {
+        return QDialog::Rejected;
+    }
+
+    prepareModalWindow(dialog, reason);
+    const int result = dialog->exec();
+    restoreAfterModalWindow();
+    return result;
+}
+
+void MainWindow::showAboutDialog(const QString &title, const QString &text)
+{
+    QMessageBox dialog(QMessageBox::Information, title, text, QMessageBox::Ok, modalDialogParent());
+    dialog.setTextFormat(Qt::PlainText);
+    execModalDialog(&dialog, title);
+}
+
+void MainWindow::showInformationDialog(const QString &title, const QString &text)
+{
+    QMessageBox dialog(QMessageBox::Information, title, text, QMessageBox::Ok, modalDialogParent());
+    dialog.setTextFormat(Qt::PlainText);
+    execModalDialog(&dialog, title);
+}
+
+void MainWindow::showWarningDialog(const QString &title, const QString &text)
+{
+    QMessageBox dialog(QMessageBox::Warning, title, text, QMessageBox::Ok, modalDialogParent());
+    dialog.setTextFormat(Qt::PlainText);
+    execModalDialog(&dialog, title);
+}
+
+void MainWindow::showCriticalDialog(const QString &title, const QString &text)
+{
+    QMessageBox dialog(QMessageBox::Critical, title, text, QMessageBox::Ok, modalDialogParent());
+    dialog.setTextFormat(Qt::PlainText);
+    execModalDialog(&dialog, title);
+}
+
+QString MainWindow::promptItemSelection(const QString &title,
+                                        const QString &label,
+                                        const QStringList &items,
+                                        int current,
+                                        bool editable)
+{
+    QInputDialog dialog(modalDialogParent());
+    dialog.setWindowTitle(title);
+    dialog.setLabelText(label);
+    dialog.setComboBoxItems(items);
+    dialog.setComboBoxEditable(editable);
+    if (current >= 0 && current < items.size()) {
+        dialog.setTextValue(items.at(current));
+    }
+    if (execModalDialog(&dialog, title) != QDialog::Accepted) {
+        return {};
+    }
+    return dialog.textValue().trimmed();
+}
+
 void MainWindow::buildUi()
 {
     setWindowTitle("Voncloft TV Tuner");
@@ -3560,10 +3815,9 @@ void MainWindow::buildUi()
     aboutAction->setShortcut(QKeySequence(Qt::Key_F1));
     aboutAction->setShortcutContext(Qt::ApplicationShortcut);
     connect(aboutAction, &QAction::triggered, this, [this]() {
-        QMessageBox::about(
-            this,
-            "About",
-            QString("Created by Voncloft\nVersion %1").arg(QStringLiteral(TV_TUNER_GUI_VERSION)));
+        showAboutDialog("About",
+                        QString("Created by Voncloft\nVersion %1")
+                            .arg(QStringLiteral(TV_TUNER_GUI_VERSION)));
     });
 
     auto *root = new QWidget(this);
@@ -4210,9 +4464,8 @@ void MainWindow::buildUi()
         }
 
         if (!addFavoriteShowRule(showName)) {
-            QMessageBox::information(this,
-                                     "Favorite show already saved",
-                                     QString("%1 is already in your favorite show list.").arg(showName));
+            showInformationDialog("Favorite show already saved",
+                                  QString("%1 is already in your favorite show list.").arg(showName));
             return;
         }
 
@@ -4928,7 +5181,7 @@ bool MainWindow::ensureSchedulesDirectJson(bool allowCachedExport,
 
     QStringList channelOrder;
     QSet<QString> seenChannelNames;
-    const QVector<GuideChannelInfo> localChannels = parseGuideChannels(channelLines_);
+    const QVector<GuideChannelInfo> localChannels = parseGuideChannels(channelLines_, &xspfNumberByTuneKey_);
     for (const GuideChannelInfo &channel : localChannels) {
         if (!channel.name.trimmed().isEmpty() && !seenChannelNames.contains(channel.name)) {
             seenChannelNames.insert(channel.name);
@@ -5172,7 +5425,7 @@ bool MainWindow::applySchedulesDirectGuideFallback(QHash<QString, QList<TvGuideE
         return false;
     }
 
-    const QVector<GuideChannelInfo> localChannels = parseGuideChannels(channelLines_);
+    const QVector<GuideChannelInfo> localChannels = parseGuideChannels(channelLines_, &xspfNumberByTuneKey_);
     if (localChannels.isEmpty()) {
         return false;
     }
@@ -5186,7 +5439,8 @@ bool MainWindow::applySchedulesDirectGuideFallback(QHash<QString, QList<TvGuideE
     int matchedChannels = 0;
     for (const GuideChannelInfo &channel : localChannels) {
         const QString localName = channel.name.trimmed();
-        if (localName.isEmpty()) {
+        const QString localMatchName = channel.baseName.trimmed().isEmpty() ? localName : channel.baseName.trimmed();
+        if (localName.isEmpty() || localMatchName.isEmpty()) {
             continue;
         }
 
@@ -5241,7 +5495,7 @@ bool MainWindow::applySchedulesDirectGuideFallback(QHash<QString, QList<TvGuideE
             const SchedulesDirectChannelPayload *uniqueRfNameMatch = nullptr;
             for (const SchedulesDirectChannelPayload &candidate : sdChannels) {
                 if (candidate.rfChannel != hint.rfChannel
-                    || !schedulesDirectLocalNameMatches(localName, candidate)) {
+                    || !schedulesDirectLocalNameMatches(localMatchName, candidate)) {
                     continue;
                 }
                 if (uniqueRfNameMatch != nullptr) {
@@ -5257,7 +5511,7 @@ bool MainWindow::applySchedulesDirectGuideFallback(QHash<QString, QList<TvGuideE
             const SchedulesDirectChannelPayload *uniqueMajorNameMatch = nullptr;
             for (const SchedulesDirectChannelPayload &candidate : sdChannels) {
                 if (candidate.virtualMajor != hint.virtualMajor
-                    || !schedulesDirectLocalNameMatches(localName, candidate)) {
+                    || !schedulesDirectLocalNameMatches(localMatchName, candidate)) {
                     continue;
                 }
                 if (uniqueMajorNameMatch != nullptr) {
@@ -5633,9 +5887,8 @@ void MainWindow::addTestingBugItem()
     }
 
     if (!addTestingBugItemEntry(text, false)) {
-        QMessageBox::information(this,
-                                 "Item already saved",
-                                 QString("%1 is already in your Testing/bugs list.").arg(text));
+        showInformationDialog("Item already saved",
+                              QString("%1 is already in your Testing/bugs list.").arg(text));
         return;
     }
 
@@ -6340,9 +6593,9 @@ bool MainWindow::resolveScheduledSwitchChoices(const QList<TvGuideScheduledSwitc
             chosenIndex = 0;
         }
     } else {
-        QDialog dialog(this);
+        QDialog dialog(modalDialogParent());
         dialog.setWindowTitle("Schedule conflict");
-        dialog.setModal(true);
+        dialog.setWindowModality(Qt::WindowModal);
 
         auto *layout = new QVBoxLayout(&dialog);
         auto *titleLabel = new QLabel(ratingTiePrompt
@@ -6420,7 +6673,11 @@ bool MainWindow::resolveScheduledSwitchChoices(const QList<TvGuideScheduledSwitc
             dialog.accept();
         });
 
-        const QScreen *screen = dialog.screen() != nullptr ? dialog.screen() : QGuiApplication::primaryScreen();
+        const QWidget *dialogParent = modalDialogParent();
+        const QScreen *screen =
+            dialogParent != nullptr && dialogParent->screen() != nullptr
+                ? dialogParent->screen()
+                : QGuiApplication::primaryScreen();
         const int availableWidth = screen != nullptr ? screen->availableGeometry().width() : 1280;
         const int availableHeight = screen != nullptr ? screen->availableGeometry().height() : 800;
         const int targetWidth = std::clamp(widestChoiceText + 140, 620, std::max(620, availableWidth - 120));
@@ -6431,7 +6688,8 @@ bool MainWindow::resolveScheduledSwitchChoices(const QList<TvGuideScheduledSwitc
         choicesList->setMinimumWidth(targetWidth - 80);
         dialog.resize(targetWidth, targetHeight);
 
-        if (dialog.exec() != QDialog::Accepted || choicesList->currentRow() < 0) {
+        if (execModalDialog(&dialog, "Schedule conflict") != QDialog::Accepted
+            || choicesList->currentRow() < 0) {
             appendLog(QString("%1 left overlapping scheduled shows unchanged.").arg(sourceDescription));
             return false;
         }
@@ -6761,8 +7019,8 @@ void MainWindow::handleGuideScheduleToggle(const QString &channelName, const TvG
 
     if (enabled) {
         if (candidate.startUtc <= QDateTime::currentDateTimeUtc()) {
-            QMessageBox::information(this, "Only future shows",
-                                     "Only future TV Guide entries can be scheduled for automatic tuning.");
+            showInformationDialog("Only future shows",
+                                  "Only future TV Guide entries can be scheduled for automatic tuning.");
             updateTvGuideDialogFromCurrentCache(false);
             return;
         }
@@ -7071,7 +7329,7 @@ void MainWindow::showStartupSwitchSummary()
                            "Scheduled switches at startup",
                            message,
                            QMessageBox::Ok,
-                           this);
+                           modalDialogParent());
     messageBox.setTextFormat(Qt::PlainText);
     if (QLabel *label = messageBox.findChild<QLabel *>("qt_msgbox_label")) {
         label->setWordWrap(false);
@@ -7083,7 +7341,7 @@ void MainWindow::showStartupSwitchSummary()
                         1,
                         layout->columnCount());
     }
-    messageBox.exec();
+    execModalDialog(&messageBox, "Scheduled switches at startup");
 }
 
 QStringList MainWindow::makeArguments() const
@@ -7121,6 +7379,8 @@ void MainWindow::startScan()
     partialStdOut_.clear();
     partialStdErr_.clear();
     channelLines_.clear();
+    pendingScanChannelNumbersByName_.clear();
+    channelHintsDirty_ = false;
 
     const QString program = "w_scan2";
     const QStringList args = makeArguments();
@@ -7129,7 +7389,7 @@ void MainWindow::startScan()
     scanProcess_->start(program, args);
 
     if (!scanProcess_->waitForStarted(2000)) {
-        QMessageBox::critical(this, "Failed to start", "Could not launch w_scan2. Check that it is in your PATH.");
+        showCriticalDialog("Failed to start", "Could not launch w_scan2. Check that it is in your PATH.");
         appendLog("Failed to start w_scan2.");
         return;
     }
@@ -7169,10 +7429,22 @@ void MainWindow::handleStdErr()
     const QStringList lines = partialStdErr_.split('\n');
     partialStdErr_ = lines.back();
 
+    static const QRegularExpression channelNumberPattern(
+        QStringLiteral("Channel number:\\s*(\\d+[:.-]\\d+)\\.\\s*Name:\\s*'([^']+)'"),
+        QRegularExpression::CaseInsensitiveOption);
+
     for (int i = 0; i < lines.size() - 1; ++i) {
         const QString line = lines[i].trimmed();
         if (!line.isEmpty()) {
             appendLog("stderr: " + line);
+            const QRegularExpressionMatch match = channelNumberPattern.match(line);
+            if (match.hasMatch()) {
+                const QString channelNumber = normalizeChannelNumberHint(match.captured(1));
+                const QString channelName = match.captured(2).trimmed();
+                if (!channelNumber.isEmpty() && !channelName.isEmpty()) {
+                    pendingScanChannelNumbersByName_[channelName].append(channelNumber);
+                }
+            }
         }
     }
 }
@@ -7192,6 +7464,15 @@ void MainWindow::processFinished(int exitCode)
 
     setScanningState(false);
     persistChannelsFile();
+    if (channelHintsDirty_) {
+        QString saveError;
+        if (!saveChannelHintsToJson(xspfNumberByTuneKey_, xspfProgramByChannel_, &saveError)
+            && !saveError.trimmed().isEmpty()) {
+            appendLog(saveError);
+        }
+    }
+    pendingScanChannelNumbersByName_.clear();
+    channelHintsDirty_ = false;
     const int rowCount = channelsTable_->rowCount();
     const QString endMsg = QString("Scan finished (exit=%1). Channels parsed: %2").arg(exitCode).arg(rowCount);
     appendLog(endMsg);
@@ -7269,7 +7550,30 @@ void MainWindow::parseAndStoreLine(const QString &line)
         channelLines_.append(normalizedLine);
     }
 
-    const QString channelNumber = xspfNumberByTuneKey_.value(tuneKeyForParts(parts), parts[5].trimmed());
+    const QString tuneKeyValue = tuneKeyForParts(parts);
+    QString channelNumberHint = normalizeChannelNumberHint(xspfNumberByTuneKey_.value(tuneKeyValue));
+    if (channelNumberHint.isEmpty()) {
+        QStringList &pendingNumbers = pendingScanChannelNumbersByName_[channelName];
+        if (!pendingNumbers.isEmpty()) {
+            channelNumberHint = normalizeChannelNumberHint(pendingNumbers.takeFirst());
+            if (!channelNumberHint.isEmpty() && !tuneKeyValue.isEmpty()) {
+                xspfNumberByTuneKey_.insert(tuneKeyValue, channelNumberHint);
+                channelHintsDirty_ = true;
+            }
+        }
+        if (pendingNumbers.isEmpty()) {
+            pendingScanChannelNumbersByName_.remove(channelName);
+        }
+    }
+    if (channelNumberHint.isEmpty()) {
+        channelNumberHint = channelNumberHintForParts(parts, &xspfNumberByTuneKey_);
+    }
+    const QString channelNumber = displayChannelNumber(channelNumberHint).isEmpty()
+                                      ? parts[5].trimmed()
+                                      : displayChannelNumber(channelNumberHint);
+    const QString displayLabel = channelDisplayLabel(channelName, channelNumberHint).isEmpty()
+                                     ? channelName
+                                     : channelDisplayLabel(channelName, channelNumberHint);
     const bool sortingEnabled = channelsTable_->isSortingEnabled();
     const int sortColumn = channelsTable_->horizontalHeader()->sortIndicatorSection();
     const Qt::SortOrder sortOrder = channelsTable_->horizontalHeader()->sortIndicatorOrder();
@@ -7281,8 +7585,13 @@ void MainWindow::parseAndStoreLine(const QString &line)
     const int row = channelsTable_->rowCount();
     channelsTable_->insertRow(row);
     channelsTable_->setItem(row, 0, new QTableWidgetItem(channelNumber));
-    channelsTable_->setItem(row, 1, new QTableWidgetItem(channelName));
+    channelsTable_->setItem(row, 1, new QTableWidgetItem(displayLabel));
     channelsTable_->setItem(row, 2, new QTableWidgetItem(normalizedLine));
+
+    xspfProgramByChannel_.insert(channelName, parts[5].trimmed());
+    if (displayLabel != channelName) {
+        xspfProgramByChannel_.insert(displayLabel, parts[5].trimmed());
+    }
 
     if (sortingEnabled) {
         channelsTable_->setSortingEnabled(true);
@@ -7338,6 +7647,52 @@ QString MainWindow::selectedChannelNameFromTable() const
     return item->text().trimmed();
 }
 
+QString MainWindow::selectedChannelLineFromTable() const
+{
+    const auto rows = channelsTable_->selectionModel()->selectedRows();
+    if (rows.isEmpty()) {
+        return {};
+    }
+    const int row = rows.first().row();
+    const auto *item = channelsTable_->item(row, 2);
+    if (item == nullptr) {
+        return {};
+    }
+    return normalizeZapLine(item->text()).trimmed();
+}
+
+QString MainWindow::firstChannelLineForName(const QString &channelName) const
+{
+    const QString trimmedChannelName = channelName.trimmed();
+    if (trimmedChannelName.isEmpty()) {
+        return {};
+    }
+
+    for (const QString &line : channelLines_) {
+        const QString normalizedLine = normalizeZapLine(line).trimmed();
+        const QString baseName = channelNameFromZapLine(normalizedLine).trimmed();
+        const QString displayLabel = channelDisplayLabelForLine(normalizedLine, &xspfNumberByTuneKey_).trimmed();
+        if (trimmedChannelName == baseName || trimmedChannelName == displayLabel) {
+            return normalizedLine;
+        }
+    }
+
+    QFile file(channelsFilePath_);
+    if (!file.open(QIODevice::ReadOnly | QIODevice::Text)) {
+        return {};
+    }
+    while (!file.atEnd()) {
+        const QString normalizedLine = normalizeZapLine(QString::fromUtf8(file.readLine())).trimmed();
+        const QString baseName = channelNameFromZapLine(normalizedLine).trimmed();
+        const QString displayLabel = channelDisplayLabelForLine(normalizedLine, &xspfNumberByTuneKey_).trimmed();
+        if (trimmedChannelName == baseName || trimmedChannelName == displayLabel) {
+            return normalizedLine;
+        }
+    }
+
+    return {};
+}
+
 bool MainWindow::highlightChannelInTable(const QString &channelName)
 {
     if (channelsTable_ == nullptr || channelName.trimmed().isEmpty()) {
@@ -7359,35 +7714,48 @@ bool MainWindow::highlightChannelInTable(const QString &channelName)
     return false;
 }
 
+bool MainWindow::highlightChannelLineInTable(const QString &channelLine)
+{
+    if (channelsTable_ == nullptr || channelLine.trimmed().isEmpty()) {
+        return false;
+    }
+
+    const QString normalizedChannelLine = normalizeZapLine(channelLine).trimmed();
+    for (int row = 0; row < channelsTable_->rowCount(); ++row) {
+        QTableWidgetItem *rawLineItem = channelsTable_->item(row, 2);
+        if (rawLineItem == nullptr || normalizeZapLine(rawLineItem->text()).trimmed() != normalizedChannelLine) {
+            continue;
+        }
+
+        channelsTable_->selectRow(row);
+        channelsTable_->setCurrentCell(row, 1);
+        channelsTable_->scrollToItem(rawLineItem, QAbstractItemView::PositionAtCenter);
+        return true;
+    }
+
+    return false;
+}
+
 QString MainWindow::programIdForChannel(const QString &channelName) const
 {
     if (channelName.isEmpty()) {
         return {};
     }
 
-    if (xspfProgramByChannel_.contains(channelName)) {
-        return xspfProgramByChannel_.value(channelName);
+    const QString trimmedChannelName = channelName.trimmed();
+    if (xspfProgramByChannel_.contains(trimmedChannelName)) {
+        return xspfProgramByChannel_.value(trimmedChannelName);
     }
 
-    auto parseProgramFromLine = [&channelName](const QString &line) -> QString {
-        const QString trimmedLine = line.trimmed();
-        if (trimmedLine.isEmpty()) {
-            return {};
-        }
-        const QStringList parts = trimmedLine.split(':');
-        if (parts.size() < 6) {
-            return {};
-        }
-        if (parts[0].trimmed() != channelName) {
-            return {};
-        }
-        return parts[5].trimmed();
-    };
-
     for (const QString &line : channelLines_) {
-        const QString programId = parseProgramFromLine(line);
-        if (!programId.isEmpty()) {
-            return programId;
+        const QString normalizedLine = normalizeZapLine(line).trimmed();
+        const QString baseName = channelNameFromZapLine(normalizedLine);
+        const QString displayLabel = channelDisplayLabelForLine(normalizedLine, &xspfNumberByTuneKey_);
+        if (trimmedChannelName == baseName || trimmedChannelName == displayLabel) {
+            const QString programId = programIdFromZapLine(normalizedLine);
+            if (!programId.isEmpty()) {
+                return programId;
+            }
         }
     }
 
@@ -7396,10 +7764,14 @@ QString MainWindow::programIdForChannel(const QString &channelName) const
         return {};
     }
     while (!file.atEnd()) {
-        const QString line = QString::fromUtf8(file.readLine());
-        const QString programId = parseProgramFromLine(line);
-        if (!programId.isEmpty()) {
-            return programId;
+        const QString normalizedLine = normalizeZapLine(QString::fromUtf8(file.readLine())).trimmed();
+        const QString baseName = channelNameFromZapLine(normalizedLine);
+        const QString displayLabel = channelDisplayLabelForLine(normalizedLine, &xspfNumberByTuneKey_);
+        if (trimmedChannelName == baseName || trimmedChannelName == displayLabel) {
+            const QString programId = programIdFromZapLine(normalizedLine);
+            if (!programId.isEmpty()) {
+                return programId;
+            }
         }
     }
     return {};
@@ -7408,26 +7780,36 @@ QString MainWindow::programIdForChannel(const QString &channelName) const
 void MainWindow::watchSelectedChannel()
 {
     if (scanProcess_->state() != QProcess::NotRunning) {
-        QMessageBox::warning(this, "Scan in progress", "Stop scanning before starting live viewing.");
+        showWarningDialog("Scan in progress", "Stop scanning before starting live viewing.");
         return;
     }
 
-    const QString channelName = selectedChannelNameFromTable();
+    const QString channelLine = selectedChannelLineFromTable();
+    const QString channelName = channelNameFromZapLine(channelLine);
     if (channelName.isEmpty()) {
-        QMessageBox::information(this, "Select a channel", "Select a channel row first.");
+        showInformationDialog("Select a channel", "Select a channel row first.");
         return;
     }
 
-    startWatchingChannel(channelName, false);
+    startWatchingChannel(channelName, false, channelLine);
 }
 
 void MainWindow::openMediaFile()
 {
-    const QString filePath = QFileDialog::getOpenFileName(
-        this,
-        "Open Media File",
-        QDir::homePath(),
-        "Video Files (*.mp4 *.mkv *.webm *.avi *.mov *.ts *.m2ts);;All Files (*)");
+    QFileDialog dialog(modalDialogParent(),
+                       "Open Media File",
+                       QDir::homePath(),
+                       "Video Files (*.mp4 *.mkv *.webm *.avi *.mov *.ts *.m2ts);;All Files (*)");
+    dialog.setFileMode(QFileDialog::ExistingFile);
+    dialog.setAcceptMode(QFileDialog::AcceptOpen);
+    if (fullscreenActive_) {
+        dialog.setOption(QFileDialog::DontUseNativeDialog, true);
+    }
+    if (execModalDialog(&dialog, "Open Media File") != QDialog::Accepted) {
+        return;
+    }
+    const QStringList selectedFiles = dialog.selectedFiles();
+    const QString filePath = selectedFiles.isEmpty() ? QString() : selectedFiles.first();
     if (filePath.isEmpty()) {
         return;
     }
@@ -7455,7 +7837,7 @@ bool MainWindow::refreshGuideData(bool interactive, bool updateDialog)
         && scanProcess_ != nullptr
         && scanProcess_->state() != QProcess::NotRunning) {
         if (interactive) {
-            QMessageBox::warning(this, "Scan in progress", "Stop scanning before opening the TV guide.");
+            showWarningDialog("Scan in progress", "Stop scanning before opening the TV guide.");
         } else {
             appendLog("guide-bg: skipped guide refresh while a scan is in progress.");
         }
@@ -7471,7 +7853,7 @@ bool MainWindow::refreshGuideData(bool interactive, bool updateDialog)
     }
     if (channelLines_.isEmpty()) {
         if (interactive) {
-            QMessageBox::information(this, "No channels", "No channels are loaded yet. Run a scan first.");
+            showInformationDialog("No channels", "No channels are loaded yet. Run a scan first.");
         } else {
             appendLog("guide-bg: no channels are loaded yet; skipping background guide refresh.");
         }
@@ -7480,19 +7862,19 @@ bool MainWindow::refreshGuideData(bool interactive, bool updateDialog)
 
     if (!persistChannelsFile() && channelsFilePath_.isEmpty()) {
         if (interactive) {
-            QMessageBox::warning(this, "Missing channels file", "Could not prepare channels.conf for guide collection.");
+            showWarningDialog("Missing channels file",
+                              "Could not prepare channels.conf for guide collection.");
         } else {
             appendLog("guide-bg: could not prepare channels.conf for background guide collection.");
         }
         return false;
     }
 
-    const QVector<GuideChannelInfo> channels = parseGuideChannels(channelLines_);
+    const QVector<GuideChannelInfo> channels = parseGuideChannels(channelLines_, &xspfNumberByTuneKey_);
     if (channels.isEmpty()) {
         if (interactive) {
-            QMessageBox::warning(this,
-                                 "Unsupported channel format",
-                                 "Could not parse channels.conf entries for guide mapping.");
+            showWarningDialog("Unsupported channel format",
+                              "Could not parse channels.conf entries for guide mapping.");
         } else {
             appendLog("guide-bg: could not parse channels.conf entries for guide mapping.");
         }
@@ -7519,7 +7901,7 @@ bool MainWindow::refreshGuideData(bool interactive, bool updateDialog)
     int guideAdapter = findPreferredGuideAdapter(frontendSpin_->value(), guideFrontend);
     if (guideAdapter < 0) {
         if (interactive) {
-            QMessageBox::warning(this, "Guide unavailable", "No tuner is available for EIT/guide collection.");
+            showWarningDialog("Guide unavailable", "No tuner is available for EIT/guide collection.");
         } else {
             appendLog("guide-bg: no tuner is available for hidden guide collection.");
         }
@@ -7561,9 +7943,8 @@ bool MainWindow::refreshGuideData(bool interactive, bool updateDialog)
         }
         if (liveFrequencyHz <= 0) {
             if (interactive) {
-                QMessageBox::warning(this,
-                                     "Guide unavailable",
-                                     "Could not determine the currently tuned multiplex while live playback is active.");
+                showWarningDialog("Guide unavailable",
+                                  "Could not determine the currently tuned multiplex while live playback is active.");
             } else {
                 appendLog("guide-bg: could not determine the currently tuned multiplex during hidden guide refresh.");
             }
@@ -7641,9 +8022,11 @@ bool MainWindow::refreshGuideData(bool interactive, bool updateDialog)
                                        "Cancel",
                                        0,
                                        frequencies.size(),
-                                       this);
+                                       modalDialogParent());
         progress->setWindowModality(Qt::WindowModal);
         progress->setMinimumDuration(0);
+        prepareModalWindow(progress, statusMessage);
+        progress->show();
     }
 
     QHash<QString, QList<TvGuideEntry>> entriesByChannel = guideEntriesCache_;
@@ -7795,6 +8178,7 @@ bool MainWindow::refreshGuideData(bool interactive, bool updateDialog)
     if (progress != nullptr) {
         progress->setValue(frequencies.size());
         delete progress;
+        restoreAfterModalWindow();
     }
     if (interactive) {
         QApplication::restoreOverrideCursor();
@@ -8119,7 +8503,7 @@ bool MainWindow::refreshGuideDataFromSchedulesDirect(bool interactive, bool upda
         }
     }
     if (channelOrder.isEmpty()) {
-        const QVector<GuideChannelInfo> localChannels = parseGuideChannels(channelLines_);
+        const QVector<GuideChannelInfo> localChannels = parseGuideChannels(channelLines_, &xspfNumberByTuneKey_);
         QSet<QString> seenChannelNames;
         for (const GuideChannelInfo &channel : localChannels) {
             if (!channel.name.trimmed().isEmpty() && !seenChannelNames.contains(channel.name)) {
@@ -8562,21 +8946,61 @@ void MainWindow::refreshCurrentShowStatus()
     setCurrentShowStatus("NO EIT DATA", "No guide cache data is currently available for this channel.");
 }
 
-bool MainWindow::startWatchingChannel(const QString &channelName, bool reconnectAttempt)
+bool MainWindow::startWatchingChannel(const QString &channelName,
+                                      bool reconnectAttempt,
+                                      const QString &channelLine)
 {
     if (channelName.isEmpty()) {
         return false;
     }
 
     if (!persistChannelsFile()) {
-        QMessageBox::warning(this, "No channel list", "No saved channels are available yet. Run a scan first.");
+        showWarningDialog("No channel list", "No saved channels are available yet. Run a scan first.");
         return false;
     }
 
     const QString zapExe = QStandardPaths::findExecutable("dvbv5-zap");
     if (zapExe.isEmpty()) {
-        QMessageBox::critical(this, "Missing dependency", "dvbv5-zap was not found in PATH.");
+        showCriticalDialog("Missing dependency", "dvbv5-zap was not found in PATH.");
         return false;
+    }
+
+    const QString requestedChannelName = channelName.trimmed();
+    QString activeChannelLine = normalizeZapLine(channelLine).trimmed();
+    if (activeChannelLine.isEmpty()) {
+        activeChannelLine = firstChannelLineForName(requestedChannelName);
+    }
+
+    const QString resolvedChannelName = !activeChannelLine.isEmpty()
+                                            ? channelDisplayLabelForLine(activeChannelLine, &xspfNumberByTuneKey_)
+                                            : requestedChannelName;
+
+    QString tuneChannelsPath = channelsFilePath_;
+    if (!activeChannelLine.isEmpty()) {
+        const QString activeTunePath = resolveActiveTuneChannelPath();
+        if (!activeTunePath.isEmpty()) {
+            QFileInfo activeTuneInfo(activeTunePath);
+            QDir activeTuneDir = activeTuneInfo.dir();
+            if (activeTuneDir.exists() || activeTuneDir.mkpath(".")) {
+                QSaveFile activeTuneFile(activeTunePath);
+                if (activeTuneFile.open(QIODevice::WriteOnly | QIODevice::Text | QIODevice::Truncate)) {
+                    const QByteArray tunePayload = activeChannelLine.toUtf8() + '\n';
+                    if (activeTuneFile.write(tunePayload) == tunePayload.size() && activeTuneFile.commit()) {
+                        tuneChannelsPath = activeTunePath;
+                    } else {
+                        activeTuneFile.cancelWriting();
+                        appendLog(QString("player: failed to write single-channel tune file %1; falling back to %2")
+                                      .arg(activeTunePath, channelsFilePath_));
+                    }
+                } else {
+                    appendLog(QString("player: could not open %1 for single-channel tuning; falling back to %2")
+                                  .arg(activeTunePath, channelsFilePath_));
+                }
+            } else {
+                appendLog(QString("player: could not create %1 for single-channel tuning; falling back to %2")
+                              .arg(activeTuneDir.path(), channelsFilePath_));
+            }
+        }
     }
 
     userStoppedWatching_ = false;
@@ -8610,8 +9034,11 @@ bool MainWindow::startWatchingChannel(const QString &channelName, bool reconnect
     mediaPlayer_->stop();
     mediaPlayer_->setSource(QUrl());
 
-    currentChannelName_ = channelName;
-    currentProgramId_ = programIdForChannel(channelName);
+    currentChannelName_ = resolvedChannelName.isEmpty() ? requestedChannelName : resolvedChannelName;
+    currentChannelLine_ = activeChannelLine;
+    currentProgramId_ = !currentChannelLine_.isEmpty()
+                            ? programIdFromZapLine(currentChannelLine_)
+                            : programIdForChannel(currentChannelName_);
     currentShowTimer_->stop();
     ++currentShowLookupSerial_;
     noAutoCurrentShowLookupChannels_.remove(channelName);
@@ -8625,16 +9052,17 @@ bool MainWindow::startWatchingChannel(const QString &channelName, bool reconnect
 
     QStringList args;
     args << "-I" << "ZAP"
-         << "-c" << channelsFilePath_
+         << "-c" << tuneChannelsPath
          << "-a" << QString::number(adapterSpin_->value())
          << "-f" << QString::number(frontendSpin_->value())
          << "-r"
          << "-P"
          << "-p";
 
-    args << channelName;
+    const QString zapChannelName = channelNameFromZapLine(activeChannelLine).trimmed();
+    args << (zapChannelName.isEmpty() ? requestedChannelName : zapChannelName);
     appendLog(QString("Tuning channel: %1 (program=%2)")
-                  .arg(channelName, currentProgramId_.isEmpty() ? "unknown" : currentProgramId_));
+                  .arg(currentChannelName_, currentProgramId_.isEmpty() ? "unknown" : currentProgramId_));
     appendLog("zap: launch " + formatCommandLine(zapExe, args));
     zapProcess_->start(zapExe, args);
     if (!zapProcess_->waitForStarted(2000)) {
@@ -8651,10 +9079,23 @@ bool MainWindow::startWatchingChannel(const QString &channelName, bool reconnect
         playbackAttachTimer_->start(3500);
     }
 
-    highlightChannelInTable(channelName);
+    if (!currentChannelLine_.isEmpty()) {
+        highlightChannelLineInTable(currentChannelLine_);
+    } else {
+    highlightChannelInTable(currentChannelName_);
+    }
 
     QSettings settings("tv_tuner_gui", "watcher");
-    settings.setValue(kLastPlayedChannelSetting, channelName);
+    const QString persistedChannelName = currentChannelName_.isEmpty() ? requestedChannelName : currentChannelName_;
+    settings.setValue(kLastPlayedChannelSetting, persistedChannelName);
+    const QString persistedChannelLine = !currentChannelLine_.isEmpty()
+                                             ? currentChannelLine_
+                                             : firstChannelLineForName(persistedChannelName);
+    if (!persistedChannelLine.isEmpty()) {
+        settings.setValue(kLastPlayedChannelLineSetting, persistedChannelLine);
+    } else {
+        settings.remove(kLastPlayedChannelLineSetting);
+    }
 
     stopWatchButton_->setEnabled(true);
     playbackStatusLabel_->setText(playbackStatusText());
@@ -8687,6 +9128,7 @@ void MainWindow::stopWatching()
     videoOnlyBridgeTried_ = false;
     bridgeSawCodecParameterFailure_ = false;
     currentChannelName_.clear();
+    currentChannelLine_.clear();
     currentProgramId_.clear();
     if (mediaPlayer_ != nullptr) {
         mediaPlayer_->stop();
@@ -8903,11 +9345,10 @@ void MainWindow::addSelectedFavorite()
 
     if (favorites_.size() >= kQuickFavoriteCount) {
         const QString candidateName = !selectedChannelName.isEmpty() ? selectedChannelName : currentWatchedChannel;
-        QMessageBox::information(this,
-                                 "Favorites full",
-                                 QString("You can save up to %1 favorites. Remove one first%2.")
-                                     .arg(kQuickFavoriteCount)
-                                     .arg(candidateName.isEmpty() ? QString() : QString(" to add %1").arg(candidateName)));
+        showInformationDialog("Favorites full",
+                              QString("You can save up to %1 favorites. Remove one first%2.")
+                                  .arg(kQuickFavoriteCount)
+                                  .arg(candidateName.isEmpty() ? QString() : QString(" to add %1").arg(candidateName)));
         return;
     }
 
@@ -8919,16 +9360,13 @@ void MainWindow::addSelectedFavorite()
     } else {
         const QStringList candidates = favoriteCandidatesFromTable(channelsTable_, favorites_);
         if (candidates.isEmpty()) {
-            QMessageBox::information(this, "No channels available", "There are no additional channels available to add to favorites.");
+            showInformationDialog("No channels available",
+                                  "There are no additional channels available to add to favorites.");
             return;
         }
 
-        const QString pickedChannel = QInputDialog::getItem(this,
-                                                            "Add Favorite",
-                                                            "Choose a channel to add:",
-                                                            candidates,
-                                                            0,
-                                                            false);
+        const QString pickedChannel =
+            promptItemSelection("Add Favorite", "Choose a channel to add:", candidates, 0, false);
         if (pickedChannel.isEmpty()) {
             return;
         }
@@ -8936,7 +9374,7 @@ void MainWindow::addSelectedFavorite()
     }
 
     if (channelName.isEmpty() || favorites_.contains(channelName)) {
-        QMessageBox::information(this, "Already a favorite", QString("%1 is already in favorites.").arg(channelName));
+        showInformationDialog("Already a favorite", QString("%1 is already in favorites.").arg(channelName));
         return;
     }
 
@@ -9137,7 +9575,7 @@ bool MainWindow::tryDynamicBridgeFallback(const QString &reason)
         reconnectTimer_->stop();
         reconnectAttemptCount_ = 0;
         appendLog(QString("player: %1; retrying with video-only bridge mode").arg(reason));
-        startWatchingChannel(currentChannelName_, true);
+        startWatchingChannel(currentChannelName_, true, currentChannelLine_);
         return true;
     }
 
@@ -9150,7 +9588,7 @@ bool MainWindow::tryDynamicBridgeFallback(const QString &reason)
     reconnectTimer_->stop();
     reconnectAttemptCount_ = 0;
     appendLog(QString("player: %1; retrying with resilient bridge mode").arg(reason));
-    startWatchingChannel(currentChannelName_, true);
+    startWatchingChannel(currentChannelName_, true, currentChannelLine_);
     return true;
 }
 
@@ -9194,7 +9632,7 @@ void MainWindow::triggerReconnect()
     if (currentChannelName_.isEmpty() || userStoppedWatching_) {
         return;
     }
-    startWatchingChannel(currentChannelName_, true);
+    startWatchingChannel(currentChannelName_, true, currentChannelLine_);
 }
 
 void MainWindow::handleMuteToggled(bool checked)
@@ -9250,19 +9688,60 @@ void MainWindow::restoreLastPlayedChannel()
     }
 
     QSettings settings("tv_tuner_gui", "watcher");
+    const QString savedChannelLine = normalizeZapLine(
+                                         settings.value(kLastPlayedChannelLineSetting).toString())
+                                         .trimmed();
+    QString restoredChannelLine;
+    if (!savedChannelLine.isEmpty()) {
+        for (const QString &line : channelLines_) {
+            if (normalizeZapLine(line).trimmed() == savedChannelLine) {
+                restoredChannelLine = savedChannelLine;
+                break;
+            }
+        }
+    }
+
+    QString restoredChannelName;
+    if (!restoredChannelLine.isEmpty()) {
+        restoredChannelName = channelDisplayLabelForLine(restoredChannelLine, &xspfNumberByTuneKey_).trimmed();
+        if (restoredChannelName.isEmpty()) {
+            restoredChannelName = channelNameFromZapLine(restoredChannelLine).trimmed();
+        }
+    }
+
     const QString lastChannelName = settings.value(kLastPlayedChannelSetting).toString().trimmed();
+    if (restoredChannelLine.isEmpty() && !lastChannelName.isEmpty()) {
+        restoredChannelLine = firstChannelLineForName(lastChannelName);
+        if (!restoredChannelLine.isEmpty()) {
+            restoredChannelName = channelDisplayLabelForLine(restoredChannelLine, &xspfNumberByTuneKey_).trimmed();
+            if (restoredChannelName.isEmpty()) {
+                restoredChannelName = channelNameFromZapLine(restoredChannelLine).trimmed();
+            }
+        }
+    }
+
+    if (!restoredChannelLine.isEmpty() && !restoredChannelName.isEmpty()) {
+        if (!highlightChannelLineInTable(restoredChannelLine)) {
+            appendLog("Saved last channel line was not highlighted in the current table: " + restoredChannelLine);
+        }
+        if (startWatchingChannel(restoredChannelName, false, restoredChannelLine)) {
+            return;
+        }
+    }
+
     if (lastChannelName.isEmpty()) {
         return;
     }
 
     if (!highlightChannelInTable(lastChannelName)) {
-        appendLog("Saved last channel was not found in the current channel list: " + lastChannelName);
-        return;
+        appendLog("Saved last channel label was not highlighted in the current table: " + lastChannelName);
     }
 
     if (startWatchingChannel(lastChannelName, false)) {
         return;
     }
+
+    appendLog("Saved last channel could not be restored: " + lastChannelName);
 }
 
 void MainWindow::toggleFullscreen()
@@ -9704,10 +10183,15 @@ void MainWindow::loadXspfChannelHints()
         const QString channelNumber = currentTitle.left(firstSpace).trimmed();
         const QString channelName = currentTitle.mid(firstSpace + 1).trimmed();
         if (!channelName.isEmpty()) {
-            if (!channelNumber.isEmpty() && !currentFrequency.isEmpty()) {
-                xspfNumberByTuneKey_.insert(tuneKey(currentFrequency, currentProgram), channelNumber);
+            const QString normalizedChannelNumber = normalizeChannelNumberHint(channelNumber);
+            if (!normalizedChannelNumber.isEmpty() && !currentFrequency.isEmpty()) {
+                xspfNumberByTuneKey_.insert(tuneKey(currentFrequency, currentProgram), normalizedChannelNumber);
             }
             xspfProgramByChannel_.insert(channelName, currentProgram);
+            const QString displayLabel = channelDisplayLabel(channelName, normalizedChannelNumber);
+            if (!displayLabel.isEmpty() && displayLabel != channelName) {
+                xspfProgramByChannel_.insert(displayLabel, currentProgram);
+            }
         }
     };
 

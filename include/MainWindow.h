@@ -11,6 +11,7 @@
 #include <QSet>
 
 class QComboBox;
+class QDialog;
 class QLineEdit;
 class QPushButton;
 class QPlainTextEdit;
@@ -94,7 +95,9 @@ private:
     void logInteraction(const QString &actor, const QString &action, const QString &details = QString());
     void parseAndStoreLine(const QString &line);
     bool persistChannelsFile();
-    bool startWatchingChannel(const QString &channelName, bool reconnectAttempt = false);
+    bool startWatchingChannel(const QString &channelName,
+                              bool reconnectAttempt = false,
+                              const QString &channelLine = QString());
     void refreshQuickButtons();
     void saveFavorites();
     void loadFavorites();
@@ -118,8 +121,11 @@ private:
     void updateTvGuideDialogFromCurrentCache(bool showStatusMessage = false);
     QStringList makeArguments() const;
     QString selectedChannelNameFromTable() const;
+    QString selectedChannelLineFromTable() const;
+    QString firstChannelLineForName(const QString &channelName) const;
     QString programIdForChannel(const QString &channelName) const;
     bool highlightChannelInTable(const QString &channelName);
+    bool highlightChannelLineInTable(const QString &channelLine);
     void probeCurrentShowAfterTune(const QString &channelName, int lookupSerial);
     void refreshCurrentShowStatus();
     void scheduleCurrentShowRefresh(const QDateTime &refreshUtc);
@@ -128,6 +134,19 @@ private:
                               const QString &synopsisText = QString());
     bool applyCurrentShowStatusFromGuideCache();
     void stopProcess(QProcess *process, int timeoutMs);
+    QWidget *modalDialogParent() const;
+    void prepareModalWindow(QWidget *window, const QString &reason = QString());
+    void restoreAfterModalWindow();
+    int execModalDialog(QDialog *dialog, const QString &reason = QString());
+    void showAboutDialog(const QString &title, const QString &text);
+    void showInformationDialog(const QString &title, const QString &text);
+    void showWarningDialog(const QString &title, const QString &text);
+    void showCriticalDialog(const QString &title, const QString &text);
+    QString promptItemSelection(const QString &title,
+                                const QString &label,
+                                const QStringList &items,
+                                int current = 0,
+                                bool editable = false);
     void syncFullscreenOverlayState();
     void positionFullscreenOverlay();
     void showFullscreenCursor();
@@ -281,7 +300,9 @@ private:
     QHash<QString, int> favoriteShowRatings_;
     QHash<QString, QString> xspfNumberByTuneKey_;
     QHash<QString, QString> xspfProgramByChannel_;
+    QHash<QString, QStringList> pendingScanChannelNumbersByName_;
     QString currentChannelName_;
+    QString currentChannelLine_;
     QString currentProgramId_;
     QString pendingDvrPath_;
     QHash<QString, QList<TvGuideEntry>> guideEntriesCache_;
@@ -305,6 +326,7 @@ private:
     bool bridgeSawCodecParameterFailure_{false};
     bool waitingForDvrReady_{false};
     bool guideRefreshInProgress_{false};
+    bool channelHintsDirty_{false};
     QString lastStatusBarMessage_{};
     bool fullscreenActive_{false};
     bool fullscreenCursorHidden_{false};
