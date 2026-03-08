@@ -4297,8 +4297,10 @@ void MainWindow::buildUi()
     volumeSlider_->setMaximumWidth(220);
     playbackStatusLabel_->setMinimumWidth(100);
     playbackStatusLabel_->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Preferred);
+    playbackStatusLabel_->setAlignment(Qt::AlignLeft | Qt::AlignTop);
     signalMonitorLabel_->setMinimumWidth(150);
     signalMonitorLabel_->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Preferred);
+    signalMonitorLabel_->setAlignment(Qt::AlignLeft | Qt::AlignTop);
     signalMonitorLabel_->setTextInteractionFlags(Qt::TextSelectableByMouse);
     currentShowLabel_->setMinimumWidth(220);
     currentShowLabel_->setWordWrap(true);
@@ -4381,8 +4383,13 @@ void MainWindow::buildUi()
     auto *statusRow = new QHBoxLayout(statusContainer_);
     statusRow->setContentsMargins(0, 0, 0, 0);
     statusRow->setSpacing(12);
-    statusRow->addWidget(playbackStatusLabel_, 0, Qt::AlignTop);
-    statusRow->addWidget(signalMonitorLabel_, 0, Qt::AlignTop);
+    auto *playbackStatusStack = new QWidget(statusContainer_);
+    auto *playbackStatusStackLayout = new QVBoxLayout(playbackStatusStack);
+    playbackStatusStackLayout->setContentsMargins(0, 0, 0, 0);
+    playbackStatusStackLayout->setSpacing(2);
+    playbackStatusStackLayout->addWidget(playbackStatusLabel_, 0, Qt::AlignLeft | Qt::AlignTop);
+    playbackStatusStackLayout->addWidget(signalMonitorLabel_, 0, Qt::AlignLeft | Qt::AlignTop);
+    statusRow->addWidget(playbackStatusStack, 0, Qt::AlignTop);
     statusRow->addWidget(currentShowSynopsisLabel_, 6);
     statusRow->addWidget(currentShowLabel_, 4);
 
@@ -4469,10 +4476,10 @@ void MainWindow::buildUi()
     fullscreenVolumeSlider_->setMaximumWidth(260);
     fullscreenPlaybackStatusLabel_ = new QLabel("Idle", fullscreenOverlayContainer_);
     fullscreenSignalMonitorLabel_ = new QLabel("Signal: n/a", fullscreenOverlayContainer_);
-    fullscreenPlaybackStatusLabel_->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+    fullscreenPlaybackStatusLabel_->setAlignment(Qt::AlignRight | Qt::AlignTop);
     fullscreenPlaybackStatusLabel_->setMinimumWidth(220);
     fullscreenPlaybackStatusLabel_->setTextInteractionFlags(Qt::TextSelectableByMouse);
-    fullscreenSignalMonitorLabel_->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+    fullscreenSignalMonitorLabel_->setAlignment(Qt::AlignRight | Qt::AlignTop);
     fullscreenSignalMonitorLabel_->setMinimumWidth(180);
     fullscreenSignalMonitorLabel_->setTextInteractionFlags(Qt::TextSelectableByMouse);
     fullscreenControlsRow->addWidget(fullscreenWatchButton_);
@@ -4482,8 +4489,13 @@ void MainWindow::buildUi()
     fullscreenControlsRow->addWidget(fullscreenVolumeSlider_);
     fullscreenControlsRow->addWidget(fullscreenMuteButton_);
     fullscreenControlsRow->addStretch(1);
-    fullscreenControlsRow->addWidget(fullscreenSignalMonitorLabel_, 0, Qt::AlignRight);
-    fullscreenControlsRow->addWidget(fullscreenPlaybackStatusLabel_, 0, Qt::AlignRight);
+    auto *fullscreenStatusStack = new QWidget(fullscreenOverlayContainer_);
+    auto *fullscreenStatusStackLayout = new QVBoxLayout(fullscreenStatusStack);
+    fullscreenStatusStackLayout->setContentsMargins(0, 0, 0, 0);
+    fullscreenStatusStackLayout->setSpacing(2);
+    fullscreenStatusStackLayout->addWidget(fullscreenPlaybackStatusLabel_, 0, Qt::AlignRight | Qt::AlignTop);
+    fullscreenStatusStackLayout->addWidget(fullscreenSignalMonitorLabel_, 0, Qt::AlignRight | Qt::AlignTop);
+    fullscreenControlsRow->addWidget(fullscreenStatusStack, 0, Qt::AlignRight | Qt::AlignTop);
 
     auto *fullscreenInfoRow = new QHBoxLayout();
     fullscreenInfoRow->setContentsMargins(0, 0, 0, 0);
