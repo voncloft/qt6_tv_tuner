@@ -58,6 +58,7 @@ private slots:
     void removeSelectedFavorite();
     void watchFavoriteItem(QListWidgetItem *item);
     void handleZapFinished(int exitCode, QProcess::ExitStatus exitStatus);
+    void handleSignalMonitorFinished(int exitCode, QProcess::ExitStatus exitStatus);
     void handleMediaStatusChanged(QMediaPlayer::MediaStatus status);
     void handlePlayerError(const QString &errorText);
     void triggerQuickFavorite();
@@ -116,6 +117,10 @@ private:
     void scheduleReconnect(const QString &reason);
     bool tryDynamicBridgeFallback(const QString &reason);
     QString playbackStatusText() const;
+    void startSignalMonitor(int adapter, int frontend);
+    void stopSignalMonitor();
+    void handleSignalMonitorOutput(const QString &chunk);
+    void setSignalMonitorStatus(const QString &text, const QString &toolTip = QString());
     void setStatusBarStateMessage(const QString &text);
     void showTransientStatusBarMessage(const QString &text, int timeoutMs = 3000);
     void updateTvGuideDialogFromCurrentCache(bool showStatusMessage = false);
@@ -242,11 +247,13 @@ private:
     QPushButton *fullscreenMuteButton_{};
     QSlider *fullscreenVolumeSlider_{};
     QLabel *fullscreenPlaybackStatusLabel_{};
+    QLabel *fullscreenSignalMonitorLabel_{};
     QLabel *fullscreenCurrentShowLabel_{};
     QLabel *fullscreenCurrentShowSynopsisLabel_{};
     QLabel *videoDetachedPlaceholderLabel_{};
     QWidget *pipWindow_{};
     QLabel *playbackStatusLabel_{};
+    QLabel *signalMonitorLabel_{};
     QLabel *currentShowLabel_{};
     QLabel *currentShowSynopsisLabel_{};
     QSlider *volumeSlider_{};
@@ -288,10 +295,12 @@ private:
     QProcess *scanProcess_{};
     QProcess *zapProcess_{};
     QProcess *streamBridgeProcess_{};
+    QProcess *signalMonitorProcess_{};
     QMediaPlayer *mediaPlayer_{};
     QAudioOutput *audioOutput_{};
     QString partialStdOut_;
     QString partialStdErr_;
+    QString partialSignalMonitorOutput_;
     QString channelsFilePath_;
     QString logFilePath_;
     QStringList channelLines_;
@@ -347,6 +356,8 @@ private:
     bool favoriteShowRatingsOverrideEnabled_{false};
     bool autoPictureInPictureEnabled_{true};
     bool deferStartupAutoFavoriteScheduling_{true};
+    QString currentShowOverlayToolTip_;
+    QString signalMonitorOverlayToolTip_;
     QStringList dismissedAutoFavoriteCandidates_;
     QStringList lockedAutoFavoriteSelections_;
     QStringList lockedScheduledSwitches_;

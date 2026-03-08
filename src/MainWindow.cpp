@@ -164,6 +164,214 @@ QString processErrorToString(QProcess::ProcessError error)
     }
 }
 
+struct SignalMonitorReading {
+    QString lockStatus;
+    QString quality;
+    QString signalValue;
+    QString carrierToNoise;
+    QString rawLine;
+
+    bool isValid() const
+    {
+        return !signalValue.isEmpty() || !quality.isEmpty() || !lockStatus.isEmpty();
+    }
+};
+
+QString captureSignalMonitorField(const QString &line, const QString &fieldName)
+{
+    static const QStringList fieldNames = {
+        "Quality=",
+        "Signal=",
+        "C/N=",
+        "SNR=",
+        "UCB=",
+        "postBER=",
+        "preBER=",
+        "BER=",
+        "PER=",
+        "UNC="
+    };
+
+    const int fieldIndex = line.indexOf(fieldName);
+    if (fieldIndex < 0) {
+        return {};
+    }
+
+    int valueStart = fieldIndex + fieldName.size();
+    while (valueStart < line.size() && line.at(valueStart).isSpace()) {
+        ++valueStart;
+    }
+
+    int valueEnd = line.size();
+    for (const QString &candidate : fieldNames) {
+        if (candidate == fieldName) {
+            continue;
+        }
+        const int candidateIndex = line.indexOf(candidate, valueStart);
+        if (candidateIndex >= 0 && candidateIndex < valueEnd) {
+            valueEnd = candidateIndex;
+        }
+    }
+
+    return line.mid(valueStart, valueEnd - valueStart).trimmed();
+}
+
+bool parseSignalValueNumber(const QString &text, double &value, QString &unit)
+{
+    static const QRegularExpression valueRegex(R"(^\s*(-?\d+(?:\.\d+)?)\s*([%[:alpha:]]+)?\s*$)");
+    const QRegularExpressionMatch match = valueRegex.match(text.trimmed());
+    if (!match.hasMatch()) {
+        return false;
+    }
+
+    bool ok = false;
+    const double parsedValue = match.captured(1).toDouble(&ok);
+    if (!ok) {
+        return false;
+    }
+
+    value = parsedValue;
+    unit = match.captured(2).trimmed();
+    return true;
+}
+
+QString signalCategoryFromPercent(double percent)
+{
+    if (percent >= 85.0) {
+        return "Excellent";
+    }
+    if (percent >= 70.0) {
+        return "Good";
+    }
+    if (percent >= 55.0) {
+        return "Ok";
+    }
+    if (percent >= 40.0) {
+        return "Mild";
+    }
+    return "Poor";
+}
+
+QString signalCategoryFromDbm(double dbm)
+{
+    if (dbm >= -50.0) {
+        return "Excellent";
+    }
+    if (dbm >= -60.0) {
+        return "Good";
+    }
+    if (dbm >= -70.0) {
+        return "Ok";
+    }
+    if (dbm >= -80.0) {
+        return "Mild";
+    }
+    return "Poor";
+}
+
+QString signalCategoryLabel(const SignalMonitorReading &reading)
+{
+    if (reading.lockStatus.contains("No lock", Qt::CaseInsensitive)) {
+        return "Poor";
+    }
+
+    double numericValue = 0.0;
+    QString unit;
+    if (parseSignalValueNumber(reading.signalValue, numericValue, unit)) {
+        if (unit == "%") {
+            return signalCategoryFromPercent(numericValue);
+        }
+        if (unit.compare("dBm", Qt::CaseInsensitive) == 0) {
+            return signalCategoryFromDbm(numericValue);
+        }
+    }
+
+    const QString normalizedQuality = reading.quality.trimmed().toCaseFolded();
+    if (normalizedQuality.contains("excellent")) {
+        return "Excellent";
+    }
+    if (normalizedQuality.contains("good")) {
+        return "Good";
+    }
+    if (normalizedQuality == "ok" || normalizedQuality.contains("okay")) {
+        return "Ok";
+    }
+    if (normalizedQuality.contains("fair") || normalizedQuality.contains("medium")) {
+        return "Mild";
+    }
+    if (normalizedQuality.contains("poor") || normalizedQuality.contains("bad") || normalizedQuality.contains("weak")) {
+        return "Poor";
+    }
+
+    if (!reading.lockStatus.trimmed().isEmpty()) {
+        return "Ok";
+    }
+
+    return {};
+}
+
+SignalMonitorReading parseSignalMonitorLine(const QString &line)
+{
+    const QString trimmedLine = line.trimmed();
+    SignalMonitorReading reading;
+    reading.rawLine = trimmedLine;
+    if (trimmedLine.isEmpty()) {
+        return reading;
+    }
+
+    const int parenIndex = trimmedLine.indexOf('(');
+    if (parenIndex > 0) {
+        reading.lockStatus = trimmedLine.left(parenIndex).trimmed();
+    } else if (trimmedLine.startsWith("Lock", Qt::CaseInsensitive)
+               || trimmedLine.startsWith("No lock", Qt::CaseInsensitive)) {
+        const int qualityIndex = trimmedLine.indexOf("Quality=");
+        reading.lockStatus = (qualityIndex > 0 ? trimmedLine.left(qualityIndex) : trimmedLine).trimmed();
+    }
+
+    reading.quality = captureSignalMonitorField(trimmedLine, "Quality=");
+    reading.signalValue = captureSignalMonitorField(trimmedLine, "Signal=");
+    reading.carrierToNoise = captureSignalMonitorField(trimmedLine, "C/N=");
+    if (reading.carrierToNoise.isEmpty()) {
+        reading.carrierToNoise = captureSignalMonitorField(trimmedLine, "SNR=");
+    }
+
+    return reading;
+}
+
+QString signalMonitorDisplayText(const SignalMonitorReading &reading)
+{
+    const QString category = signalCategoryLabel(reading);
+    if (category.isEmpty()) {
+        return {};
+    }
+
+    return "Signal: " + category;
+}
+
+QString signalMonitorToolTip(const SignalMonitorReading &reading, const QString &monitorDescription)
+{
+    QStringList lines;
+    if (!monitorDescription.trimmed().isEmpty()) {
+        lines << monitorDescription.trimmed();
+    }
+    if (!reading.signalValue.isEmpty()) {
+        lines << QString("Signal: %1").arg(reading.signalValue);
+    }
+    if (!reading.quality.isEmpty()) {
+        lines << QString("Quality: %1").arg(reading.quality);
+    }
+    if (!reading.lockStatus.isEmpty()) {
+        lines << QString("Lock: %1").arg(reading.lockStatus);
+    }
+    if (!reading.carrierToNoise.isEmpty()) {
+        lines << QString("C/N: %1").arg(reading.carrierToNoise);
+    }
+    if (!reading.rawLine.isEmpty()) {
+        lines << QString("Raw: %1").arg(reading.rawLine);
+    }
+    return lines.join('\n');
+}
+
 QString normalizeZapLine(const QString &line)
 {
     const QStringList parts = line.split(':');
@@ -3251,6 +3459,7 @@ MainWindow::MainWindow(QWidget *parent)
     scanProcess_ = new QProcess(this);
     zapProcess_ = new QProcess(this);
     streamBridgeProcess_ = new QProcess(this);
+    signalMonitorProcess_ = new QProcess(this);
     mediaPlayer_ = new QMediaPlayer(this);
     audioOutput_ = new QAudioOutput(this);
     reconnectTimer_ = new QTimer(this);
@@ -3356,6 +3565,21 @@ MainWindow::MainWindow(QWidget *parent)
     connect(zapProcess_, &QProcess::errorOccurred, this, [this](QProcess::ProcessError error) {
         appendLog(QString("zap: errorOccurred=%1 (%2)")
                       .arg(processErrorToString(error), zapProcess_->errorString()));
+    });
+    signalMonitorProcess_->setProcessChannelMode(QProcess::MergedChannels);
+    connect(signalMonitorProcess_, &QProcess::readyReadStandardOutput, this, [this]() {
+        handleSignalMonitorOutput(QString::fromUtf8(signalMonitorProcess_->readAllStandardOutput()));
+    });
+    connect(signalMonitorProcess_, &QProcess::finished, this, &MainWindow::handleSignalMonitorFinished);
+    connect(signalMonitorProcess_, &QProcess::errorOccurred, this, [this](QProcess::ProcessError error) {
+        if (currentChannelName_.isEmpty() || userStoppedWatching_) {
+            return;
+        }
+        setSignalMonitorStatus("Signal: unavailable",
+                               QString("dvb-fe-tool error: %1 (%2)")
+                                   .arg(processErrorToString(error), signalMonitorProcess_->errorString()));
+        appendLog(QString("signal: dvb-fe-tool errorOccurred=%1 (%2)")
+                      .arg(processErrorToString(error), signalMonitorProcess_->errorString()));
     });
     connect(streamBridgeProcess_, &QProcess::errorOccurred, this, [this](QProcess::ProcessError error) {
         appendLog(QString("ffmpeg bridge: errorOccurred=%1 (%2)")
@@ -3480,6 +3704,7 @@ MainWindow::MainWindow(QWidget *parent)
     refreshScheduledSwitchList();
     refreshQuickButtons();
     playbackStatusLabel_->setText(playbackStatusText());
+    setSignalMonitorStatus("Signal: n/a");
     setCurrentShowStatus("NO EIT DATA");
     syncFullscreenOverlayState();
     updateTvGuideDialogFromCurrentCache(false);
@@ -3553,6 +3778,8 @@ MainWindow::~MainWindow()
     suppressBridgeExitReconnect_ = true;
     stopProcess(streamBridgeProcess_, 1200);
     suppressBridgeExitReconnect_ = false;
+
+    stopProcess(signalMonitorProcess_, 1000);
 
     suppressZapExitReconnect_ = true;
     stopProcess(zapProcess_, 1200);
@@ -4038,6 +4265,7 @@ void MainWindow::buildUi()
     muteButton_ = new QPushButton("Mute", watchPage_);
     volumeSlider_ = new QSlider(Qt::Horizontal, watchPage_);
     playbackStatusLabel_ = new QLabel("Idle", watchPage_);
+    signalMonitorLabel_ = new QLabel("Signal: n/a", watchPage_);
     currentShowLabel_ = new QLabel("NO EIT DATA", watchPage_);
     currentShowSynopsisLabel_ = new QLabel(watchPage_);
     addFavoriteButton_ = new QPushButton("Add Favorite", watchPage_);
@@ -4069,6 +4297,9 @@ void MainWindow::buildUi()
     volumeSlider_->setMaximumWidth(220);
     playbackStatusLabel_->setMinimumWidth(100);
     playbackStatusLabel_->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Preferred);
+    signalMonitorLabel_->setMinimumWidth(150);
+    signalMonitorLabel_->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Preferred);
+    signalMonitorLabel_->setTextInteractionFlags(Qt::TextSelectableByMouse);
     currentShowLabel_->setMinimumWidth(220);
     currentShowLabel_->setWordWrap(true);
     currentShowLabel_->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Preferred);
@@ -4151,6 +4382,7 @@ void MainWindow::buildUi()
     statusRow->setContentsMargins(0, 0, 0, 0);
     statusRow->setSpacing(12);
     statusRow->addWidget(playbackStatusLabel_, 0, Qt::AlignTop);
+    statusRow->addWidget(signalMonitorLabel_, 0, Qt::AlignTop);
     statusRow->addWidget(currentShowSynopsisLabel_, 6);
     statusRow->addWidget(currentShowLabel_, 4);
 
@@ -4236,9 +4468,13 @@ void MainWindow::buildUi()
     fullscreenVolumeSlider_->setMinimumWidth(160);
     fullscreenVolumeSlider_->setMaximumWidth(260);
     fullscreenPlaybackStatusLabel_ = new QLabel("Idle", fullscreenOverlayContainer_);
+    fullscreenSignalMonitorLabel_ = new QLabel("Signal: n/a", fullscreenOverlayContainer_);
     fullscreenPlaybackStatusLabel_->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
     fullscreenPlaybackStatusLabel_->setMinimumWidth(220);
     fullscreenPlaybackStatusLabel_->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    fullscreenSignalMonitorLabel_->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+    fullscreenSignalMonitorLabel_->setMinimumWidth(180);
+    fullscreenSignalMonitorLabel_->setTextInteractionFlags(Qt::TextSelectableByMouse);
     fullscreenControlsRow->addWidget(fullscreenWatchButton_);
     fullscreenControlsRow->addWidget(fullscreenStopWatchButton_);
     fullscreenControlsRow->addSpacing(12);
@@ -4246,6 +4482,7 @@ void MainWindow::buildUi()
     fullscreenControlsRow->addWidget(fullscreenVolumeSlider_);
     fullscreenControlsRow->addWidget(fullscreenMuteButton_);
     fullscreenControlsRow->addStretch(1);
+    fullscreenControlsRow->addWidget(fullscreenSignalMonitorLabel_, 0, Qt::AlignRight);
     fullscreenControlsRow->addWidget(fullscreenPlaybackStatusLabel_, 0, Qt::AlignRight);
 
     auto *fullscreenInfoRow = new QHBoxLayout();
@@ -5780,8 +6017,18 @@ void MainWindow::refreshScheduledSwitchList()
 
     scheduledSwitchesList_->clear();
     for (const TvGuideScheduledSwitch &scheduledSwitch : scheduledSwitches_) {
-        scheduledSwitchesList_->addItem(scheduledSwitchManagementLabel(scheduledSwitch,
-                                                                       isScheduledSwitchLockedIn(scheduledSwitch)));
+        const QString displayTitle = scheduledSwitch.title.trimmed().isEmpty()
+                                         ? scheduledSwitch.channelName.trimmed()
+                                         : scheduledSwitch.title.simplified();
+        QString label = QString("%1 (%2) | %3 | %4")
+                            .arg(displayTitle)
+                            .arg(favoriteShowRating(displayTitle))
+                            .arg(scheduledSwitch.channelName.trimmed())
+                            .arg(scheduledSwitch.startUtc.toLocalTime().toString("ddd h:mm AP"));
+        if (isScheduledSwitchLockedIn(scheduledSwitch)) {
+            label += " | locked in";
+        }
+        scheduledSwitchesList_->addItem(label);
     }
     if (removeScheduledSwitchButton_ != nullptr) {
         removeScheduledSwitchButton_->setEnabled(false);
@@ -7816,6 +8063,7 @@ void MainWindow::openMediaFile()
 
     stopWatching();
     userStoppedWatching_ = true;
+    setSignalMonitorStatus("Signal: local file", "Signal monitoring is only available during live tuner playback.");
     currentChannelName_ = "File: " + QFileInfo(filePath).fileName();
     setCurrentShowStatus(QFileInfo(filePath).fileName());
 
@@ -8741,12 +8989,13 @@ void MainWindow::setCurrentShowStatus(const QString &text,
         return;
     }
 
+    currentShowOverlayToolTip_ = toolTip.trimmed();
     currentShowLabel_->setText(text);
-    currentShowLabel_->setToolTip(toolTip.trimmed());
+    currentShowLabel_->setToolTip(QString());
     if (currentShowSynopsisLabel_ != nullptr) {
         const QString trimmedSynopsis = synopsisText.trimmed();
         currentShowSynopsisLabel_->setText(trimmedSynopsis);
-        currentShowSynopsisLabel_->setToolTip(toolTip.trimmed());
+        currentShowSynopsisLabel_->setToolTip(QString());
         currentShowSynopsisLabel_->setVisible(!trimmedSynopsis.isEmpty());
         currentShowSynopsisLabel_->updateGeometry();
     }
@@ -9010,6 +9259,7 @@ bool MainWindow::startWatchingChannel(const QString &channelName,
     }
     waitingForDvrReady_ = false;
     pendingDvrPath_.clear();
+    stopSignalMonitor();
     ++playbackStartSerial_;
     if (!reconnectAttempt) {
         reconnectAttemptCount_ = 0;
@@ -9071,6 +9321,7 @@ bool MainWindow::startWatchingChannel(const QString &channelName,
         scheduleReconnect("Failed to start tuner process");
         return false;
     }
+    startSignalMonitor(adapterSpin_->value(), frontendSpin_->value());
 
     pendingDvrPath_ = QString("/dev/dvb/adapter%1/dvr0").arg(adapterSpin_->value());
     waitingForDvrReady_ = true;
@@ -9114,6 +9365,7 @@ void MainWindow::stopWatching()
     userStoppedWatching_ = true;
     reconnectTimer_->stop();
     currentShowTimer_->stop();
+    stopSignalMonitor();
     if (playbackAttachTimer_ != nullptr) {
         playbackAttachTimer_->stop();
     }
@@ -9149,6 +9401,7 @@ void MainWindow::stopWatching()
 
     stopWatchButton_->setEnabled(false);
     playbackStatusLabel_->setText(playbackStatusText());
+    setSignalMonitorStatus("Signal: n/a");
     setCurrentShowStatus("NO EIT DATA");
     syncFullscreenOverlayState();
     if (scanProcess_->state() == QProcess::NotRunning) {
@@ -9422,6 +9675,10 @@ void MainWindow::watchFavoriteItem(QListWidgetItem *item)
 
 void MainWindow::handleZapFinished(int exitCode, QProcess::ExitStatus exitStatus)
 {
+    stopSignalMonitor();
+    if (!userStoppedWatching_ && !currentChannelName_.isEmpty()) {
+        setSignalMonitorStatus("Signal: unavailable", "The tuner process exited, so live signal stats stopped updating.");
+    }
     if (exitStatus != QProcess::NormalExit) {
         appendLog(QString("zap: tuner process crashed (code=%1, error=%2)")
                       .arg(exitCode)
@@ -9429,6 +9686,32 @@ void MainWindow::handleZapFinished(int exitCode, QProcess::ExitStatus exitStatus
     }
     if (!suppressZapExitReconnect_ && exitCode != 0 && !userStoppedWatching_ && !currentChannelName_.isEmpty()) {
         scheduleReconnect(QString("Tuner process exited (%1)").arg(exitCode));
+    }
+}
+
+void MainWindow::handleSignalMonitorFinished(int exitCode, QProcess::ExitStatus exitStatus)
+{
+    partialSignalMonitorOutput_.clear();
+    if (userStoppedWatching_ || currentChannelName_.isEmpty()) {
+        return;
+    }
+
+    if (exitStatus != QProcess::NormalExit || exitCode != 0) {
+        setSignalMonitorStatus("Signal: unavailable",
+                               QString("dvb-fe-tool exited (%1, %2).")
+                                   .arg(exitCode)
+                                   .arg(signalMonitorProcess_->errorString()));
+        appendLog(QString("signal: dvb-fe-tool exited (code=%1, status=%2, error=%3)")
+                      .arg(exitCode)
+                      .arg(exitStatus == QProcess::NormalExit ? "normal" : "crash")
+                      .arg(signalMonitorProcess_->errorString()));
+        return;
+    }
+
+    if (signalMonitorLabel_ != nullptr
+        && signalMonitorLabel_->text().trimmed() == "Signal: monitoring...") {
+        setSignalMonitorStatus("Signal: unavailable",
+                               "dvb-fe-tool exited before reporting any frontend statistics.");
     }
 }
 
@@ -9440,6 +9723,90 @@ QString MainWindow::playbackStatusText() const
 
     const QString stateText = (mediaPlayer_->playbackState() == QMediaPlayer::PlayingState) ? "Playing" : "Buffering";
     return QString("%1: %2").arg(stateText, currentChannelName_);
+}
+
+void MainWindow::startSignalMonitor(int adapter, int frontend)
+{
+    stopSignalMonitor();
+
+    const QString femonExe = QStandardPaths::findExecutable("dvb-fe-tool");
+    if (femonExe.isEmpty()) {
+        setSignalMonitorStatus("Signal: unavailable", "dvb-fe-tool was not found in PATH.");
+        return;
+    }
+
+    partialSignalMonitorOutput_.clear();
+    setSignalMonitorStatus("Signal: monitoring...",
+                           QString("Monitoring adapter%1/frontend%2 with dvb-fe-tool --femon.")
+                               .arg(adapter)
+                               .arg(frontend));
+
+    QStringList args;
+    args << "-m"
+         << "-a" << QString::number(adapter)
+         << "-f" << QString::number(frontend);
+    signalMonitorProcess_->start(femonExe, args);
+    if (!signalMonitorProcess_->waitForStarted(1200)) {
+        setSignalMonitorStatus("Signal: unavailable",
+                               QString("Failed to start dvb-fe-tool (%1).")
+                                   .arg(signalMonitorProcess_->errorString()));
+        appendLog(QString("signal: failed to start dvb-fe-tool (%1)")
+                      .arg(signalMonitorProcess_->errorString()));
+        return;
+    }
+
+    appendLog(QString("signal: launch %1").arg(formatCommandLine(femonExe, args)));
+}
+
+void MainWindow::stopSignalMonitor()
+{
+    partialSignalMonitorOutput_.clear();
+    if (signalMonitorProcess_ != nullptr && signalMonitorProcess_->state() != QProcess::NotRunning) {
+        stopProcess(signalMonitorProcess_, 1000);
+    }
+}
+
+void MainWindow::handleSignalMonitorOutput(const QString &chunk)
+{
+    if (chunk.isEmpty()) {
+        return;
+    }
+
+    partialSignalMonitorOutput_ += chunk;
+    partialSignalMonitorOutput_.replace('\r', '\n');
+
+    int newlineIndex = partialSignalMonitorOutput_.indexOf('\n');
+    while (newlineIndex >= 0) {
+        const QString line = partialSignalMonitorOutput_.left(newlineIndex).trimmed();
+        partialSignalMonitorOutput_.remove(0, newlineIndex + 1);
+
+        if (!line.isEmpty()) {
+            const SignalMonitorReading reading = parseSignalMonitorLine(line);
+            if (reading.isValid()) {
+                setSignalMonitorStatus(signalMonitorDisplayText(reading),
+                                       signalMonitorToolTip(reading,
+                                                            QString("Monitoring %1")
+                                                                .arg(currentChannelName_.trimmed())));
+            } else if (line.contains("error", Qt::CaseInsensitive)
+                       || line.contains("fail", Qt::CaseInsensitive)
+                       || line.contains("could not", Qt::CaseInsensitive)) {
+                setSignalMonitorStatus("Signal: unavailable", line);
+                appendLog("signal: " + line);
+            }
+        }
+
+        newlineIndex = partialSignalMonitorOutput_.indexOf('\n');
+    }
+}
+
+void MainWindow::setSignalMonitorStatus(const QString &text, const QString &toolTip)
+{
+    signalMonitorOverlayToolTip_ = toolTip.trimmed();
+    if (signalMonitorLabel_ != nullptr) {
+        signalMonitorLabel_->setText(text);
+        signalMonitorLabel_->setToolTip(QString());
+    }
+    syncFullscreenOverlayState();
 }
 
 void MainWindow::setStatusBarStateMessage(const QString &text)
@@ -9786,16 +10153,20 @@ void MainWindow::syncFullscreenOverlayState()
     }
     if (fullscreenPlaybackStatusLabel_ != nullptr && playbackStatusLabel_ != nullptr) {
         fullscreenPlaybackStatusLabel_->setText(playbackStatusLabel_->text());
-        fullscreenPlaybackStatusLabel_->setToolTip(playbackStatusLabel_->toolTip());
+        fullscreenPlaybackStatusLabel_->setToolTip(QString());
+    }
+    if (fullscreenSignalMonitorLabel_ != nullptr && signalMonitorLabel_ != nullptr) {
+        fullscreenSignalMonitorLabel_->setText(signalMonitorLabel_->text());
+        fullscreenSignalMonitorLabel_->setToolTip(signalMonitorOverlayToolTip_);
     }
     if (fullscreenCurrentShowLabel_ != nullptr && currentShowLabel_ != nullptr) {
         fullscreenCurrentShowLabel_->setText(currentShowLabel_->text());
-        fullscreenCurrentShowLabel_->setToolTip(currentShowLabel_->toolTip());
+        fullscreenCurrentShowLabel_->setToolTip(currentShowOverlayToolTip_);
     }
     if (fullscreenCurrentShowSynopsisLabel_ != nullptr && currentShowSynopsisLabel_ != nullptr) {
         const QString synopsis = currentShowSynopsisLabel_->text().trimmed();
         fullscreenCurrentShowSynopsisLabel_->setText(synopsis);
-        fullscreenCurrentShowSynopsisLabel_->setToolTip(currentShowSynopsisLabel_->toolTip());
+        fullscreenCurrentShowSynopsisLabel_->setToolTip(currentShowOverlayToolTip_);
         fullscreenCurrentShowSynopsisLabel_->setVisible(!synopsis.isEmpty());
     }
 }
@@ -10104,7 +10475,7 @@ void MainWindow::refreshQuickButtons()
         if (i < favorites_.size()) {
             const QString channel = favorites_.at(i);
             button->setText(QString("%1 %2").arg(i + 1).arg(channel));
-            button->setToolTip(channel);
+            button->setToolTip(QString());
             button->setProperty("channelName", channel);
             button->setEnabled(scanProcess_ == nullptr || scanProcess_->state() == QProcess::NotRunning);
         } else {

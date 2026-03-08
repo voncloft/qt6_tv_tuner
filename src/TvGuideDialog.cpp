@@ -845,6 +845,14 @@ void TvGuideDialog::updateSearchResults()
         return;
     }
 
+    SearchResult selectedResult;
+    bool hadSelectedResult = false;
+    const int previousRow = showSearchResultsList_->currentRow();
+    if (previousRow >= 0 && previousRow < searchResults_.size()) {
+        selectedResult = searchResults_.at(previousRow);
+        hadSelectedResult = true;
+    }
+
     searchResults_.clear();
     showSearchResultsList_->clear();
 
@@ -897,6 +905,7 @@ void TvGuideDialog::updateSearchResults()
     });
 
     searchResults_ = matchedResults;
+    int restoredRow = -1;
     for (const SearchResult &result : searchResults_) {
         const GuideEntryDisplayParts parts = displayPartsForEntry(result.entry);
         const QString ratedTitle = formatRatedShowTitle(parts.title, favoriteShowRatings_);
@@ -913,6 +922,13 @@ void TvGuideDialog::updateSearchResults()
             lines << "Synopsis: " + parts.synopsisBody;
         }
         showSearchResultsList_->addItem(lines.join('\n'));
+
+        if (restoredRow < 0
+            && hadSelectedResult
+            && result.channelName.trimmed() == selectedResult.channelName.trimmed()
+            && guideEntriesMatch(result.entry, selectedResult.entry)) {
+            restoredRow = showSearchResultsList_->count() - 1;
+        }
     }
 
     if (searchResults_.isEmpty()) {
@@ -921,6 +937,10 @@ void TvGuideDialog::updateSearchResults()
         showSearchSummaryLabel_->setText(QString("%1 matching guide entr%2 found.")
                                              .arg(searchResults_.size())
                                              .arg(searchResults_.size() == 1 ? "y" : "ies"));
+    }
+
+    if (restoredRow >= 0) {
+        showSearchResultsList_->setCurrentRow(restoredRow);
     }
 
     updateSearchActionState();
