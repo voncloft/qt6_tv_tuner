@@ -6217,8 +6217,11 @@ void MainWindow::loadTestingBugItems()
         const QJsonObject object = value.toObject();
         addTestingBugItemEntry(object.value("text").toString(), object.value("checked").toBool(false));
     }
+    if (testingBugItemsList_->count() == 1) {
+        testingBugItemsList_->setCurrentRow(0);
+    }
     if (removeTestingBugItemButton_ != nullptr) {
-        removeTestingBugItemButton_->setEnabled(false);
+        removeTestingBugItemButton_->setEnabled(testingBugItemsList_->count() == 1);
     }
 }
 
@@ -6272,6 +6275,12 @@ bool MainWindow::addTestingBugItemEntry(const QString &text, bool checked)
     auto *item = new QListWidgetItem(trimmedText, testingBugItemsList_);
     item->setFlags(item->flags() | Qt::ItemIsUserCheckable | Qt::ItemIsEnabled | Qt::ItemIsSelectable);
     item->setCheckState(checked ? Qt::Checked : Qt::Unchecked);
+    if (testingBugItemsList_->count() == 1) {
+        testingBugItemsList_->setCurrentRow(0);
+        if (removeTestingBugItemButton_ != nullptr) {
+            removeTestingBugItemButton_->setEnabled(true);
+        }
+    }
     return true;
 }
 
@@ -6302,7 +6311,10 @@ void MainWindow::removeSelectedTestingBugItem()
         return;
     }
 
-    const int row = testingBugItemsList_->currentRow();
+    int row = testingBugItemsList_->currentRow();
+    if (row < 0 && testingBugItemsList_->count() == 1) {
+        row = 0;
+    }
     if (row < 0) {
         return;
     }
@@ -6310,6 +6322,10 @@ void MainWindow::removeSelectedTestingBugItem()
     delete testingBugItemsList_->takeItem(row);
     if (removeTestingBugItemButton_ != nullptr) {
         removeTestingBugItemButton_->setEnabled(false);
+        if (testingBugItemsList_->count() == 1) {
+            testingBugItemsList_->setCurrentRow(0);
+            removeTestingBugItemButton_->setEnabled(true);
+        }
     }
     saveTestingBugItems();
 }
