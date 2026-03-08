@@ -412,6 +412,85 @@ QString displayChannelNumber(const QString &channelNumber)
     return display;
 }
 
+struct GuideChannelOrderKey {
+    bool hasNumericPrefix{false};
+    int major{-1};
+    int minor{-1};
+    int tertiary{-1};
+    QString fallbackText;
+};
+
+GuideChannelOrderKey guideChannelOrderKey(const QString &channelName)
+{
+    GuideChannelOrderKey key;
+    key.fallbackText = channelName.trimmed().toCaseFolded();
+
+    const QString prefix = channelName.section(' ', 0, 0).trimmed();
+    static const QRegularExpression prefixPattern(QStringLiteral("^\\d+(?:[-:.]\\d+)*$"));
+    if (!prefixPattern.match(prefix).hasMatch()) {
+        return key;
+    }
+
+    const QStringList parts = normalizeChannelNumberHint(prefix).split(':', Qt::SkipEmptyParts);
+    if (parts.isEmpty()) {
+        return key;
+    }
+
+    bool ok = false;
+    key.major = parts.at(0).toInt(&ok);
+    if (!ok) {
+        return key;
+    }
+
+    key.hasNumericPrefix = true;
+    if (parts.size() >= 2) {
+        key.minor = parts.at(1).toInt(&ok);
+        if (!ok) {
+            key.minor = -1;
+        }
+    }
+    if (parts.size() >= 3) {
+        key.tertiary = parts.at(2).toInt(&ok);
+        if (!ok) {
+            key.tertiary = -1;
+        }
+    }
+
+    return key;
+}
+
+bool guideChannelOrderLess(const QString &left, const QString &right)
+{
+    const GuideChannelOrderKey leftKey = guideChannelOrderKey(left);
+    const GuideChannelOrderKey rightKey = guideChannelOrderKey(right);
+
+    if (leftKey.hasNumericPrefix != rightKey.hasNumericPrefix) {
+        return leftKey.hasNumericPrefix;
+    }
+    if (leftKey.hasNumericPrefix) {
+        if (leftKey.major != rightKey.major) {
+            return leftKey.major < rightKey.major;
+        }
+        if (leftKey.minor != rightKey.minor) {
+            return leftKey.minor < rightKey.minor;
+        }
+        if (leftKey.tertiary != rightKey.tertiary) {
+            return leftKey.tertiary < rightKey.tertiary;
+        }
+    }
+
+    const int fallbackCompare = QString::compare(leftKey.fallbackText, rightKey.fallbackText, Qt::CaseInsensitive);
+    if (fallbackCompare != 0) {
+        return fallbackCompare < 0;
+    }
+    return left < right;
+}
+
+void sortGuideChannelOrder(QStringList &channelOrder)
+{
+    std::sort(channelOrder.begin(), channelOrder.end(), guideChannelOrderLess);
+}
+
 QString channelNameFromZapLine(const QString &line)
 {
     const QString normalizedLine = normalizeZapLine(line).trimmed();
@@ -5578,6 +5657,7 @@ bool MainWindow::ensureSchedulesDirectJson(bool allowCachedExport,
             channelOrder.append(channel.name);
         }
     }
+    sortGuideChannelOrder(channelOrder);
 
     QDateTime windowStartUtc = nowUtc;
     windowStartUtc = windowStartUtc.addSecs(-windowStartUtc.time().second());
@@ -5765,8 +5845,10 @@ bool MainWindow::applySchedulesDirectGuideFallback(QHash<QString, QList<TvGuideE
     }
 
     const QJsonObject rootObject = document.object();
+    const QVector<SchedulesDirectChannelPayload> sdChannels =
+        parseSchedulesDirectExportChannels(rootObject);
     const QJsonObject embeddedEntriesObject = rootObject.value("entriesByChannel").toObject();
-    if (!embeddedEntriesObject.isEmpty()) {
+    if (sdChannels.isEmpty() && !embeddedEntriesObject.isEmpty()) {
         int importedEntries = 0;
         for (auto it = embeddedEntriesObject.begin(); it != embeddedEntriesObject.end(); ++it) {
             const QString channelName = it.key().trimmed();
@@ -5808,8 +5890,6 @@ bool MainWindow::applySchedulesDirectGuideFallback(QHash<QString, QList<TvGuideE
         return false;
     }
 
-    const QVector<SchedulesDirectChannelPayload> sdChannels =
-        parseSchedulesDirectExportChannels(rootObject);
     if (sdChannels.isEmpty()) {
         appendLog(QString("guide-sd: %1 did not contain OTA schedule entries.").arg(exportPath));
         return false;
@@ -5879,6 +5959,14 @@ bool MainWindow::applySchedulesDirectGuideFallback(QHash<QString, QList<TvGuideE
                 uniqueRfMinorMatch = &candidate;
             }
             matchedChannel = uniqueRfMinorMatch;
+        }
+
+        const bool hasSpecificVirtualMinor = hint.virtualMinor > 0;
+        if (matchedChannel == nullptr && hasSpecificVirtualMinor) {
+            appendUnique(unmatchedChannels, localName);
+            appendLog(QString("guide-sd: no exact subchannel match for %1; skipping loose fallback mapping.")
+                          .arg(localName));
+            continue;
         }
 
         if (matchedChannel == nullptr && hint.rfChannel > 0) {
@@ -8213,6 +8301,7 @@ bool MainWindow::refreshGuideData(bool interactive, bool updateDialog)
             channelOrder.append(channel.name);
         }
     }
+    sortGuideChannelOrder(channelOrder);
 
     const bool livePlaybackActive = zapProcess_ != nullptr
                                     && zapProcess_->state() != QProcess::NotRunning
@@ -8834,13 +8923,28 @@ bool MainWindow::refreshGuideDataFromSchedulesDirect(bool interactive, bool upda
             }
         }
     }
+    sortGuideChannelOrder(channelOrder);
 
     const QDateTime nowUtc = QDateTime::currentDateTimeUtc();
     const int retentionHours = guideCacheRetentionHoursValue(guideCacheRetentionSpin_);
     QDateTime latestEndUtc = nowUtc.addSecs(6 * 3600);
     QHash<QString, QList<TvGuideEntry>> entriesByChannel;
+    const bool hasRawSchedulesDirectLineups = !root.value("lineups").toArray().isEmpty();
     const QJsonObject entriesObject = root.value("entriesByChannel").toObject();
-    if (!entriesObject.isEmpty()) {
+    if (hasRawSchedulesDirectLineups) {
+        QStringList importedChannels;
+        QStringList unmatchedChannels;
+        QStringList skippedChannels;
+        int importedEntryCount = 0;
+        applySchedulesDirectGuideFallback(entriesByChannel,
+                                          retentionHours,
+                                          nowUtc,
+                                          &latestEndUtc,
+                                          &importedChannels,
+                                          &unmatchedChannels,
+                                          &skippedChannels,
+                                          &importedEntryCount);
+    } else if (!entriesObject.isEmpty()) {
         for (auto it = entriesObject.begin(); it != entriesObject.end(); ++it) {
             entriesByChannel.insert(it.key(),
                                     cleanGuideEntries(guideEntriesFromJsonArray(it.value().toArray()),
@@ -8982,7 +9086,7 @@ bool MainWindow::loadGuideCacheFile()
                                                               lastGuideSlotCount_);
     const QJsonObject root = document.object();
     const QDateTime nowUtc = QDateTime::currentDateTimeUtc();
-    const QStringList storedChannelOrder = [&root]() {
+    QStringList storedChannelOrder = [&root]() {
         QStringList order;
         for (const QJsonValue &value : root.value("channelOrder").toArray()) {
             const QString channelName = value.toString().trimmed();
@@ -8992,6 +9096,7 @@ bool MainWindow::loadGuideCacheFile()
         }
         return order;
     }();
+    sortGuideChannelOrder(storedChannelOrder);
 
     QHash<QString, QList<TvGuideEntry>> loadedEntries;
     const QJsonObject entriesObject = root.value("entriesByChannel").toObject();
