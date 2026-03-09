@@ -404,12 +404,81 @@ QString normalizeChannelNumberHint(const QString &channelNumber)
 
 QString displayChannelNumber(const QString &channelNumber)
 {
-    QString display = normalizeChannelNumberHint(channelNumber);
-    if (display.isEmpty()) {
+    const QString normalized = normalizeChannelNumberHint(channelNumber);
+    if (normalized.isEmpty()) {
         return {};
     }
-    display.replace(':', '-');
-    return display;
+
+    const QStringList parts = normalized.split(':', Qt::SkipEmptyParts);
+    if (parts.isEmpty()) {
+        return {};
+    }
+
+    QStringList displayParts;
+    displayParts.reserve(parts.size());
+    for (const QString &part : parts) {
+        bool ok = false;
+        const int value = part.trimmed().toInt(&ok);
+        if (!ok || value < 0) {
+            displayParts.append(part.trimmed());
+            continue;
+        }
+
+        const QString digits = QString::number(value);
+        displayParts.append(digits.rightJustified(std::max(3, static_cast<int>(digits.size())), QChar('0')));
+    }
+    return displayParts.join('-');
+}
+
+QString normalizeDisplayedChannelLabel(const QString &channelLabel)
+{
+    const QString trimmedLabel = channelLabel.trimmed();
+    if (trimmedLabel.isEmpty()) {
+        return {};
+    }
+
+    const int firstSpace = trimmedLabel.indexOf(' ');
+    const QString prefix = (firstSpace < 0 ? trimmedLabel : trimmedLabel.left(firstSpace)).trimmed();
+    static const QRegularExpression prefixPattern(QStringLiteral("^\\d+(?:[-:.]\\d+)*$"));
+    if (!prefixPattern.match(prefix).hasMatch()) {
+        return trimmedLabel;
+    }
+
+    const QString displayPrefix = displayChannelNumber(prefix);
+    if (displayPrefix.isEmpty()) {
+        return trimmedLabel;
+    }
+
+    if (firstSpace < 0) {
+        return displayPrefix;
+    }
+
+    const QString suffix = trimmedLabel.mid(firstSpace + 1).trimmed();
+    return suffix.isEmpty() ? displayPrefix : QString("%1 %2").arg(displayPrefix, suffix);
+}
+
+bool channelDisplayLabelsEqual(const QString &left, const QString &right)
+{
+    return normalizeDisplayedChannelLabel(left).compare(normalizeDisplayedChannelLabel(right), Qt::CaseInsensitive) == 0;
+}
+
+bool channelDisplayListContains(const QStringList &channels, const QString &channelName)
+{
+    for (const QString &existing : channels) {
+        if (channelDisplayLabelsEqual(existing, channelName)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void removeChannelDisplayLabel(QStringList &channels, const QString &channelName)
+{
+    for (int index = channels.size() - 1; index >= 0; --index) {
+        if (channelDisplayLabelsEqual(channels.at(index), channelName)) {
+            channels.removeAt(index);
+        }
+    }
 }
 
 struct GuideChannelOrderKey {
@@ -896,7 +965,7 @@ bool guideEntryMatchesScheduledSwitch(const QString &channelName,
 {
     const TvGuideScheduledSwitch normalizedScheduled = normalizedScheduledSwitch(scheduledSwitch);
     const TvGuideScheduledSwitch normalizedCandidate = scheduledSwitchFromGuideEntry(channelName, entry);
-    return normalizedScheduled.channelName == normalizedCandidate.channelName
+    return channelDisplayLabelsEqual(normalizedScheduled.channelName, normalizedCandidate.channelName)
            && normalizedScheduled.startUtc == normalizedCandidate.startUtc
            && normalizedScheduled.endUtc == normalizedCandidate.endUtc
            && normalizedScheduled.title == normalizedCandidate.title;
@@ -916,7 +985,7 @@ QDateTime scheduledSwitchMinuteBoundaryUtc(const QDateTime &dateTime)
 TvGuideScheduledSwitch normalizedScheduledSwitch(const TvGuideScheduledSwitch &scheduledSwitch)
 {
     TvGuideScheduledSwitch normalized = scheduledSwitch;
-    normalized.channelName = normalized.channelName.trimmed();
+    normalized.channelName = normalizeDisplayedChannelLabel(normalized.channelName);
     normalized.title = normalized.title.trimmed();
     normalized.episode = normalized.episode.trimmed();
     normalized.synopsis = normalized.synopsis.trimmed();
@@ -1467,8 +1536,8 @@ QStringList normalizedFavorites(const QStringList &favorites, int maxCount = -1)
 {
     QStringList normalized;
     for (const QString &favorite : favorites) {
-        const QString trimmedFavorite = favorite.trimmed();
-        if (trimmedFavorite.isEmpty() || normalized.contains(trimmedFavorite)) {
+        const QString trimmedFavorite = normalizeDisplayedChannelLabel(favorite);
+        if (trimmedFavorite.isEmpty() || channelDisplayListContains(normalized, trimmedFavorite)) {
             continue;
         }
         normalized.append(trimmedFavorite);
@@ -1495,7 +1564,7 @@ QStringList favoriteCandidatesFromTable(const QTableWidget *channelsTable, const
 
         const QString channelName = item->text().trimmed();
         if (channelName.isEmpty()
-            || normalizedExistingFavorites.contains(channelName)
+            || channelDisplayListContains(normalizedExistingFavorites, channelName)
             || candidates.contains(channelName)) {
             continue;
         }
@@ -6917,7 +6986,7 @@ void MainWindow::processScheduledSwitches()
         return;
     }
 
-    if (currentChannelName_ == scheduledSwitch.channelName) {
+    if (channelDisplayLabelsEqual(currentChannelName_, scheduledSwitch.channelName)) {
         appendLog(QString("schedule: already tuned for %1; removing completed switch.")
                       .arg(scheduledSwitchLabel(scheduledSwitch)));
         showTransientStatusBarMessage(QString("Scheduled switch already satisfied: %1")
@@ -8086,7 +8155,7 @@ QString MainWindow::selectedChannelLineFromTable() const
 
 QString MainWindow::firstChannelLineForName(const QString &channelName) const
 {
-    const QString trimmedChannelName = channelName.trimmed();
+    const QString trimmedChannelName = normalizeDisplayedChannelLabel(channelName);
     if (trimmedChannelName.isEmpty()) {
         return {};
     }
@@ -8094,8 +8163,10 @@ QString MainWindow::firstChannelLineForName(const QString &channelName) const
     for (const QString &line : channelLines_) {
         const QString normalizedLine = normalizeZapLine(line).trimmed();
         const QString baseName = channelNameFromZapLine(normalizedLine).trimmed();
-        const QString displayLabel = channelDisplayLabelForLine(normalizedLine, &xspfNumberByTuneKey_).trimmed();
-        if (trimmedChannelName == baseName || trimmedChannelName == displayLabel) {
+        const QString displayLabel = normalizeDisplayedChannelLabel(
+            channelDisplayLabelForLine(normalizedLine, &xspfNumberByTuneKey_).trimmed());
+        if (channelDisplayLabelsEqual(trimmedChannelName, baseName)
+            || channelDisplayLabelsEqual(trimmedChannelName, displayLabel)) {
             return normalizedLine;
         }
     }
@@ -8107,8 +8178,10 @@ QString MainWindow::firstChannelLineForName(const QString &channelName) const
     while (!file.atEnd()) {
         const QString normalizedLine = normalizeZapLine(QString::fromUtf8(file.readLine())).trimmed();
         const QString baseName = channelNameFromZapLine(normalizedLine).trimmed();
-        const QString displayLabel = channelDisplayLabelForLine(normalizedLine, &xspfNumberByTuneKey_).trimmed();
-        if (trimmedChannelName == baseName || trimmedChannelName == displayLabel) {
+        const QString displayLabel = normalizeDisplayedChannelLabel(
+            channelDisplayLabelForLine(normalizedLine, &xspfNumberByTuneKey_).trimmed());
+        if (channelDisplayLabelsEqual(trimmedChannelName, baseName)
+            || channelDisplayLabelsEqual(trimmedChannelName, displayLabel)) {
             return normalizedLine;
         }
     }
@@ -8165,16 +8238,19 @@ QString MainWindow::programIdForChannel(const QString &channelName) const
         return {};
     }
 
-    const QString trimmedChannelName = channelName.trimmed();
-    if (xspfProgramByChannel_.contains(trimmedChannelName)) {
-        return xspfProgramByChannel_.value(trimmedChannelName);
+    const QString trimmedChannelName = normalizeDisplayedChannelLabel(channelName);
+    for (auto it = xspfProgramByChannel_.cbegin(); it != xspfProgramByChannel_.cend(); ++it) {
+        if (channelDisplayLabelsEqual(it.key(), trimmedChannelName)) {
+            return it.value();
+        }
     }
 
     for (const QString &line : channelLines_) {
         const QString normalizedLine = normalizeZapLine(line).trimmed();
         const QString baseName = channelNameFromZapLine(normalizedLine);
         const QString displayLabel = channelDisplayLabelForLine(normalizedLine, &xspfNumberByTuneKey_);
-        if (trimmedChannelName == baseName || trimmedChannelName == displayLabel) {
+        if (channelDisplayLabelsEqual(trimmedChannelName, baseName)
+            || channelDisplayLabelsEqual(trimmedChannelName, displayLabel)) {
             const QString programId = programIdFromZapLine(normalizedLine);
             if (!programId.isEmpty()) {
                 return programId;
@@ -8190,7 +8266,8 @@ QString MainWindow::programIdForChannel(const QString &channelName) const
         const QString normalizedLine = normalizeZapLine(QString::fromUtf8(file.readLine())).trimmed();
         const QString baseName = channelNameFromZapLine(normalizedLine);
         const QString displayLabel = channelDisplayLabelForLine(normalizedLine, &xspfNumberByTuneKey_);
-        if (trimmedChannelName == baseName || trimmedChannelName == displayLabel) {
+        if (channelDisplayLabelsEqual(trimmedChannelName, baseName)
+            || channelDisplayLabelsEqual(trimmedChannelName, displayLabel)) {
             const QString programId = programIdFromZapLine(normalizedLine);
             if (!programId.isEmpty()) {
                 return programId;
@@ -8922,7 +8999,7 @@ bool MainWindow::refreshGuideDataFromSchedulesDirect(bool interactive, bool upda
     QStringList channelOrder;
     const QJsonArray channelOrderArray = root.value("channelOrder").toArray();
     for (const QJsonValue &value : channelOrderArray) {
-        const QString channelName = value.toString().trimmed();
+        const QString channelName = normalizeDisplayedChannelLabel(value.toString());
         if (!channelName.isEmpty() && !channelOrder.contains(channelName)) {
             channelOrder.append(channelName);
         }
@@ -8960,7 +9037,7 @@ bool MainWindow::refreshGuideDataFromSchedulesDirect(bool interactive, bool upda
                                           &importedEntryCount);
     } else if (!entriesObject.isEmpty()) {
         for (auto it = entriesObject.begin(); it != entriesObject.end(); ++it) {
-            entriesByChannel.insert(it.key(),
+            entriesByChannel.insert(normalizeDisplayedChannelLabel(it.key()),
                                     cleanGuideEntries(guideEntriesFromJsonArray(it.value().toArray()),
                                                       nowUtc,
                                                       retentionHours,
@@ -9103,7 +9180,7 @@ bool MainWindow::loadGuideCacheFile()
     QStringList storedChannelOrder = [&root]() {
         QStringList order;
         for (const QJsonValue &value : root.value("channelOrder").toArray()) {
-            const QString channelName = value.toString().trimmed();
+            const QString channelName = normalizeDisplayedChannelLabel(value.toString());
             if (!channelName.isEmpty() && !order.contains(channelName)) {
                 order.append(channelName);
             }
@@ -9118,7 +9195,7 @@ bool MainWindow::loadGuideCacheFile()
     for (auto it = entriesObject.begin(); it != entriesObject.end(); ++it) {
         const QList<TvGuideEntry> cleaned =
             cleanGuideEntries(guideEntriesFromJsonArray(it.value().toArray()), nowUtc, retentionHours);
-        loadedEntries.insert(it.key(), cleaned);
+        loadedEntries.insert(normalizeDisplayedChannelLabel(it.key()), cleaned);
     }
 
     guideEntriesCache_ = loadedEntries;
@@ -9787,9 +9864,9 @@ void MainWindow::addSelectedFavorite()
     }
 
     QString channelName;
-    if (!selectedChannelName.isEmpty() && !favorites_.contains(selectedChannelName)) {
+    if (!selectedChannelName.isEmpty() && !channelDisplayListContains(favorites_, selectedChannelName)) {
         channelName = selectedChannelName;
-    } else if (!currentWatchedChannel.isEmpty() && !favorites_.contains(currentWatchedChannel)) {
+    } else if (!currentWatchedChannel.isEmpty() && !channelDisplayListContains(favorites_, currentWatchedChannel)) {
         channelName = currentWatchedChannel;
     } else {
         const QStringList candidates = favoriteCandidatesFromTable(channelsTable_, favorites_);
@@ -9807,7 +9884,7 @@ void MainWindow::addSelectedFavorite()
         channelName = pickedChannel.trimmed();
     }
 
-    if (channelName.isEmpty() || favorites_.contains(channelName)) {
+    if (channelName.isEmpty() || channelDisplayListContains(favorites_, channelName)) {
         showInformationDialog("Already a favorite", QString("%1 is already in favorites.").arg(channelName));
         return;
     }
@@ -9837,11 +9914,11 @@ void MainWindow::removeSelectedFavorite()
         return;
     }
 
-    if (!favorites_.contains(name)) {
+    if (!channelDisplayListContains(favorites_, name)) {
         return;
     }
 
-    favorites_.removeAll(name);
+    removeChannelDisplayLabel(favorites_, name);
     saveFavorites();
     refreshQuickButtons();
 }
