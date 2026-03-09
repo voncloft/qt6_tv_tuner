@@ -6943,34 +6943,18 @@ bool MainWindow::resolveScheduledSwitchChoices(const QList<TvGuideScheduledSwitc
 
     QList<ScheduledSwitchChoiceOption> choices;
     QSet<int> relevantExistingIndexSet;
-    for (int index = 0; index < scheduledSwitches_.size(); ++index) {
-        const TvGuideScheduledSwitch &existing = scheduledSwitches_.at(index);
-        bool relevant = false;
-        for (const TvGuideScheduledSwitch &candidate : uniqueCandidates) {
-            if (scheduledSwitchesMatch(existing, candidate) || scheduledSwitchesOverlap(existing, candidate)) {
-                relevant = true;
-                break;
-            }
-        }
-        if (!relevant) {
-            continue;
-        }
-
-        relevantExistingIndexSet.insert(index);
-        choices.append(ScheduledSwitchChoiceOption{existing, true, index});
-    }
-
     for (const TvGuideScheduledSwitch &candidate : uniqueCandidates) {
-        bool represented = false;
-        for (const ScheduledSwitchChoiceOption &choice : choices) {
-            if (scheduledSwitchesMatch(choice.scheduledSwitch, candidate)) {
-                represented = true;
-                break;
+        int existingIndex = -1;
+        for (int index = 0; index < scheduledSwitches_.size(); ++index) {
+            if (!scheduledSwitchesMatch(scheduledSwitches_.at(index), candidate)) {
+                continue;
             }
+            existingIndex = index;
+            relevantExistingIndexSet.insert(index);
+            break;
         }
-        if (!represented) {
-            choices.append(ScheduledSwitchChoiceOption{candidate, false, -1});
-        }
+
+        choices.append(ScheduledSwitchChoiceOption{candidate, existingIndex >= 0, existingIndex});
     }
 
     if (choices.isEmpty()) {
