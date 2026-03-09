@@ -49,6 +49,7 @@
 #include <QPushButton>
 #include <QRegularExpression>
 #include <QSaveFile>
+#include <QScrollBar>
 #include <QSignalBlocker>
 #include <QSettings>
 #include <QSizePolicy>
@@ -106,6 +107,7 @@ constexpr auto kTestingBugItemsSetting = "testing/bugItems";
 constexpr auto kMutedSetting = "audio/muted";
 constexpr auto kAutoPictureInPictureSetting = "video/autoPictureInPicture";
 constexpr auto kHideStartupSwitchSummarySetting = "tvGuide/hideStartupSwitchSummary";
+constexpr auto kLogAutoScrollSetting = "logs/autoScroll";
 constexpr auto kGuideRefreshIntervalMinutesSetting = "tvGuide/refreshIntervalMinutes";
 constexpr auto kGuideRefreshWhenCacheRunsOutSetting = "tvGuide/refreshWhenCacheRunsOut";
 constexpr auto kGuideCacheRetentionHoursSetting = "tvGuide/cacheRetentionHours";
@@ -2812,6 +2814,8 @@ constexpr int kGuideLookupTotalMaxMs = 4000;
 constexpr int kGuideProbeIntervalMs = 350;
 constexpr int kGuideCapturePacketCount = 60000;
 constexpr int kGuideCachePollIntervalMs = 5000;
+constexpr int kVideoOnlyAudioRecoveryDelayMs = 12000;
+constexpr int kRecoveryAudioUnmuteStabilityMs = 2500;
 
 quint8 byteAt(const QByteArray &data, int index)
 {
@@ -3880,12 +3884,15 @@ MainWindow::MainWindow(QWidget *parent)
     guideCachePollTimer_ = new QTimer(this);
     scheduledSwitchTimer_ = new QTimer(this);
     fullscreenCursorHideTimer_ = new QTimer(this);
+    audioRecoveryUnmuteTimer_ = new QTimer(this);
     reconnectTimer_->setSingleShot(true);
     currentShowTimer_->setSingleShot(true);
     playbackAttachTimer_->setSingleShot(true);
     scheduledSwitchTimer_->setSingleShot(true);
     fullscreenCursorHideTimer_->setSingleShot(true);
     fullscreenCursorHideTimer_->setInterval(5000);
+    audioRecoveryUnmuteTimer_->setSingleShot(true);
+    audioRecoveryUnmuteTimer_->setInterval(kRecoveryAudioUnmuteStabilityMs);
 
     mediaPlayer_->setAudioOutput(audioOutput_);
     mediaPlayer_->setVideoOutput(videoWidget_);
@@ -3901,13 +3908,13 @@ MainWindow::MainWindow(QWidget *parent)
     dismissedAutoFavoriteCandidates_ = settings.value(kDismissedAutoFavoriteCandidatesSetting).toStringList();
     settings.remove(kLockedAutoFavoriteSelectionsSetting);
     settings.remove(kLockedScheduledSwitchesSetting);
-    audioOutput_->setVolume(savedMuted ? 0.0f : static_cast<float>(savedVolume) / 100.0f);
     volumeSlider_->setValue(savedVolume);
     if (muteButton_ != nullptr) {
         const QSignalBlocker blocker(muteButton_);
         muteButton_->setChecked(savedMuted);
         muteButton_->setText(savedMuted ? "Unmute" : "Mute");
     }
+    applyAudioOutputState();
     if (hideNoEitChannelsCheckBox_ != nullptr) {
         const QSignalBlocker blocker(hideNoEitChannelsCheckBox_);
         hideNoEitChannelsCheckBox_->setChecked(settings.value(kHideNoEitChannelsSetting, false).toBool());
@@ -3941,6 +3948,10 @@ MainWindow::MainWindow(QWidget *parent)
         const QSignalBlocker blocker(hideStartupSwitchSummaryCheckBox_);
         hideStartupSwitchSummaryCheckBox_->setChecked(
             settings.value(kHideStartupSwitchSummarySetting, false).toBool());
+    }
+    if (logAutoScrollCheckBox_ != nullptr) {
+        const QSignalBlocker blocker(logAutoScrollCheckBox_);
+        logAutoScrollCheckBox_->setChecked(settings.value(kLogAutoScrollSetting, true).toBool());
     }
     if (useSchedulesDirectGuideCheckBox_ != nullptr) {
         const QSignalBlocker blocker(useSchedulesDirectGuideCheckBox_);
@@ -4023,8 +4034,7 @@ MainWindow::MainWindow(QWidget *parent)
                     const QString lowerTrimmed = trimmed.toLower();
                     if (lowerTrimmed.contains("could not find codec parameters")
                         || lowerTrimmed.contains("could not write header")
-                        || lowerTrimmed.contains("sample rate not set")
-                        || lowerTrimmed.contains("invalid frame dimensions 0x0")) {
+                        || lowerTrimmed.contains("sample rate not set")) {
                         bridgeSawCodecParameterFailure_ = true;
                     }
                     appendLog("ffmpeg: " + trimmed);
@@ -4054,6 +4064,7 @@ MainWindow::MainWindow(QWidget *parent)
         appendLog(QString("player: playbackStateChanged=%1").arg(static_cast<int>(mediaPlayer_->playbackState())));
         playbackStatusLabel_->setText(playbackStatusText());
         syncFullscreenOverlayState();
+        refreshRecoveryAudioMuteGate();
     });
     connect(mediaPlayer_, &QMediaPlayer::errorChanged, this, [this]() {
         if (mediaPlayer_->error() != QMediaPlayer::NoError) {
@@ -4068,9 +4079,15 @@ MainWindow::MainWindow(QWidget *parent)
     });
     connect(mediaPlayer_, &QMediaPlayer::hasVideoChanged, this, [this](bool hasVideo) {
         appendLog(QString("player: hasVideoChanged=%1").arg(hasVideo ? "true" : "false"));
+        Q_UNUSED(hasVideo);
+        refreshRecoveryAudioMuteGate();
     });
     connect(mediaPlayer_, &QMediaPlayer::hasAudioChanged, this, [this](bool hasAudio) {
         appendLog(QString("player: hasAudioChanged=%1").arg(hasAudio ? "true" : "false"));
+        if (hasAudio && mediaPlayer_->hasVideo()) {
+            bridgeSawCodecParameterFailure_ = false;
+        }
+        refreshRecoveryAudioMuteGate();
     });
     connect(mediaPlayer_, &QMediaPlayer::bufferProgressChanged, this, [this](float progress) {
         appendLog(QString("player: bufferProgress=%1").arg(progress, 0, 'f', 3));
@@ -4083,6 +4100,19 @@ MainWindow::MainWindow(QWidget *parent)
         }
         appendLog("player: DVR ready signal timeout; attempting playback anyway.");
         startPlaybackFromDvr(pendingDvrPath_);
+    });
+    connect(audioRecoveryUnmuteTimer_, &QTimer::timeout, this, [this]() {
+        if (!recoveryAudioMuted_ || !isRecoveryAudioStable()) {
+            refreshRecoveryAudioMuteGate();
+            return;
+        }
+        clearRecoveryAudioMute();
+        muteRecoveryAfterAudioRebuildFailure_ = false;
+        const bool userMuted = muteButton_ != nullptr && muteButton_->isChecked();
+        appendLog(userMuted ? "player: rebuilt audio stabilized; recovery mute released but user mute remains enabled."
+                            : "player: rebuilt audio stabilized; unmuting recovered audio.");
+        setStatusBarStateMessage(userMuted ? "Recovered audio ready (user muted)"
+                                           : "Recovered audio restored");
     });
     connect(scheduledSwitchTimer_, &QTimer::timeout, this, &MainWindow::processScheduledSwitches);
     connect(fullscreenCursorHideTimer_, &QTimer::timeout, this, &MainWindow::hideFullscreenCursor);
@@ -4107,6 +4137,10 @@ MainWindow::MainWindow(QWidget *parent)
     });
     connect(volumeSlider_, &QSlider::valueChanged, this, &MainWindow::handleVolumeChanged);
     connect(muteButton_, &QPushButton::toggled, this, &MainWindow::handleMuteToggled);
+    connect(logAutoScrollCheckBox_, &QCheckBox::toggled, this, [](bool checked) {
+        QSettings settings("tv_tuner_gui", "watcher");
+        settings.setValue(kLogAutoScrollSetting, checked);
+    });
     connect(contentSplitter_, &QSplitter::splitterMoved, this, [this](int, int) {
         saveChannelSidebarSizing();
     });
@@ -4852,6 +4886,12 @@ void MainWindow::buildUi()
     logOutput_->setReadOnly(true);
     logOutput_->setMaximumBlockCount(4000);
     logOutput_->setPlaceholderText("w_scan2 and tuning output will appear here...");
+    auto *logControlsRow = new QHBoxLayout();
+    logAutoScrollCheckBox_ = new QCheckBox("Auto-scroll logs", logsPage);
+    logAutoScrollCheckBox_->setChecked(true);
+    logControlsRow->addWidget(logAutoScrollCheckBox_);
+    logControlsRow->addStretch();
+    logsLayout->addLayout(logControlsRow);
     logsLayout->addWidget(logOutput_);
 
     tvGuideDialog_ = new TvGuideDialog(tabs_);
@@ -8212,10 +8252,20 @@ void MainWindow::appendLog(const QString &line)
     const QString entry = QString("[%1] %2")
                               .arg(QDateTime::currentDateTime().toString("MM/dd/yyyy HH:mm:ss"), line);
 
+    QScrollBar *scrollBar = logOutput_->verticalScrollBar();
+    const int previousScrollValue = scrollBar != nullptr ? scrollBar->value() : 0;
+    const bool shouldAutoScroll = logAutoScrollCheckBox_ == nullptr || logAutoScrollCheckBox_->isChecked();
     logOutput_->appendPlainText(entry);
-    QTextCursor cursor = logOutput_->textCursor();
-    cursor.movePosition(QTextCursor::End);
-    logOutput_->setTextCursor(cursor);
+    if (shouldAutoScroll) {
+        QTextCursor cursor = logOutput_->textCursor();
+        cursor.movePosition(QTextCursor::End);
+        logOutput_->setTextCursor(cursor);
+        if (scrollBar != nullptr) {
+            scrollBar->setValue(scrollBar->maximum());
+        }
+    } else if (scrollBar != nullptr) {
+        scrollBar->setValue(previousScrollValue);
+    }
 
     if (!logFilePath_.isEmpty()) {
         QFile logFile(logFilePath_);
@@ -9744,6 +9794,15 @@ bool MainWindow::startWatchingChannel(const QString &channelName,
         resilientBridgeTried_ = false;
         useVideoOnlyBridgeMode_ = false;
         videoOnlyBridgeTried_ = false;
+        videoOnlyAudioRecoveryTried_ = false;
+        muteRecoveryAfterAudioRebuildFailure_ = false;
+        clearRecoveryAudioMute();
+    } else if (muteRecoveryAfterAudioRebuildFailure_) {
+        beginRecoveryAudioMute(useVideoOnlyBridgeMode_
+                                   ? "audio rebuild already failed once; keeping recovery muted during video-only fallback"
+                                   : "audio rebuild already failed once; retrying rebuilt audio while muted");
+    } else {
+        clearRecoveryAudioMute();
     }
 
     if (streamBridgeProcess_ != nullptr && streamBridgeProcess_->state() != QProcess::NotRunning) {
@@ -9855,7 +9914,10 @@ void MainWindow::stopWatching()
     resilientBridgeTried_ = false;
     useVideoOnlyBridgeMode_ = false;
     videoOnlyBridgeTried_ = false;
+    videoOnlyAudioRecoveryTried_ = false;
+    muteRecoveryAfterAudioRebuildFailure_ = false;
     bridgeSawCodecParameterFailure_ = false;
+    clearRecoveryAudioMute();
     currentChannelName_.clear();
     currentChannelLine_.clear();
     currentProgramId_.clear();
@@ -9984,8 +10046,10 @@ void MainWindow::startPlaybackFromDvr(const QString &dvrPath)
                    << "-dn"
                    << "-c:v" << "mpeg2video"
                    << "-q:v" << "3"
-                   << "-c:a" << "mp2"
-                   << "-b:a" << "192k"
+                   << "-c:a" << "aac"
+                   << "-b:a" << "160k"
+                   << "-ac" << "2"
+                   << "-ar" << "48000"
                    << "-mpegts_flags" << "+resend_headers+pat_pmt_at_frames"
                    << "-flush_packets" << "1"
                    << "-f" << "mpegts"
@@ -9994,9 +10058,10 @@ void MainWindow::startPlaybackFromDvr(const QString &dvrPath)
         ffmpegArgs << "-hide_banner"
                    << "-nostdin"
                    << "-loglevel" << "warning"
-                   << "-fflags" << "+genpts"
-                   << "-analyzeduration" << "2M"
-                   << "-probesize" << "2M"
+                   << "-fflags" << "+genpts+discardcorrupt"
+                   << "-err_detect" << "ignore_err"
+                   << "-analyzeduration" << "4M"
+                   << "-probesize" << "4M"
                    << "-f" << "mpegts"
                    << "-i" << dvrPath;
         if (!currentProgramId_.isEmpty()) {
@@ -10005,6 +10070,8 @@ void MainWindow::startPlaybackFromDvr(const QString &dvrPath)
             ffmpegArgs << "-map" << "0";
         }
         ffmpegArgs
+                   << "-sn"
+                   << "-dn"
                    << "-c" << "copy"
                    << "-mpegts_flags" << "+resend_headers+pat_pmt_at_frames"
                    << "-flush_packets" << "1"
@@ -10032,6 +10099,40 @@ void MainWindow::startPlaybackFromDvr(const QString &dvrPath)
                        liveUrl.toString(),
                        useVideoOnlyBridgeMode_ ? "video-only" : (useResilientBridgeMode_ ? "resilient" : "normal"),
                        currentProgramId_.isEmpty() ? "unknown" : currentProgramId_));
+    if (useResilientBridgeMode_) {
+        setStatusBarStateMessage(recoveryAudioMuted_ ? "Retrying rebuilt audio (muted)..."
+                                                     : "Recovering audio with rebuilt stream...");
+        appendLog(recoveryAudioMuted_ ? "player: rebuilt audio retry started with recovery mute enabled."
+                                      : "player: switching to rebuilt audio recovery mode.");
+    } else if (useVideoOnlyBridgeMode_) {
+        setStatusBarStateMessage(muteRecoveryAfterAudioRebuildFailure_
+                                     ? "Video-only recovery active; muted audio retry pending"
+                                     : "Video-only recovery active");
+    }
+    if (useVideoOnlyBridgeMode_ && !videoOnlyAudioRecoveryTried_) {
+        const int recoverySerial = playbackStartSerial_;
+        appendLog(QString("player: video-only bridge active; retrying audio-capable playback in %1 ms if picture stays up.")
+                      .arg(kVideoOnlyAudioRecoveryDelayMs));
+        QTimer::singleShot(kVideoOnlyAudioRecoveryDelayMs, this, [this, recoverySerial]() {
+            if (recoverySerial != playbackStartSerial_
+                || userStoppedWatching_
+                || currentChannelName_.isEmpty()
+                || !useVideoOnlyBridgeMode_
+                || videoOnlyAudioRecoveryTried_
+                || !mediaPlayer_->hasVideo()) {
+                return;
+            }
+            videoOnlyAudioRecoveryTried_ = true;
+            resilientBridgeTried_ = true;
+            useResilientBridgeMode_ = true;
+            useVideoOnlyBridgeMode_ = false;
+            bridgeSawCodecParameterFailure_ = false;
+            reconnectTimer_->stop();
+            reconnectAttemptCount_ = 0;
+            appendLog("player: video-only playback stayed stable; retrying resilient bridge to restore audio.");
+            startWatchingChannel(currentChannelName_, true, currentChannelLine_);
+        });
+    }
     mediaPlayer_->setAudioOutput(audioOutput_);
     currentShowTimer_->stop();
     if (applyCurrentShowStatusFromGuideCache()) {
@@ -10403,6 +10504,13 @@ void MainWindow::handleMediaStatusChanged(QMediaPlayer::MediaStatus status)
         }
         scheduleReconnect("Media stream became invalid");
     }
+    if (recoveryAudioMuted_) {
+        setStatusBarStateMessage(useVideoOnlyBridgeMode_ ? "Video-only recovery active; muted audio retry pending"
+                                                         : "Retrying rebuilt audio (muted)...");
+    } else if (useResilientBridgeMode_ && mediaPlayer_->playbackState() != QMediaPlayer::PlayingState) {
+        setStatusBarStateMessage("Recovering audio with rebuilt stream...");
+    }
+    refreshRecoveryAudioMuteGate();
 }
 
 void MainWindow::handlePlayerError(const QString &errorText)
@@ -10426,9 +10534,13 @@ bool MainWindow::tryDynamicBridgeFallback(const QString &reason)
     }
 
     const bool shouldTryVideoOnly =
-        bridgeSawCodecParameterFailure_
-        || reason.contains("Could not open file", Qt::CaseInsensitive)
-        || useResilientBridgeMode_;
+        useResilientBridgeMode_
+        && (bridgeSawCodecParameterFailure_
+            || reason.contains("Could not open file", Qt::CaseInsensitive));
+
+    if (useResilientBridgeMode_) {
+        armRecoveryAudioMute(reason);
+    }
 
     if (shouldTryVideoOnly && !videoOnlyBridgeTried_ && !useVideoOnlyBridgeMode_) {
         videoOnlyBridgeTried_ = true;
@@ -10436,12 +10548,14 @@ bool MainWindow::tryDynamicBridgeFallback(const QString &reason)
         useResilientBridgeMode_ = false;
         reconnectTimer_->stop();
         reconnectAttemptCount_ = 0;
-        appendLog(QString("player: %1; retrying with video-only bridge mode").arg(reason));
+        appendLog(QString("player: %1; rebuilt audio recovery failed, switching to temporary video-only fallback.")
+                      .arg(reason));
+        setStatusBarStateMessage("Rebuilt audio failed; using temporary video-only recovery...");
         startWatchingChannel(currentChannelName_, true, currentChannelLine_);
         return true;
     }
 
-    if (resilientBridgeTried_ || useResilientBridgeMode_) {
+    if (useVideoOnlyBridgeMode_ || resilientBridgeTried_ || useResilientBridgeMode_) {
         return false;
     }
     resilientBridgeTried_ = true;
@@ -10449,7 +10563,8 @@ bool MainWindow::tryDynamicBridgeFallback(const QString &reason)
     useVideoOnlyBridgeMode_ = false;
     reconnectTimer_->stop();
     reconnectAttemptCount_ = 0;
-    appendLog(QString("player: %1; retrying with resilient bridge mode").arg(reason));
+    appendLog(QString("player: %1; switching to rebuilt audio recovery mode (lower audio quality).").arg(reason));
+    setStatusBarStateMessage("Recovering audio with rebuilt stream...");
     startWatchingChannel(currentChannelName_, true, currentChannelLine_);
     return true;
 }
@@ -10480,12 +10595,17 @@ void MainWindow::scheduleReconnect(const QString &reason)
 
     ++reconnectAttemptCount_;
     const int delayMs = 800 + (reconnectAttemptCount_ * 900);
+    if (muteRecoveryAfterAudioRebuildFailure_) {
+        beginRecoveryAudioMute(QString("%1; waiting for muted recovery retry").arg(reason));
+    }
     appendLog(QString("Reconnect attempt %1/%2 in %3 ms (%4)")
                   .arg(reconnectAttemptCount_)
                   .arg(maxReconnectAttempts_)
                   .arg(delayMs)
                   .arg(reason));
-    setStatusBarStateMessage("Reconnecting...");
+    setStatusBarStateMessage(muteRecoveryAfterAudioRebuildFailure_
+                                 ? "Waiting for muted rebuilt-audio retry..."
+                                 : "Reconnecting...");
     reconnectTimer_->start(delayMs);
 }
 
@@ -10497,13 +10617,97 @@ void MainWindow::triggerReconnect()
     startWatchingChannel(currentChannelName_, true, currentChannelLine_);
 }
 
-void MainWindow::handleMuteToggled(bool checked)
+void MainWindow::applyAudioOutputState()
 {
-    if (checked) {
+    if (audioOutput_ == nullptr || volumeSlider_ == nullptr) {
+        return;
+    }
+    const bool userMuted = muteButton_ != nullptr && muteButton_->isChecked();
+    if (userMuted || recoveryAudioMuted_) {
         audioOutput_->setVolume(0.0f);
     } else {
         audioOutput_->setVolume(static_cast<float>(volumeSlider_->value()) / 100.0f);
     }
+}
+
+void MainWindow::armRecoveryAudioMute(const QString &reason)
+{
+    if (!muteRecoveryAfterAudioRebuildFailure_) {
+        muteRecoveryAfterAudioRebuildFailure_ = true;
+        appendLog(QString("player: %1; first rebuilt-audio attempt failed, future audio recovery will stay muted until stable.")
+                      .arg(reason));
+        setStatusBarStateMessage("Rebuilt audio failed; future audio retries will stay muted until stable.");
+    }
+    beginRecoveryAudioMute(QString("%1; holding audio muted for the next rebuilt-audio retry").arg(reason));
+}
+
+void MainWindow::beginRecoveryAudioMute(const QString &reason)
+{
+    if (audioRecoveryUnmuteTimer_ != nullptr) {
+        audioRecoveryUnmuteTimer_->stop();
+    }
+    const bool wasMuted = recoveryAudioMuted_;
+    recoveryAudioMuted_ = true;
+    applyAudioOutputState();
+    if (!wasMuted) {
+        appendLog(QString("player: recovery audio muted (%1)").arg(reason));
+    }
+    if (!currentChannelName_.isEmpty()) {
+        setStatusBarStateMessage(useVideoOnlyBridgeMode_ ? "Video-only recovery active; muted audio retry pending"
+                                                         : "Retrying rebuilt audio (muted)...");
+    }
+}
+
+void MainWindow::clearRecoveryAudioMute()
+{
+    if (audioRecoveryUnmuteTimer_ != nullptr) {
+        audioRecoveryUnmuteTimer_->stop();
+    }
+    if (!recoveryAudioMuted_) {
+        return;
+    }
+    recoveryAudioMuted_ = false;
+    applyAudioOutputState();
+}
+
+bool MainWindow::isRecoveryAudioStable() const
+{
+    return recoveryAudioMuted_
+           && !userStoppedWatching_
+           && !currentChannelName_.isEmpty()
+           && !useVideoOnlyBridgeMode_
+           && mediaPlayer_ != nullptr
+           && mediaPlayer_->playbackState() == QMediaPlayer::PlayingState
+           && mediaPlayer_->hasAudio()
+           && mediaPlayer_->hasVideo();
+}
+
+void MainWindow::refreshRecoveryAudioMuteGate()
+{
+    if (audioRecoveryUnmuteTimer_ == nullptr || !recoveryAudioMuted_) {
+        return;
+    }
+
+    if (isRecoveryAudioStable()) {
+        if (!audioRecoveryUnmuteTimer_->isActive()) {
+            appendLog(QString("player: rebuilt audio looks stable; waiting %1 ms before unmuting.")
+                          .arg(kRecoveryAudioUnmuteStabilityMs));
+            setStatusBarStateMessage("Recovered audio stable; unmuting soon...");
+            audioRecoveryUnmuteTimer_->start();
+        }
+        return;
+    }
+
+    audioRecoveryUnmuteTimer_->stop();
+    if (!currentChannelName_.isEmpty()) {
+        setStatusBarStateMessage(useVideoOnlyBridgeMode_ ? "Video-only recovery active; muted audio retry pending"
+                                                         : "Retrying rebuilt audio (muted)...");
+    }
+}
+
+void MainWindow::handleMuteToggled(bool checked)
+{
+    applyAudioOutputState();
     QSettings settings("tv_tuner_gui", "watcher");
     settings.setValue(kMutedSetting, checked);
     muteButton_->setText(checked ? "Unmute" : "Mute");
@@ -10512,11 +10716,7 @@ void MainWindow::handleMuteToggled(bool checked)
 
 void MainWindow::handleVolumeChanged(int value)
 {
-    if (muteButton_ != nullptr && muteButton_->isChecked()) {
-        audioOutput_->setVolume(0.0f);
-    } else {
-        audioOutput_->setVolume(static_cast<float>(value) / 100.0f);
-    }
+    applyAudioOutputState();
     QSettings settings("tv_tuner_gui", "watcher");
     settings.setValue("volume_percent", value);
     syncFullscreenOverlayState();

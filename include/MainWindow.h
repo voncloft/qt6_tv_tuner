@@ -118,6 +118,12 @@ private:
     void scheduleReconnect(const QString &reason);
     bool tryDynamicBridgeFallback(const QString &reason);
     QString playbackStatusText() const;
+    void applyAudioOutputState();
+    void armRecoveryAudioMute(const QString &reason);
+    void beginRecoveryAudioMute(const QString &reason);
+    void clearRecoveryAudioMute();
+    void refreshRecoveryAudioMuteGate();
+    bool isRecoveryAudioStable() const;
     void startSignalMonitor(int adapter, int frontend);
     void stopSignalMonitor();
     void handleSignalMonitorOutput(const QString &chunk);
@@ -267,6 +273,7 @@ private:
     QCheckBox *hideStartupSwitchSummaryCheckBox_{};
     QCheckBox *useSchedulesDirectGuideCheckBox_{};
     QCheckBox *refreshGuideWhenCacheRunsOutCheckBox_{};
+    QCheckBox *logAutoScrollCheckBox_{};
     QComboBox *guideRefreshIntervalCombo_{};
     QComboBox *guideCacheRetentionCombo_{};
     QLineEdit *favoriteShowRuleEdit_{};
@@ -334,6 +341,9 @@ private:
     bool resilientBridgeTried_{false};
     bool useVideoOnlyBridgeMode_{false};
     bool videoOnlyBridgeTried_{false};
+    bool videoOnlyAudioRecoveryTried_{false};
+    bool muteRecoveryAfterAudioRebuildFailure_{false};
+    bool recoveryAudioMuted_{false};
     bool bridgeSawCodecParameterFailure_{false};
     bool waitingForDvrReady_{false};
     bool guideRefreshInProgress_{false};
@@ -349,6 +359,7 @@ private:
     QTimer *guideCachePollTimer_{};
     QTimer *scheduledSwitchTimer_{};
     QTimer *fullscreenCursorHideTimer_{};
+    QTimer *audioRecoveryUnmuteTimer_{};
     TvGuideDialog *tvGuideDialog_{};
     int currentShowLookupSerial_{0};
     int playbackStartSerial_{0};
