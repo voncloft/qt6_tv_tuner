@@ -1,5 +1,6 @@
 #pragma once
 
+#include "DisplayTheme.h"
 #include "TvGuideDialog.h"
 
 #include <QByteArray>
@@ -12,6 +13,7 @@
 
 class QComboBox;
 class QDialog;
+class QFontComboBox;
 class QLineEdit;
 class QPushButton;
 class QPlainTextEdit;
@@ -88,9 +90,30 @@ private slots:
     void removeSelectedScheduledSwitch();
 
 private:
+    struct DisplayFontEditorWidgets {
+        QFontComboBox *family{};
+        QSpinBox *size{};
+        QCheckBox *bold{};
+        QCheckBox *italic{};
+        QCheckBox *underline{};
+    };
+
     static constexpr int kQuickFavoriteCount = 10;
 
     void buildUi();
+    void applyDisplayTheme(bool persistCurrentTheme);
+    void refreshDisplayThemeControls();
+    void refreshSavedDisplayThemeList(const QString &preferredSelection = QString());
+    void chooseDisplayThemeColor(const QString &roleKey);
+    void handleDisplayThemeFontEdited(const QString &roleKey);
+    void loadSelectedDisplayTheme();
+    void saveCurrentDisplayThemeAsNew();
+    void overwriteSelectedDisplayTheme();
+    void deleteSelectedDisplayTheme();
+    void resetCurrentDisplayThemeToDefaults();
+    bool persistDisplayThemeStore(const QString &statusMessage, bool appendToLog);
+    void setDisplayThemeStatusMessage(const QString &text, bool appendToLog = false);
+    void updateDisplayThemeColorButton(const QString &roleKey);
     void setScanningState(bool running);
     void appendLog(const QString &line);
     // Keep user/program behavior observable: new interaction paths should log entry and outcome here.
@@ -295,9 +318,12 @@ private:
     QPushButton *removeFavoriteShowRuleButton_{};
     QPushButton *removeScheduledSwitchButton_{};
     QLabel *schedulesDirectStatusLabel_{};
+    QLabel *displayThemeFilePathLabel_{};
+    QLabel *displayThemeStatusLabel_{};
     QTabWidget *tabs_{};
     QWidget *watchPage_{};
     QWidget *configPage_{};
+    QWidget *displayOptionsPage_{};
     QWidget *watchControlsContainer_{};
     QWidget *favoritesContainer_{};
     QWidget *statusContainer_{};
@@ -379,4 +405,19 @@ private:
     QString signalMonitorOverlayToolTip_;
     QStringList dismissedAutoFavoriteCandidates_;
     bool startupSwitchSummaryShown_{false};
+    bool scheduledSwitchListRefreshPending_{false};
+    QLineEdit *displayThemeNameEdit_{};
+    QComboBox *displayThemeSavedThemesCombo_{};
+    QPushButton *displayThemeLoadButton_{};
+    QPushButton *displayThemeSaveAsButton_{};
+    QPushButton *displayThemeOverwriteButton_{};
+    QPushButton *displayThemeDeleteButton_{};
+    QPushButton *displayThemeResetButton_{};
+    QHash<QString, QPushButton *> displayThemeColorButtons_;
+    QHash<QString, DisplayFontEditorWidgets> displayThemeFontEditors_;
+    DisplayTheme defaultDisplayTheme_;
+    DisplayTheme currentDisplayTheme_;
+    DisplayThemeStore displayThemeStore_;
+    QString pendingDisplayThemeLoadError_;
+    bool syncingDisplayThemeUi_{false};
 };

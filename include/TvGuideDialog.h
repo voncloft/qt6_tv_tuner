@@ -1,5 +1,7 @@
 #pragma once
 
+#include "DisplayTheme.h"
+
 #include <QDateTime>
 #include <QHash>
 #include <QList>
@@ -46,6 +48,7 @@ public:
     explicit TvGuideDialog(QWidget *parent = nullptr);
 
     void setLoadingState(const QString &message);
+    void setDisplayTheme(const DisplayTheme &theme);
     void setGuideFilters(bool hideChannelsWithoutEitData, bool showFavoritesOnly);
     void syncToCurrentTime();
     void setGuideData(const QStringList &channelOrder,
@@ -117,4 +120,5 @@ private:
     bool showFavoritesOnly_{false};
     bool pendingSyncToCurrentTime_{false};
     QList<SearchResult> searchResults_;
+    DisplayTheme displayTheme_;
 };

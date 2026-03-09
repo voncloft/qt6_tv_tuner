@@ -6,6 +6,7 @@
 #include <QApplication>
 #include <QAudioOutput>
 #include <QCheckBox>
+#include <QColorDialog>
 #include <QComboBox>
 #include <QCloseEvent>
 #include <QDateTime>
@@ -20,6 +21,7 @@
 #include <QFileDialog>
 #include <QFileInfo>
 #include <QFontMetrics>
+#include <QFontComboBox>
 #include <QFormLayout>
 #include <QGridLayout>
 #include <QGuiApplication>
@@ -49,6 +51,7 @@
 #include <QPushButton>
 #include <QRegularExpression>
 #include <QSaveFile>
+#include <QScrollArea>
 #include <QScrollBar>
 #include <QSignalBlocker>
 #include <QSettings>
@@ -212,6 +215,24 @@ QString formatGuideDurationText(int totalMinutes)
         parts.append(pluralizedIntervalUnit(remainingMinutes, "minute"));
     }
     return parts.join(" ");
+}
+
+QString colorCss(const QColor &color)
+{
+    return color.alpha() < 255 ? color.name(QColor::HexArgb) : color.name(QColor::HexRgb);
+}
+
+QColor contrastingTextColor(const QColor &color)
+{
+    const int brightness = static_cast<int>((color.red() * 299 + color.green() * 587 + color.blue() * 114) / 1000);
+    return brightness >= 140 ? QColor("#000000") : QColor("#ffffff");
+}
+
+QString displayThemeColorButtonStyle(const QColor &color)
+{
+    const QColor textColor = contrastingTextColor(color);
+    return QString("QPushButton { background-color: %1; color: %2; border: 1px solid %3; padding: 6px 10px; }")
+        .arg(colorCss(color), colorCss(textColor), colorCss(textColor.darker(160)));
 }
 
 const QList<int> &guideRefreshIntervalOptionsMinutes()
@@ -1160,6 +1181,23 @@ bool scheduledSwitchesMatch(const TvGuideScheduledSwitch &left, const TvGuideSch
            && normalizedLeft.title == normalizedRight.title;
 }
 
+QString scheduledSwitchKey(const TvGuideScheduledSwitch &scheduledSwitch)
+{
+    const TvGuideScheduledSwitch normalized = normalizedScheduledSwitch(scheduledSwitch);
+    if (normalized.channelName.isEmpty()
+        || !normalized.startUtc.isValid()
+        || !normalized.endUtc.isValid()
+        || normalized.endUtc <= normalized.startUtc) {
+        return {};
+    }
+
+    return QString("%1|%2|%3|%4")
+        .arg(normalized.channelName,
+             QString::number(normalized.startUtc.toSecsSinceEpoch()),
+             QString::number(normalized.endUtc.toSecsSinceEpoch()),
+             normalized.title);
+}
+
 bool scheduledSwitchListContains(const QList<TvGuideScheduledSwitch> &switches,
                                  const TvGuideScheduledSwitch &candidate)
 {
@@ -1362,6 +1400,9 @@ QJsonObject scheduledSwitchToJsonObject(const TvGuideScheduledSwitch &scheduledS
 QList<TvGuideScheduledSwitch> scheduledSwitchesFromJsonArray(const QJsonArray &array)
 {
     QList<TvGuideScheduledSwitch> scheduledSwitches;
+    scheduledSwitches.reserve(array.size());
+    QSet<QString> seenScheduledSwitchKeys;
+    seenScheduledSwitchKeys.reserve(array.size());
     for (const QJsonValue &value : array) {
         if (!value.isObject()) {
             continue;
@@ -1384,16 +1425,13 @@ QList<TvGuideScheduledSwitch> scheduledSwitchesFromJsonArray(const QJsonArray &a
             continue;
         }
 
-        bool duplicate = false;
-        for (const TvGuideScheduledSwitch &existing : scheduledSwitches) {
-            if (scheduledSwitchesMatch(existing, scheduledSwitch)) {
-                duplicate = true;
-                break;
-            }
+        const QString switchKey = scheduledSwitchKey(scheduledSwitch);
+        if (switchKey.isEmpty() || seenScheduledSwitchKeys.contains(switchKey)) {
+            continue;
         }
-        if (!duplicate) {
-            scheduledSwitches.append(scheduledSwitch);
-        }
+
+        seenScheduledSwitchKeys.insert(switchKey);
+        scheduledSwitches.append(scheduledSwitch);
     }
 
     std::sort(scheduledSwitches.begin(), scheduledSwitches.end(), [](const TvGuideScheduledSwitch &left,
@@ -2179,8 +2217,7 @@ QList<TvGuideEntry> cleanGuideEntries(const QList<TvGuideEntry> &entries,
         if (entry.title.simplified().isEmpty()) {
             continue;
         }
-        if ((limitPastEntries && entry.endUtc < earliestEndUtc)
-            || (nowUtc.isValid() && entry.startUtc > nowUtc.addDays(2))) {
+        if (limitPastEntries && entry.endUtc < earliestEndUtc) {
             continue;
         }
 
@@ -2225,6 +2262,7 @@ int guideWindowSlotCount(const QDateTime &windowStartUtc,
                          int slotMinutes)
 {
     constexpr qint64 kMinimumGuideWindowSeconds = 6LL * 60LL * 60LL;
+    constexpr int kMaximumGuideWindowSlots = 32;
     if (!windowStartUtc.isValid() || slotMinutes <= 0) {
         return 12;
     }
@@ -2238,7 +2276,7 @@ int guideWindowSlotCount(const QDateTime &windowStartUtc,
 
     int slotCount = static_cast<int>(std::ceil(static_cast<double>(requestedWindowSeconds)
                                                / (slotMinutes * 60.0)));
-    return std::clamp(slotCount, 12, 32);
+    return std::clamp(slotCount, 12, kMaximumGuideWindowSlots);
 }
 
 QJsonObject guideEntryToJson(const TvGuideEntry &entry)
@@ -3869,7 +3907,13 @@ bool captureGuideEventsForChannel(const QString &channelsFilePath,
 MainWindow::MainWindow(QWidget *parent)
     : QMainWindow(parent)
 {
+    defaultDisplayTheme_ = defaultDisplayTheme();
+    if (!loadDisplayThemeStore(&displayThemeStore_, &pendingDisplayThemeLoadError_)) {
+        displayThemeStore_ = defaultDisplayThemeStore();
+    }
+    currentDisplayTheme_ = normalizedDisplayTheme(displayThemeStore_.currentTheme);
     buildUi();
+    applyDisplayTheme(false);
     qApp->installEventFilter(this);
 
     scanProcess_ = new QProcess(this);
@@ -4170,6 +4214,12 @@ MainWindow::MainWindow(QWidget *parent)
     updateTvGuideDialogFromCurrentCache(false);
     refreshScheduledSwitchTimer();
     guideCachePollTimer_->start();
+    if (!pendingDisplayThemeLoadError_.trimmed().isEmpty()) {
+        appendLog(QString("display-theme: %1").arg(pendingDisplayThemeLoadError_));
+        setDisplayThemeStatusMessage("Theme file had issues; defaults were loaded.", false);
+    } else {
+        persistDisplayThemeStore("Display theme ready", false);
+    }
 
     QTimer::singleShot(0, this, [this]() {
         const QDateTime nowUtc = QDateTime::currentDateTimeUtc();
@@ -4190,7 +4240,7 @@ MainWindow::MainWindow(QWidget *parent)
                            .arg(guideEntriesCache_.isEmpty() ? "false" : "true",
                                 favoriteShowRules_.join(" | "),
                                 summarizeScheduledSwitchesDebug(scheduledSwitches_)));
-        autoScheduleFavoriteShowsFromGuideCache(false, true);
+        autoScheduleFavoriteShowsFromGuideCache(false, false);
         if (!refreshGuideWhenCacheRunsOutEnabled()) {
             guideRefreshTimer_->start();
         }
@@ -4528,7 +4578,10 @@ void MainWindow::buildUi()
     tabs_ = new QTabWidget(root);
     tabs_->setTabPosition(QTabWidget::North);
     tabs_->setDocumentMode(true);
-    tabs_->setStyleSheet("QTabWidget::pane { border: 0; }");
+    tabs_->setStyleSheet(
+        "QTabWidget::pane { border: 0; background-color: #000000; }"
+        "QTabBar::tab { background-color: #050505; color: #ffffff; border: 1px solid #343434; padding: 8px 14px; }"
+        "QTabBar::tab:selected { background-color: #101010; }");
 
     watchPage_ = new QWidget(tabs_);
     auto *watchLayout = new QVBoxLayout(watchPage_);
@@ -4539,7 +4592,34 @@ void MainWindow::buildUi()
     auto *tuningLayout = new QVBoxLayout(tuningPage);
 
     configPage_ = new QWidget(tabs_);
-    auto *configLayout = new QVBoxLayout(configPage_);
+    auto *configPageLayout = new QVBoxLayout(configPage_);
+    configPageLayout->setContentsMargins(0, 0, 0, 0);
+    configPageLayout->setSpacing(0);
+    auto *configScrollArea = new QScrollArea(configPage_);
+    configScrollArea->setWidgetResizable(true);
+    configScrollArea->setFrameShape(QFrame::NoFrame);
+    configScrollArea->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+    auto *configContent = new QWidget(configScrollArea);
+    auto *configLayout = new QVBoxLayout(configContent);
+    configLayout->setContentsMargins(14, 14, 14, 14);
+    configLayout->setSpacing(12);
+    configScrollArea->setWidget(configContent);
+    configPageLayout->addWidget(configScrollArea);
+
+    displayOptionsPage_ = new QWidget(tabs_);
+    auto *displayOptionsPageLayout = new QVBoxLayout(displayOptionsPage_);
+    displayOptionsPageLayout->setContentsMargins(0, 0, 0, 0);
+    displayOptionsPageLayout->setSpacing(0);
+    auto *displayOptionsScrollArea = new QScrollArea(displayOptionsPage_);
+    displayOptionsScrollArea->setWidgetResizable(true);
+    displayOptionsScrollArea->setFrameShape(QFrame::NoFrame);
+    displayOptionsScrollArea->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+    auto *displayOptionsContent = new QWidget(displayOptionsScrollArea);
+    auto *displayOptionsLayout = new QVBoxLayout(displayOptionsContent);
+    displayOptionsLayout->setContentsMargins(14, 14, 14, 14);
+    displayOptionsLayout->setSpacing(12);
+    displayOptionsScrollArea->setWidget(displayOptionsContent);
+    displayOptionsPageLayout->addWidget(displayOptionsScrollArea);
 
     auto *metaManagementPage = new QWidget(tabs_);
     auto *metaManagementLayout = new QVBoxLayout(metaManagementPage);
@@ -4549,6 +4629,26 @@ void MainWindow::buildUi()
 
     auto *testingBugsPage = new QWidget(tabs_);
     auto *testingBugsLayout = new QVBoxLayout(testingBugsPage);
+
+    const QString mainPageStyle =
+        "QWidget { background-color: #000000; color: #ffffff; }"
+        "QGroupBox { border: 1px solid #262626; margin-top: 10px; }"
+        "QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 4px; }"
+        "QPushButton { background-color: #090909; color: #ffffff; border: 1px solid #343434; padding: 6px 12px; }"
+        "QPushButton:disabled { color: #777777; border-color: #1e1e1e; }"
+        "QScrollArea, QScrollArea > QWidget > QWidget { background-color: #000000; }"
+        "QLineEdit, QComboBox, QListWidget, QPlainTextEdit, QTableWidget, QSpinBox {"
+        " background-color: #050505; color: #ffffff; border: 1px solid #343434; }"
+        "QHeaderView::section { background-color: #000000; color: #ffffff; border: 1px solid #343434; padding: 4px; }"
+        "QLabel { color: #ffffff; }";
+    watchPage_->setStyleSheet(mainPageStyle);
+    tuningPage->setStyleSheet(mainPageStyle);
+    configPage_->setStyleSheet(mainPageStyle);
+    displayOptionsPage_->setStyleSheet(mainPageStyle);
+    metaManagementPage->setStyleSheet(mainPageStyle);
+    logsPage->setStyleSheet(mainPageStyle);
+    testingBugsPage->setStyleSheet(mainPageStyle);
+    menuBar()->setStyleSheet("QMenuBar, QMenu { background-color: #000000; color: #ffffff; }");
 
     auto *scanGroup = new QGroupBox("Scan Settings", tuningPage);
     auto *form = new QFormLayout(scanGroup);
@@ -4602,6 +4702,8 @@ void MainWindow::buildUi()
 
     auto *guideOptionsGroup = new QGroupBox("TV Guide", configPage_);
     auto *guideOptionsLayout = new QVBoxLayout(guideOptionsGroup);
+    guideOptionsLayout->setContentsMargins(12, 14, 12, 12);
+    guideOptionsLayout->setSpacing(8);
     useSchedulesDirectGuideCheckBox_ = new QCheckBox("Use Schedules Direct OTA data for guide refreshes", guideOptionsGroup);
     hideNoEitChannelsCheckBox_ = new QCheckBox("Hide channels without EIT data", guideOptionsGroup);
     showFavoritesOnlyCheckBox_ = new QCheckBox("Show only favorites in TV Guide", guideOptionsGroup);
@@ -4618,6 +4720,8 @@ void MainWindow::buildUi()
 
     auto *playbackOptionsGroup = new QGroupBox("Playback", configPage_);
     auto *playbackOptionsLayout = new QVBoxLayout(playbackOptionsGroup);
+    playbackOptionsLayout->setContentsMargins(12, 14, 12, 12);
+    playbackOptionsLayout->setSpacing(8);
     autoPictureInPictureCheckBox_ = new QCheckBox("Pop video out when leaving the Video tab", playbackOptionsGroup);
     processedPlaybackCheckBox_ =
         new QCheckBox("Always process live audio/video before playback", playbackOptionsGroup);
@@ -4632,6 +4736,10 @@ void MainWindow::buildUi()
 
     auto *cacheOptionsGroup = new QGroupBox("Guide Cache", configPage_);
     auto *cacheOptionsForm = new QFormLayout(cacheOptionsGroup);
+    cacheOptionsForm->setContentsMargins(12, 14, 12, 12);
+    cacheOptionsForm->setHorizontalSpacing(12);
+    cacheOptionsForm->setVerticalSpacing(10);
+    cacheOptionsForm->setFieldGrowthPolicy(QFormLayout::AllNonFixedFieldsGrow);
     guideRefreshIntervalCombo_ = new QComboBox(cacheOptionsGroup);
     for (const int minutes : guideRefreshIntervalOptionsMinutes()) {
         guideRefreshIntervalCombo_->addItem(guideRefreshIntervalText(minutes), minutes);
@@ -4652,7 +4760,12 @@ void MainWindow::buildUi()
 
     auto *schedulesDirectGroup = new QGroupBox("Schedules Direct", configPage_);
     auto *schedulesDirectLayout = new QVBoxLayout(schedulesDirectGroup);
+    schedulesDirectLayout->setContentsMargins(12, 14, 12, 12);
+    schedulesDirectLayout->setSpacing(10);
     auto *schedulesDirectForm = new QFormLayout();
+    schedulesDirectForm->setHorizontalSpacing(12);
+    schedulesDirectForm->setVerticalSpacing(10);
+    schedulesDirectForm->setFieldGrowthPolicy(QFormLayout::AllNonFixedFieldsGrow);
     schedulesDirectUsernameEdit_ = new QLineEdit(schedulesDirectGroup);
     schedulesDirectUsernameEdit_->setPlaceholderText("voncloft");
     schedulesDirectPasswordEdit_ = new QLineEdit(schedulesDirectGroup);
@@ -4672,6 +4785,11 @@ void MainWindow::buildUi()
     schedulesDirectLayout->addLayout(schedulesDirectForm);
     schedulesDirectLayout->addWidget(exportSchedulesDirectButton_, 0);
     schedulesDirectLayout->addWidget(schedulesDirectStatusLabel_, 0);
+
+    guideOptionsGroup->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Maximum);
+    playbackOptionsGroup->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Maximum);
+    cacheOptionsGroup->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Maximum);
+    schedulesDirectGroup->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Maximum);
 
     auto *favoriteShowsGroup = new QGroupBox("Favorite Shows", metaManagementPage);
     auto *favoriteShowsLayout = new QVBoxLayout(favoriteShowsGroup);
@@ -4713,11 +4831,114 @@ void MainWindow::buildUi()
     scheduledSwitchesLayout->addWidget(scheduledSwitchesList_, 1);
     scheduledSwitchesLayout->addWidget(removeScheduledSwitchButton_, 0);
 
-    configLayout->addWidget(guideOptionsGroup);
-    configLayout->addWidget(playbackOptionsGroup);
-    configLayout->addWidget(cacheOptionsGroup);
-    configLayout->addWidget(schedulesDirectGroup);
+    auto *configSectionsLayout = new QGridLayout();
+    configSectionsLayout->setContentsMargins(0, 0, 0, 0);
+    configSectionsLayout->setHorizontalSpacing(12);
+    configSectionsLayout->setVerticalSpacing(12);
+    configSectionsLayout->setColumnStretch(0, 1);
+    configSectionsLayout->setColumnStretch(1, 1);
+    configSectionsLayout->addWidget(guideOptionsGroup, 0, 0);
+    configSectionsLayout->addWidget(playbackOptionsGroup, 0, 1);
+    configSectionsLayout->addWidget(cacheOptionsGroup, 1, 0);
+    configSectionsLayout->addWidget(schedulesDirectGroup, 1, 1);
+    configLayout->addLayout(configSectionsLayout);
     configLayout->addStretch(1);
+
+    auto *themeLibraryGroup = new QGroupBox("Theme Library", displayOptionsPage_);
+    auto *themeLibraryLayout = new QVBoxLayout(themeLibraryGroup);
+    themeLibraryLayout->setContentsMargins(12, 14, 12, 12);
+    themeLibraryLayout->setSpacing(10);
+    auto *themeSelectionRow = new QHBoxLayout();
+    themeSelectionRow->setSpacing(8);
+    themeSelectionRow->addWidget(new QLabel("Saved themes:", themeLibraryGroup), 0);
+    displayThemeSavedThemesCombo_ = new QComboBox(themeLibraryGroup);
+    displayThemeLoadButton_ = new QPushButton("Load Selected", themeLibraryGroup);
+    displayThemeOverwriteButton_ = new QPushButton("Overwrite Selected", themeLibraryGroup);
+    displayThemeDeleteButton_ = new QPushButton("Delete Selected", themeLibraryGroup);
+    themeSelectionRow->addWidget(displayThemeSavedThemesCombo_, 1);
+    themeSelectionRow->addWidget(displayThemeLoadButton_, 0);
+    themeSelectionRow->addWidget(displayThemeOverwriteButton_, 0);
+    themeSelectionRow->addWidget(displayThemeDeleteButton_, 0);
+    auto *themeSaveRow = new QHBoxLayout();
+    themeSaveRow->setSpacing(8);
+    themeSaveRow->addWidget(new QLabel("Theme name:", themeLibraryGroup), 0);
+    displayThemeNameEdit_ = new QLineEdit(themeLibraryGroup);
+    displayThemeNameEdit_->setPlaceholderText("Save the current look as a named theme");
+    displayThemeSaveAsButton_ = new QPushButton("Save As New Theme", themeLibraryGroup);
+    displayThemeResetButton_ = new QPushButton("Reset Current To Defaults", themeLibraryGroup);
+    themeSaveRow->addWidget(displayThemeNameEdit_, 1);
+    themeSaveRow->addWidget(displayThemeSaveAsButton_, 0);
+    themeSaveRow->addWidget(displayThemeResetButton_, 0);
+    displayThemeFilePathLabel_ =
+        new QLabel(QString("Theme file: %1").arg(resolveDisplayThemeStorePath()), themeLibraryGroup);
+    displayThemeFilePathLabel_->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    displayThemeFilePathLabel_->setWordWrap(true);
+    displayThemeStatusLabel_ = new QLabel("Editing the current theme updates the theme file immediately.", themeLibraryGroup);
+    displayThemeStatusLabel_->setWordWrap(true);
+    displayThemeStatusLabel_->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    themeLibraryLayout->addLayout(themeSelectionRow);
+    themeLibraryLayout->addLayout(themeSaveRow);
+    themeLibraryLayout->addWidget(displayThemeFilePathLabel_);
+    themeLibraryLayout->addWidget(displayThemeStatusLabel_);
+
+    auto *colorsGroup = new QGroupBox("Colors", displayOptionsPage_);
+    auto *colorsLayout = new QGridLayout(colorsGroup);
+    colorsLayout->setContentsMargins(12, 14, 12, 12);
+    colorsLayout->setHorizontalSpacing(12);
+    colorsLayout->setVerticalSpacing(8);
+    colorsLayout->setColumnStretch(1, 1);
+    colorsLayout->setColumnStretch(3, 1);
+    const QList<DisplayColorRoleSpec> colorSpecs = displayColorRoleSpecs();
+    for (int index = 0; index < colorSpecs.size(); ++index) {
+        const DisplayColorRoleSpec &spec = colorSpecs.at(index);
+        auto *label = new QLabel(spec.label + ":", colorsGroup);
+        label->setWordWrap(true);
+        auto *button = new QPushButton(colorsGroup);
+        button->setMinimumWidth(160);
+        displayThemeColorButtons_.insert(spec.key, button);
+        const int row = index / 2;
+        const int column = (index % 2) * 2;
+        colorsLayout->addWidget(label, row, column);
+        colorsLayout->addWidget(button, row, column + 1);
+    }
+
+    auto *fontsGroup = new QGroupBox("Fonts", displayOptionsPage_);
+    auto *fontsLayout = new QGridLayout(fontsGroup);
+    fontsLayout->setContentsMargins(12, 14, 12, 12);
+    fontsLayout->setHorizontalSpacing(10);
+    fontsLayout->setVerticalSpacing(8);
+    fontsLayout->addWidget(new QLabel("Element", fontsGroup), 0, 0);
+    fontsLayout->addWidget(new QLabel("Family", fontsGroup), 0, 1);
+    fontsLayout->addWidget(new QLabel("Size", fontsGroup), 0, 2);
+    fontsLayout->addWidget(new QLabel("Bold", fontsGroup), 0, 3);
+    fontsLayout->addWidget(new QLabel("Italic", fontsGroup), 0, 4);
+    fontsLayout->addWidget(new QLabel("Underline", fontsGroup), 0, 5);
+    fontsLayout->setColumnStretch(1, 1);
+    const QList<DisplayFontRoleSpec> fontSpecs = displayFontRoleSpecs();
+    for (int index = 0; index < fontSpecs.size(); ++index) {
+        const DisplayFontRoleSpec &spec = fontSpecs.at(index);
+        auto *label = new QLabel(spec.label, fontsGroup);
+        auto *familyCombo = new QFontComboBox(fontsGroup);
+        familyCombo->setSizeAdjustPolicy(QComboBox::AdjustToMinimumContentsLengthWithIcon);
+        auto *sizeSpin = new QSpinBox(fontsGroup);
+        sizeSpin->setRange(6, 48);
+        auto *boldCheck = new QCheckBox(fontsGroup);
+        auto *italicCheck = new QCheckBox(fontsGroup);
+        auto *underlineCheck = new QCheckBox(fontsGroup);
+        displayThemeFontEditors_.insert(spec.key, {familyCombo, sizeSpin, boldCheck, italicCheck, underlineCheck});
+        const int row = index + 1;
+        fontsLayout->addWidget(label, row, 0);
+        fontsLayout->addWidget(familyCombo, row, 1);
+        fontsLayout->addWidget(sizeSpin, row, 2);
+        fontsLayout->addWidget(boldCheck, row, 3, Qt::AlignCenter);
+        fontsLayout->addWidget(italicCheck, row, 4, Qt::AlignCenter);
+        fontsLayout->addWidget(underlineCheck, row, 5, Qt::AlignCenter);
+    }
+
+    displayOptionsLayout->addWidget(themeLibraryGroup);
+    displayOptionsLayout->addWidget(colorsGroup);
+    displayOptionsLayout->addWidget(fontsGroup);
+    displayOptionsLayout->addStretch(1);
 
     metaManagementLayout->addWidget(favoriteShowsGroup, 1);
     metaManagementLayout->addWidget(scheduledSwitchesGroup, 1);
@@ -4926,10 +5147,12 @@ void MainWindow::buildUi()
     tabs_->addTab(metaManagementPage, "Meta Management");
     tabs_->addTab(tuningPage, "Tuning");
     tabs_->addTab(configPage_, "Config");
+    tabs_->addTab(displayOptionsPage_, "Display Options");
     tabs_->addTab(testingBugsPage, "Testing/bugs");
     tabs_->addTab(logsPage, "Logs");
     mainLayout->addWidget(tabs_, 1);
     setCentralWidget(root);
+    statusBar()->setStyleSheet("QStatusBar { background-color: #000000; color: #ffffff; }");
 
     fullscreenWindow_ = new QWidget(nullptr, Qt::Window | Qt::FramelessWindowHint);
     fullscreenWindow_->setWindowFlag(Qt::WindowStaysOnTopHint, true);
@@ -5293,7 +5516,571 @@ void MainWindow::buildUi()
     connect(removeFavoriteShowRuleButton_, &QPushButton::clicked, this, &MainWindow::removeSelectedFavoriteShowRule);
     connect(removeScheduledSwitchButton_, &QPushButton::clicked, this, &MainWindow::removeSelectedScheduledSwitch);
     connect(fullscreenButton_, &QPushButton::clicked, this, &MainWindow::toggleFullscreen);
+    if (displayThemeLoadButton_ != nullptr) {
+        connect(displayThemeLoadButton_, &QPushButton::clicked, this, &MainWindow::loadSelectedDisplayTheme);
+    }
+    if (displayThemeSaveAsButton_ != nullptr) {
+        connect(displayThemeSaveAsButton_, &QPushButton::clicked, this, &MainWindow::saveCurrentDisplayThemeAsNew);
+    }
+    if (displayThemeOverwriteButton_ != nullptr) {
+        connect(displayThemeOverwriteButton_, &QPushButton::clicked, this, &MainWindow::overwriteSelectedDisplayTheme);
+    }
+    if (displayThemeDeleteButton_ != nullptr) {
+        connect(displayThemeDeleteButton_, &QPushButton::clicked, this, &MainWindow::deleteSelectedDisplayTheme);
+    }
+    if (displayThemeResetButton_ != nullptr) {
+        connect(displayThemeResetButton_, &QPushButton::clicked, this, &MainWindow::resetCurrentDisplayThemeToDefaults);
+    }
+    if (displayThemeNameEdit_ != nullptr) {
+        connect(displayThemeNameEdit_, &QLineEdit::returnPressed, this, &MainWindow::saveCurrentDisplayThemeAsNew);
+        connect(displayThemeNameEdit_, &QLineEdit::textChanged, this, [this](const QString &text) {
+            if (displayThemeSaveAsButton_ != nullptr) {
+                displayThemeSaveAsButton_->setEnabled(!text.simplified().isEmpty());
+            }
+        });
+    }
+    for (auto it = displayThemeColorButtons_.begin(); it != displayThemeColorButtons_.end(); ++it) {
+        const QString roleKey = it.key();
+        if (it.value() != nullptr) {
+            connect(it.value(), &QPushButton::clicked, this, [this, roleKey]() {
+                chooseDisplayThemeColor(roleKey);
+            });
+        }
+    }
+    for (auto it = displayThemeFontEditors_.begin(); it != displayThemeFontEditors_.end(); ++it) {
+        const QString roleKey = it.key();
+        const DisplayFontEditorWidgets widgets = it.value();
+        if (widgets.family != nullptr) {
+            connect(widgets.family,
+                    &QFontComboBox::currentFontChanged,
+                    this,
+                    [this, roleKey](const QFont &) { handleDisplayThemeFontEdited(roleKey); });
+        }
+        if (widgets.size != nullptr) {
+            connect(widgets.size,
+                    qOverload<int>(&QSpinBox::valueChanged),
+                    this,
+                    [this, roleKey](int) { handleDisplayThemeFontEdited(roleKey); });
+        }
+        if (widgets.bold != nullptr) {
+            connect(widgets.bold, &QCheckBox::toggled, this, [this, roleKey](bool) {
+                handleDisplayThemeFontEdited(roleKey);
+            });
+        }
+        if (widgets.italic != nullptr) {
+            connect(widgets.italic, &QCheckBox::toggled, this, [this, roleKey](bool) {
+                handleDisplayThemeFontEdited(roleKey);
+            });
+        }
+        if (widgets.underline != nullptr) {
+            connect(widgets.underline, &QCheckBox::toggled, this, [this, roleKey](bool) {
+                handleDisplayThemeFontEdited(roleKey);
+            });
+        }
+    }
+    refreshSavedDisplayThemeList(currentDisplayTheme_.name);
+    if (displayThemeNameEdit_ != nullptr) {
+        displayThemeNameEdit_->setText(currentDisplayTheme_.name);
+    }
+    refreshDisplayThemeControls();
     updateSchedulesDirectControls();
+}
+
+void MainWindow::setDisplayThemeStatusMessage(const QString &text, bool appendToLog)
+{
+    const QString trimmed = text.trimmed();
+    if (displayThemeStatusLabel_ != nullptr) {
+        displayThemeStatusLabel_->setText(trimmed);
+    }
+    if (appendToLog && !trimmed.isEmpty()) {
+        appendLog(QString("display-theme: %1").arg(trimmed));
+    }
+}
+
+bool MainWindow::persistDisplayThemeStore(const QString &statusMessage, bool appendToLog)
+{
+    displayThemeStore_.currentTheme = normalizedDisplayTheme(currentDisplayTheme_);
+    QString errorText;
+    if (!saveDisplayThemeStore(displayThemeStore_, &errorText)) {
+        setDisplayThemeStatusMessage(errorText, true);
+        return false;
+    }
+
+    if (!statusMessage.trimmed().isEmpty()) {
+        setDisplayThemeStatusMessage(statusMessage, appendToLog);
+    }
+    return true;
+}
+
+void MainWindow::updateDisplayThemeColorButton(const QString &roleKey)
+{
+    QPushButton *button = displayThemeColorButtons_.value(roleKey, nullptr);
+    if (button == nullptr) {
+        return;
+    }
+
+    const QColor color = displayThemeColor(currentDisplayTheme_, roleKey);
+    button->setText(color.alpha() < 255 ? color.name(QColor::HexArgb) : color.name(QColor::HexRgb));
+    button->setStyleSheet(displayThemeColorButtonStyle(color));
+}
+
+void MainWindow::refreshSavedDisplayThemeList(const QString &preferredSelection)
+{
+    if (displayThemeSavedThemesCombo_ == nullptr) {
+        return;
+    }
+
+    const QString preferredName = preferredSelection.trimmed();
+    const QString currentSelection = preferredName.isEmpty()
+                                         ? displayThemeSavedThemesCombo_->currentText().trimmed()
+                                         : preferredName;
+    const QSignalBlocker blocker(displayThemeSavedThemesCombo_);
+    displayThemeSavedThemesCombo_->clear();
+    int selectedIndex = -1;
+    for (int index = 0; index < displayThemeStore_.savedThemes.size(); ++index) {
+        const QString name = displayThemeStore_.savedThemes.at(index).name.trimmed();
+        displayThemeSavedThemesCombo_->addItem(name);
+        if (selectedIndex < 0 && !currentSelection.isEmpty()
+            && name.compare(currentSelection, Qt::CaseInsensitive) == 0) {
+            selectedIndex = index;
+        }
+    }
+    if (selectedIndex >= 0) {
+        displayThemeSavedThemesCombo_->setCurrentIndex(selectedIndex);
+    }
+
+    const bool hasSavedThemes = displayThemeSavedThemesCombo_->count() > 0;
+    if (displayThemeLoadButton_ != nullptr) {
+        displayThemeLoadButton_->setEnabled(hasSavedThemes);
+    }
+    if (displayThemeOverwriteButton_ != nullptr) {
+        displayThemeOverwriteButton_->setEnabled(hasSavedThemes);
+    }
+    if (displayThemeDeleteButton_ != nullptr) {
+        displayThemeDeleteButton_->setEnabled(hasSavedThemes);
+    }
+}
+
+void MainWindow::refreshDisplayThemeControls()
+{
+    syncingDisplayThemeUi_ = true;
+    for (const DisplayColorRoleSpec &spec : displayColorRoleSpecs()) {
+        updateDisplayThemeColorButton(spec.key);
+    }
+
+    for (const DisplayFontRoleSpec &spec : displayFontRoleSpecs()) {
+        const DisplayFontEditorWidgets widgets = displayThemeFontEditors_.value(spec.key);
+        const DisplayFontStyle style = displayThemeFontStyle(currentDisplayTheme_, spec.key);
+        if (widgets.family != nullptr) {
+            widgets.family->setCurrentFont(qFontFromDisplayFontStyle(style, widgets.family->currentFont()));
+        }
+        if (widgets.size != nullptr) {
+            widgets.size->setValue(style.pointSize);
+        }
+        if (widgets.bold != nullptr) {
+            widgets.bold->setChecked(style.bold);
+        }
+        if (widgets.italic != nullptr) {
+            widgets.italic->setChecked(style.italic);
+        }
+        if (widgets.underline != nullptr) {
+            widgets.underline->setChecked(style.underline);
+        }
+    }
+
+    if (displayThemeSaveAsButton_ != nullptr && displayThemeNameEdit_ != nullptr) {
+        displayThemeSaveAsButton_->setEnabled(!displayThemeNameEdit_->text().simplified().isEmpty());
+    }
+    syncingDisplayThemeUi_ = false;
+}
+
+void MainWindow::applyDisplayTheme(bool persistCurrentTheme)
+{
+    currentDisplayTheme_ = normalizedDisplayTheme(currentDisplayTheme_);
+    displayThemeStore_.currentTheme = currentDisplayTheme_;
+
+    const auto color = [this](const char *key) {
+        return colorCss(displayThemeColor(currentDisplayTheme_, QString::fromLatin1(key)));
+    };
+
+    qApp->setFont(qFontFromDisplayFontStyle(displayThemeFontStyle(currentDisplayTheme_, DisplayThemeKeys::AppFont),
+                                            qApp->font()));
+    qApp->setPalette(buildApplicationPalette(currentDisplayTheme_, qApp->palette()));
+    qApp->setStyleSheet(buildScrollBarStyleSheet(currentDisplayTheme_));
+
+    const QString mainPageStyle =
+        QString(
+            "QWidget { background-color: %1; color: %2; }"
+            "QGroupBox { border: 1px solid %3; margin-top: 12px; padding-top: 8px; }"
+            "QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 4px; color: %2; }"
+            "QPushButton { background-color: %4; color: %5; border: 1px solid %6; padding: 6px 12px; }"
+            "QPushButton:disabled { color: %7; border-color: %8; }"
+            "QCheckBox { color: %2; spacing: 6px; }"
+            "QScrollArea, QScrollArea > QWidget > QWidget { background-color: %1; }"
+            "QLineEdit, QComboBox, QListWidget, QPlainTextEdit, QTableWidget, QSpinBox, QFontComboBox {"
+            " background-color: %9; color: %10; border: 1px solid %11; selection-background-color: %12; selection-color: %13; }"
+            "QHeaderView::section { background-color: %14; color: %15; border: 1px solid %16; padding: 4px; }"
+            "QLabel { color: %17; }"
+            "QToolTip { background-color: %1; color: %2; border: 1px solid %3; }")
+            .arg(color(DisplayThemeKeys::WindowBackground),
+                 color(DisplayThemeKeys::WindowText),
+                 color(DisplayThemeKeys::GroupBorder),
+                 color(DisplayThemeKeys::ButtonBackground),
+                 color(DisplayThemeKeys::ButtonText),
+                 color(DisplayThemeKeys::ButtonBorder),
+                 color(DisplayThemeKeys::ButtonDisabledText),
+                 color(DisplayThemeKeys::ButtonDisabledBorder),
+                 color(DisplayThemeKeys::InputBackground),
+                 color(DisplayThemeKeys::InputText),
+                 color(DisplayThemeKeys::InputBorder),
+                 color(DisplayThemeKeys::Highlight),
+                 color(DisplayThemeKeys::HighlightText),
+                 color(DisplayThemeKeys::HeaderBackground),
+                 color(DisplayThemeKeys::HeaderText),
+                 color(DisplayThemeKeys::HeaderBorder),
+                 color(DisplayThemeKeys::LabelText));
+
+    if (tabs_ != nullptr) {
+        tabs_->setStyleSheet(
+            QString("QTabWidget::pane { border: 0; background-color: %1; }"
+                    "QTabBar::tab { background-color: %2; color: %3; border: 1px solid %4; padding: 8px 14px; }"
+                    "QTabBar::tab:selected { background-color: %5; }")
+                .arg(color(DisplayThemeKeys::WindowBackground),
+                     color(DisplayThemeKeys::TabBackground),
+                     color(DisplayThemeKeys::TabText),
+                     color(DisplayThemeKeys::TabBorder),
+                     color(DisplayThemeKeys::TabSelectedBackground)));
+        if (tabs_->tabBar() != nullptr) {
+            tabs_->tabBar()->setFont(qFontFromDisplayFontStyle(displayThemeFontStyle(currentDisplayTheme_,
+                                                                                     DisplayThemeKeys::TabFont),
+                                                               tabs_->tabBar()->font()));
+        }
+        for (int index = 0; index < tabs_->count(); ++index) {
+            QWidget *page = tabs_->widget(index);
+            if (page != nullptr && page != tvGuideDialog_) {
+                page->setStyleSheet(mainPageStyle);
+            }
+        }
+    }
+
+    if (menuBar() != nullptr) {
+        menuBar()->setStyleSheet(QString("QMenuBar, QMenu { background-color: %1; color: %2; }")
+                                     .arg(color(DisplayThemeKeys::MenuBackground), color(DisplayThemeKeys::MenuText)));
+        menuBar()->setFont(qFontFromDisplayFontStyle(displayThemeFontStyle(currentDisplayTheme_,
+                                                                           DisplayThemeKeys::MenuFont),
+                                                     menuBar()->font()));
+    }
+
+    if (statusBar() != nullptr) {
+        statusBar()->setStyleSheet(QString("QStatusBar { background-color: %1; color: %2; }")
+                                       .arg(color(DisplayThemeKeys::StatusBackground),
+                                            color(DisplayThemeKeys::StatusText)));
+        statusBar()->setFont(qFontFromDisplayFontStyle(displayThemeFontStyle(currentDisplayTheme_,
+                                                                             DisplayThemeKeys::StatusFont),
+                                                       statusBar()->font()));
+    }
+
+    if (pipWindow_ != nullptr) {
+        pipWindow_->setStyleSheet(QString("background: %1;").arg(color(DisplayThemeKeys::WindowBackground)));
+    }
+    if (fullscreenWindow_ != nullptr) {
+        fullscreenWindow_->setStyleSheet(QString("background: %1;").arg(color(DisplayThemeKeys::WindowBackground)));
+    }
+    if (videoDetachedPlaceholderLabel_ != nullptr) {
+        videoDetachedPlaceholderLabel_->setStyleSheet(
+            QString("QLabel { background: %1; color: %2; padding: 24px; }")
+                .arg(color(DisplayThemeKeys::WindowBackground), color(DisplayThemeKeys::MutedText)));
+    }
+    if (currentShowSynopsisLabel_ != nullptr) {
+        currentShowSynopsisLabel_->setStyleSheet(
+            QString("QLabel { color: %1; }").arg(color(DisplayThemeKeys::MutedText)));
+    }
+    if (fullscreenCurrentShowSynopsisLabel_ != nullptr) {
+        fullscreenCurrentShowSynopsisLabel_->setStyleSheet(
+            QString("QLabel { color: %1; }").arg(color(DisplayThemeKeys::MutedText)));
+    }
+    if (fullscreenOverlayContainer_ != nullptr) {
+        fullscreenOverlayContainer_->setStyleSheet(
+            QString(
+                "QWidget#fullscreenOverlayContainer { background: %1; }"
+                "QPushButton { min-height: 34px; background-color: %2; color: %3; border: 1px solid %4; padding: 6px 12px; }"
+                "QLabel { color: %5; }")
+                .arg(color(DisplayThemeKeys::FullscreenOverlayBackground),
+                     color(DisplayThemeKeys::ButtonBackground),
+                     color(DisplayThemeKeys::ButtonText),
+                     color(DisplayThemeKeys::ButtonBorder),
+                     color(DisplayThemeKeys::FullscreenOverlayText)));
+    }
+
+    const QFont labelFont =
+        qFontFromDisplayFontStyle(displayThemeFontStyle(currentDisplayTheme_, DisplayThemeKeys::LabelFont),
+                                  font());
+    const QFont buttonFont =
+        qFontFromDisplayFontStyle(displayThemeFontStyle(currentDisplayTheme_, DisplayThemeKeys::ButtonFont),
+                                  font());
+    const QFont inputFont =
+        qFontFromDisplayFontStyle(displayThemeFontStyle(currentDisplayTheme_, DisplayThemeKeys::InputFont),
+                                  font());
+    const QFont logFont =
+        qFontFromDisplayFontStyle(displayThemeFontStyle(currentDisplayTheme_, DisplayThemeKeys::LogFont), font());
+    const QFont overlayFont =
+        qFontFromDisplayFontStyle(displayThemeFontStyle(currentDisplayTheme_, DisplayThemeKeys::OverlayFont),
+                                  font());
+    const QFont statusFont =
+        qFontFromDisplayFontStyle(displayThemeFontStyle(currentDisplayTheme_, DisplayThemeKeys::StatusFont),
+                                  font());
+
+    for (QLabel *label : findChildren<QLabel *>()) {
+        if (label != nullptr) {
+            label->setFont(labelFont);
+        }
+    }
+    for (QGroupBox *groupBox : findChildren<QGroupBox *>()) {
+        if (groupBox != nullptr) {
+            groupBox->setFont(labelFont);
+        }
+    }
+    for (QPushButton *button : findChildren<QPushButton *>()) {
+        if (button != nullptr) {
+            button->setFont(buttonFont);
+        }
+    }
+    for (QCheckBox *checkBox : findChildren<QCheckBox *>()) {
+        if (checkBox != nullptr) {
+            checkBox->setFont(buttonFont);
+        }
+    }
+    for (QLineEdit *lineEdit : findChildren<QLineEdit *>()) {
+        if (lineEdit != nullptr) {
+            lineEdit->setFont(inputFont);
+        }
+    }
+    for (QComboBox *comboBox : findChildren<QComboBox *>()) {
+        if (comboBox != nullptr) {
+            comboBox->setFont(inputFont);
+        }
+    }
+    for (QFontComboBox *fontComboBox : findChildren<QFontComboBox *>()) {
+        if (fontComboBox != nullptr) {
+            fontComboBox->setFont(inputFont);
+        }
+    }
+    for (QSpinBox *spinBox : findChildren<QSpinBox *>()) {
+        if (spinBox != nullptr) {
+            spinBox->setFont(inputFont);
+        }
+    }
+    for (QListWidget *listWidget : findChildren<QListWidget *>()) {
+        if (listWidget != nullptr) {
+            listWidget->setFont(inputFont);
+        }
+    }
+    for (QTableWidget *tableWidget : findChildren<QTableWidget *>()) {
+        if (tableWidget != nullptr) {
+            tableWidget->setFont(inputFont);
+            if (tableWidget->horizontalHeader() != nullptr) {
+                tableWidget->horizontalHeader()->setFont(labelFont);
+            }
+            if (tableWidget->verticalHeader() != nullptr) {
+                tableWidget->verticalHeader()->setFont(labelFont);
+            }
+        }
+    }
+    if (logOutput_ != nullptr) {
+        logOutput_->setFont(logFont);
+    }
+    if (playbackStatusLabel_ != nullptr) {
+        playbackStatusLabel_->setFont(statusFont);
+    }
+    if (signalMonitorLabel_ != nullptr) {
+        signalMonitorLabel_->setFont(statusFont);
+    }
+    if (fullscreenPlaybackStatusLabel_ != nullptr) {
+        fullscreenPlaybackStatusLabel_->setFont(statusFont);
+    }
+    if (fullscreenSignalMonitorLabel_ != nullptr) {
+        fullscreenSignalMonitorLabel_->setFont(statusFont);
+    }
+    if (fullscreenOverlayContainer_ != nullptr) {
+        for (QLabel *label : fullscreenOverlayContainer_->findChildren<QLabel *>()) {
+            if (label != nullptr) {
+                label->setFont(overlayFont);
+            }
+        }
+        for (QPushButton *button : fullscreenOverlayContainer_->findChildren<QPushButton *>()) {
+            if (button != nullptr) {
+                button->setFont(overlayFont);
+            }
+        }
+    }
+
+    if (tvGuideDialog_ != nullptr) {
+        tvGuideDialog_->setDisplayTheme(currentDisplayTheme_);
+    }
+
+    refreshDisplayThemeControls();
+    if (persistCurrentTheme) {
+        persistDisplayThemeStore("Current theme saved.", false);
+    }
+}
+
+void MainWindow::chooseDisplayThemeColor(const QString &roleKey)
+{
+    QColorDialog dialog(displayThemeColor(currentDisplayTheme_, roleKey), modalDialogParent());
+    dialog.setOption(QColorDialog::ShowAlphaChannel, true);
+    dialog.setCurrentColor(displayThemeColor(currentDisplayTheme_, roleKey));
+    dialog.setWindowTitle("Select Theme Color");
+    if (execModalDialog(&dialog, "Choose theme color") != QDialog::Accepted) {
+        return;
+    }
+
+    const QColor selectedColor = dialog.selectedColor();
+    if (!selectedColor.isValid()) {
+        return;
+    }
+
+    setDisplayThemeColor(&currentDisplayTheme_, roleKey, selectedColor);
+    applyDisplayTheme(true);
+}
+
+void MainWindow::handleDisplayThemeFontEdited(const QString &roleKey)
+{
+    if (syncingDisplayThemeUi_) {
+        return;
+    }
+
+    const DisplayFontEditorWidgets widgets = displayThemeFontEditors_.value(roleKey);
+    if (widgets.family == nullptr || widgets.size == nullptr) {
+        return;
+    }
+
+    DisplayFontStyle style;
+    style.family = widgets.family->currentFont().family();
+    style.pointSize = widgets.size->value();
+    style.bold = widgets.bold != nullptr && widgets.bold->isChecked();
+    style.italic = widgets.italic != nullptr && widgets.italic->isChecked();
+    style.underline = widgets.underline != nullptr && widgets.underline->isChecked();
+    setDisplayThemeFontStyle(&currentDisplayTheme_, roleKey, style);
+    applyDisplayTheme(true);
+}
+
+void MainWindow::loadSelectedDisplayTheme()
+{
+    if (displayThemeSavedThemesCombo_ == nullptr) {
+        return;
+    }
+
+    const QString selectedName = displayThemeSavedThemesCombo_->currentText().trimmed();
+    for (const DisplayTheme &theme : displayThemeStore_.savedThemes) {
+        if (theme.name.trimmed().compare(selectedName, Qt::CaseInsensitive) != 0) {
+            continue;
+        }
+
+        currentDisplayTheme_ = normalizedDisplayTheme(theme);
+        currentDisplayTheme_.name = theme.name.trimmed();
+        if (displayThemeNameEdit_ != nullptr) {
+            displayThemeNameEdit_->setText(currentDisplayTheme_.name);
+        }
+        refreshSavedDisplayThemeList(currentDisplayTheme_.name);
+        applyDisplayTheme(true);
+        setDisplayThemeStatusMessage(QString("Loaded theme \"%1\".").arg(currentDisplayTheme_.name), true);
+        return;
+    }
+
+    setDisplayThemeStatusMessage("Select a saved theme first.", false);
+}
+
+void MainWindow::saveCurrentDisplayThemeAsNew()
+{
+    if (displayThemeNameEdit_ == nullptr) {
+        return;
+    }
+
+    const QString themeName = displayThemeNameEdit_->text().simplified();
+    if (themeName.isEmpty()) {
+        setDisplayThemeStatusMessage("Enter a theme name first.", false);
+        return;
+    }
+
+    for (const DisplayTheme &theme : displayThemeStore_.savedThemes) {
+        if (theme.name.trimmed().compare(themeName, Qt::CaseInsensitive) == 0) {
+            setDisplayThemeStatusMessage(QString("Theme \"%1\" already exists. Use Overwrite Selected instead.")
+                                             .arg(themeName),
+                                         false);
+            return;
+        }
+    }
+
+    currentDisplayTheme_.name = themeName;
+    displayThemeStore_.savedThemes.append(currentDisplayTheme_);
+    refreshSavedDisplayThemeList(themeName);
+    applyDisplayTheme(true);
+    setDisplayThemeStatusMessage(QString("Saved new theme \"%1\".").arg(themeName), true);
+}
+
+void MainWindow::overwriteSelectedDisplayTheme()
+{
+    if (displayThemeSavedThemesCombo_ == nullptr) {
+        return;
+    }
+
+    const QString selectedName = displayThemeSavedThemesCombo_->currentText().trimmed();
+    if (selectedName.isEmpty()) {
+        setDisplayThemeStatusMessage("Select a saved theme to overwrite.", false);
+        return;
+    }
+
+    for (int index = 0; index < displayThemeStore_.savedThemes.size(); ++index) {
+        if (displayThemeStore_.savedThemes.at(index).name.trimmed().compare(selectedName, Qt::CaseInsensitive) != 0) {
+            continue;
+        }
+
+        currentDisplayTheme_.name = selectedName;
+        displayThemeStore_.savedThemes[index] = currentDisplayTheme_;
+        refreshSavedDisplayThemeList(selectedName);
+        applyDisplayTheme(true);
+        setDisplayThemeStatusMessage(QString("Overwrote theme \"%1\".").arg(selectedName), true);
+        return;
+    }
+
+    setDisplayThemeStatusMessage("Select a saved theme to overwrite.", false);
+}
+
+void MainWindow::deleteSelectedDisplayTheme()
+{
+    if (displayThemeSavedThemesCombo_ == nullptr) {
+        return;
+    }
+
+    const QString selectedName = displayThemeSavedThemesCombo_->currentText().trimmed();
+    if (selectedName.isEmpty()) {
+        setDisplayThemeStatusMessage("Select a saved theme to delete.", false);
+        return;
+    }
+
+    for (int index = 0; index < displayThemeStore_.savedThemes.size(); ++index) {
+        if (displayThemeStore_.savedThemes.at(index).name.trimmed().compare(selectedName, Qt::CaseInsensitive) != 0) {
+            continue;
+        }
+
+        displayThemeStore_.savedThemes.removeAt(index);
+        refreshSavedDisplayThemeList();
+        persistDisplayThemeStore(QString("Deleted theme \"%1\".").arg(selectedName), true);
+        return;
+    }
+
+    setDisplayThemeStatusMessage("Select a saved theme to delete.", false);
+}
+
+void MainWindow::resetCurrentDisplayThemeToDefaults()
+{
+    currentDisplayTheme_ = defaultDisplayTheme_;
+    if (displayThemeNameEdit_ != nullptr) {
+        displayThemeNameEdit_->setText(currentDisplayTheme_.name);
+    }
+    refreshSavedDisplayThemeList(currentDisplayTheme_.name);
+    applyDisplayTheme(true);
+    setDisplayThemeStatusMessage("Reset the current theme to defaults.", true);
 }
 
 void MainWindow::handleGuideHideNoEitToggled(bool checked)
@@ -6043,11 +6830,7 @@ bool MainWindow::ensureSchedulesDirectJson(bool allowCachedExport,
     windowStartUtc = windowStartUtc.addSecs(-(windowStartUtc.time().minute() % 30) * 60);
 
     constexpr int slotMinutes = 30;
-    const qint64 minimumWindowSeconds = 6 * 3600;
-    const qint64 requestedWindowSeconds =
-        std::max(minimumWindowSeconds, windowStartUtc.secsTo(latestEndUtc) + slotMinutes * 60);
-    int slotCount = static_cast<int>(std::ceil(static_cast<double>(requestedWindowSeconds) / (slotMinutes * 60.0)));
-    slotCount = std::clamp(slotCount, 12, 32);
+    const int slotCount = guideWindowSlotCount(windowStartUtc, latestEndUtc, slotMinutes);
 
     QJsonArray channelOrderArray;
     for (const QString &channelName : channelOrder) {
@@ -6642,18 +7425,32 @@ void MainWindow::refreshScheduledSwitchList()
         return;
     }
 
+    if (!scheduledSwitchesList_->isVisibleTo(this)) {
+        scheduledSwitchListRefreshPending_ = true;
+        return;
+    }
+
+    scheduledSwitchListRefreshPending_ = false;
+    const QSignalBlocker blocker(scheduledSwitchesList_);
+    const bool restoreUpdates = scheduledSwitchesList_->updatesEnabled();
+    scheduledSwitchesList_->setUpdatesEnabled(false);
     scheduledSwitchesList_->clear();
+    QStringList labels;
+    labels.reserve(scheduledSwitches_.size());
     for (const TvGuideScheduledSwitch &scheduledSwitch : scheduledSwitches_) {
         const QString displayTitle = scheduledSwitch.title.trimmed().isEmpty()
                                          ? scheduledSwitch.channelName.trimmed()
                                          : scheduledSwitch.title.simplified();
-        QString label = QString("%1 (%2) | %3 | %4")
-                            .arg(displayTitle)
-                            .arg(favoriteShowRating(displayTitle))
-                            .arg(scheduledSwitch.channelName.trimmed())
-                            .arg(scheduledSwitch.startUtc.toLocalTime().toString("ddd h:mm AP"));
-        scheduledSwitchesList_->addItem(label);
+        labels.append(QString("%1 (%2) | %3 | %4")
+                          .arg(displayTitle)
+                          .arg(favoriteShowRating(displayTitle))
+                          .arg(scheduledSwitch.channelName.trimmed())
+                          .arg(scheduledSwitch.startUtc.toLocalTime().toString("ddd h:mm AP")));
     }
+    if (!labels.isEmpty()) {
+        scheduledSwitchesList_->addItems(labels);
+    }
+    scheduledSwitchesList_->setUpdatesEnabled(restoreUpdates);
     if (removeScheduledSwitchButton_ != nullptr) {
         removeScheduledSwitchButton_->setEnabled(false);
     }
@@ -6883,6 +7680,11 @@ void MainWindow::handleCurrentTabChanged(int index)
         return;
     }
 
+    if (scheduledSwitchListRefreshPending_ && scheduledSwitchesList_ != nullptr
+        && scheduledSwitchesList_->isVisibleTo(this)) {
+        refreshScheduledSwitchList();
+    }
+
     if (tabs_->widget(index) == tvGuideDialog_ && tvGuideDialog_ != nullptr) {
         tvGuideDialog_->syncToCurrentTime();
         const QDateTime nowUtc = QDateTime::currentDateTimeUtc();
@@ -7086,15 +7888,13 @@ bool MainWindow::loadScheduledSwitches()
     }
 
     scheduledSwitches_ = scheduledSwitchesFromJsonArray(document.object().value("switches").toArray());
-    appendLog(QString("schedule: loaded %1 switch(es) from disk -> %2")
-                  .arg(scheduledSwitches_.size())
-                  .arg(summarizeScheduledSwitchesDebug(scheduledSwitches_)));
+    appendLog(QString("schedule: loaded %1 switch(es) from disk").arg(scheduledSwitches_.size()));
     const bool pruned = pruneExpiredScheduledSwitches(true);
     if (pruned) {
         saveScheduledSwitches();
         showTransientStatusBarMessage("Pruning scheduled tunes", 3000);
-        appendLog(QString("schedule: pruned expired/duplicate switches after load -> %1")
-                      .arg(summarizeScheduledSwitchesDebug(scheduledSwitches_)));
+        appendLog(QString("schedule: pruned expired/duplicate switches after load; %1 remain")
+                      .arg(scheduledSwitches_.size()));
     }
     refreshScheduledSwitchList();
     return !scheduledSwitches_.isEmpty();
@@ -7104,6 +7904,9 @@ bool MainWindow::pruneExpiredScheduledSwitches(bool includeStartedSwitches)
 {
     const QDateTime nowUtc = QDateTime::currentDateTimeUtc();
     QList<TvGuideScheduledSwitch> cleaned;
+    cleaned.reserve(scheduledSwitches_.size());
+    QSet<QString> seenScheduledSwitchKeys;
+    seenScheduledSwitchKeys.reserve(scheduledSwitches_.size());
     bool changed = false;
 
     std::sort(scheduledSwitches_.begin(), scheduledSwitches_.end(), [](const TvGuideScheduledSwitch &left,
@@ -7129,17 +7932,12 @@ bool MainWindow::pruneExpiredScheduledSwitches(bool includeStartedSwitches)
             continue;
         }
 
-        bool duplicate = false;
-        for (const TvGuideScheduledSwitch &existing : cleaned) {
-            if (scheduledSwitchesMatch(existing, normalizedSwitch)) {
-                duplicate = true;
-                break;
-            }
-        }
-        if (duplicate) {
+        const QString switchKey = scheduledSwitchKey(normalizedSwitch);
+        if (switchKey.isEmpty() || seenScheduledSwitchKeys.contains(switchKey)) {
             changed = true;
             continue;
         }
+        seenScheduledSwitchKeys.insert(switchKey);
         cleaned.append(normalizedSwitch);
     }
 
@@ -7749,24 +8547,36 @@ void MainWindow::scheduleMatchingGuideEntriesForTitle(const QString &favoriteSho
                                                       const QString &sourceDescription,
                                                       bool promptForConflict)
 {
+    Q_UNUSED(promptForConflict);
+
     const QString normalizedTitle = normalizeFavoriteShowRule(favoriteShowTitle);
     const QDateTime nowUtc = QDateTime::currentDateTimeUtc();
     QList<TvGuideScheduledSwitch> matchingCandidates;
-    const auto appendCandidate = [&matchingCandidates](const TvGuideScheduledSwitch &candidate) {
-        if (candidate.channelName.trimmed().isEmpty()
-            || !candidate.startUtc.isValid()
-            || !candidate.endUtc.isValid()
-            || candidate.endUtc <= candidate.startUtc) {
+    QSet<QString> matchingCandidateKeys;
+    const auto scheduledSwitchKey = [](const TvGuideScheduledSwitch &scheduledSwitch) {
+        const TvGuideScheduledSwitch normalized = normalizedScheduledSwitch(scheduledSwitch);
+        return QString("%1|%2|%3|%4")
+            .arg(normalized.channelName,
+                 QString::number(normalized.startUtc.toSecsSinceEpoch()),
+                 QString::number(normalized.endUtc.toSecsSinceEpoch()),
+                 normalized.title);
+    };
+    const auto appendCandidate = [&matchingCandidates, &matchingCandidateKeys, &scheduledSwitchKey](
+                                     const TvGuideScheduledSwitch &candidate) {
+        const TvGuideScheduledSwitch normalizedCandidate = normalizedScheduledSwitch(candidate);
+        if (normalizedCandidate.channelName.trimmed().isEmpty()
+            || !normalizedCandidate.startUtc.isValid()
+            || !normalizedCandidate.endUtc.isValid()
+            || normalizedCandidate.endUtc <= normalizedCandidate.startUtc) {
             return;
         }
 
-        for (const TvGuideScheduledSwitch &existingCandidate : matchingCandidates) {
-            if (scheduledSwitchesMatch(existingCandidate, candidate)) {
-                return;
-            }
+        const QString candidateKey = scheduledSwitchKey(normalizedCandidate);
+        if (matchingCandidateKeys.contains(candidateKey)) {
+            return;
         }
-
-        matchingCandidates.append(candidate);
+        matchingCandidateKeys.insert(candidateKey);
+        matchingCandidates.append(normalizedCandidate);
     };
 
     if (scheduledSwitchEffectiveStartUtc(seedCandidate) > nowUtc
@@ -7822,11 +8632,49 @@ void MainWindow::scheduleMatchingGuideEntriesForTitle(const QString &favoriteSho
                                                       lastGuideWindowStartUtc_,
                                                       lastGuideSlotMinutes_,
                                                       lastGuideSlotCount_);
+    QSet<QString> existingScheduledKeys;
+    for (const TvGuideScheduledSwitch &existingSwitch : std::as_const(scheduledSwitches_)) {
+        existingScheduledKeys.insert(scheduledSwitchKey(existingSwitch));
+    }
+
+    QList<TvGuideScheduledSwitch> addedCandidates;
     for (const TvGuideScheduledSwitch &candidate : matchingCandidates) {
-        addScheduledSwitchCandidate(candidate, sourceDescription, promptForConflict);
-        if (scheduledSwitchListContains(scheduledSwitches_, candidate)) {
-            setAutoFavoriteDismissed(dismissedAutoFavoriteCandidates_, cacheStamp, candidate, false);
+        const QString candidateKey = scheduledSwitchKey(candidate);
+        if (existingScheduledKeys.contains(candidateKey)) {
+            continue;
         }
+        scheduledSwitches_.append(candidate);
+        existingScheduledKeys.insert(candidateKey);
+        addedCandidates.append(candidate);
+        setAutoFavoriteDismissed(dismissedAutoFavoriteCandidates_, cacheStamp, candidate, false);
+    }
+
+    if (!addedCandidates.isEmpty()) {
+        std::sort(scheduledSwitches_.begin(), scheduledSwitches_.end(), [](const TvGuideScheduledSwitch &left,
+                                                                           const TvGuideScheduledSwitch &right) {
+            if (left.startUtc == right.startUtc) {
+                return left.channelName < right.channelName;
+            }
+            return left.startUtc < right.startUtc;
+        });
+        saveScheduledSwitches();
+        refreshScheduledSwitchList();
+        updateTvGuideDialogFromCurrentCache(false);
+        refreshScheduledSwitchTimer();
+        appendLog(QString("%1 queued %2 new switch%3 for %4")
+                      .arg(sourceDescription)
+                      .arg(addedCandidates.size())
+                      .arg(addedCandidates.size() == 1 ? QString() : QString("es"))
+                      .arg(showTitle));
+        appendLog(QString("%1 queue after -> %2")
+                      .arg(sourceDescription, summarizeScheduledSwitchesDebug(scheduledSwitches_)));
+        showTransientStatusBarMessage(QString("Queued %1 switch%2 for %3")
+                                          .arg(addedCandidates.size())
+                                          .arg(addedCandidates.size() == 1 ? QString() : QString("es"))
+                                          .arg(showTitle),
+                                      4000);
+    } else {
+        appendLog(QString("%1 found no new future switches to queue for %2").arg(sourceDescription, showTitle));
     }
 
     savePersistedAutoFavoriteConflictState(cacheStamp, dismissedAutoFavoriteCandidates_);
@@ -8022,7 +8870,26 @@ void MainWindow::autoScheduleFavoriteShowsFromGuideCache(bool promptForConflict,
         }
     }
 
+    const auto scheduledSwitchKey = [](const TvGuideScheduledSwitch &scheduledSwitch) {
+        const TvGuideScheduledSwitch normalized = normalizedScheduledSwitch(scheduledSwitch);
+        if (normalized.channelName.trimmed().isEmpty()
+            || !normalized.startUtc.isValid()
+            || !normalized.endUtc.isValid()
+            || normalized.endUtc <= normalized.startUtc) {
+            return QString();
+        }
+
+        return QString("%1|%2|%3|%4")
+            .arg(normalized.channelName,
+                 QString::number(normalized.startUtc.toSecsSinceEpoch()),
+                 QString::number(normalized.endUtc.toSecsSinceEpoch()),
+                 normalizeFavoriteShowRule(normalized.title));
+    };
+
     QList<TvGuideScheduledSwitch> matchedCandidates;
+    QSet<QString> matchedCandidateKeys;
+    QStringList sampleMatches;
+    int dismissedCandidateCount = 0;
     for (const QString &favoriteRule : favoriteShowRules_) {
         const QString normalizedRule = normalizeFavoriteShowRule(favoriteRule);
         if (normalizedRule.isEmpty()) {
@@ -8041,22 +8908,21 @@ void MainWindow::autoScheduleFavoriteShowsFromGuideCache(bool promptForConflict,
                     continue;
                 }
                 if (isAutoFavoriteDismissed(dismissedAutoFavoriteCandidates_, currentCacheStamp, candidate)) {
-                    appendLog(QString("favorite-show auto: skipped dismissed candidate rule=%1 -> %2")
-                                  .arg(favoriteRule, scheduledSwitchDebugLabel(candidate)));
+                    ++dismissedCandidateCount;
                     continue;
                 }
 
-                bool duplicateCandidate = false;
-                for (const TvGuideScheduledSwitch &existingCandidate : matchedCandidates) {
-                    if (scheduledSwitchesMatch(existingCandidate, candidate)) {
-                        duplicateCandidate = true;
-                        break;
-                    }
+                const TvGuideScheduledSwitch normalizedCandidate = normalizedScheduledSwitch(candidate);
+                const QString candidateKey = scheduledSwitchKey(normalizedCandidate);
+                if (candidateKey.isEmpty() || matchedCandidateKeys.contains(candidateKey)) {
+                    continue;
                 }
-                if (!duplicateCandidate) {
-                    matchedCandidates.append(candidate);
-                    appendLog(QString("favorite-show auto: matched rule=%1 -> %2")
-                                  .arg(favoriteRule, scheduledSwitchDebugLabel(candidate)));
+
+                matchedCandidateKeys.insert(candidateKey);
+                matchedCandidates.append(normalizedCandidate);
+                if (sampleMatches.size() < 8) {
+                    sampleMatches.append(QString("%1 -> %2")
+                                             .arg(favoriteRule, scheduledSwitchDebugLabel(normalizedCandidate)));
                 }
             }
         }
@@ -8075,34 +8941,73 @@ void MainWindow::autoScheduleFavoriteShowsFromGuideCache(bool promptForConflict,
         }
         return left.startUtc < right.startUtc;
     });
-    appendLog(QString("favorite-show auto: sorted candidates=%1")
-                  .arg(summarizeScheduledSwitchesDebug(matchedCandidates)));
+    appendLog(QString("favorite-show auto: matched %1 future candidate%2 across %3 favorite%4 (dismissed=%5)")
+                  .arg(matchedCandidates.size())
+                  .arg(matchedCandidates.size() == 1 ? QString() : QString("s"))
+                  .arg(favoriteShowRules_.size())
+                  .arg(favoriteShowRules_.size() == 1 ? QString() : QString("s"))
+                  .arg(dismissedCandidateCount));
+    if (!sampleMatches.isEmpty()) {
+        appendLog(QString("favorite-show auto: sample matches -> %1").arg(sampleMatches.join(" || ")));
+    }
 
+    QSet<QString> existingScheduledKeys;
+    for (const TvGuideScheduledSwitch &existingSwitch : std::as_const(scheduledSwitches_)) {
+        const QString existingKey = scheduledSwitchKey(existingSwitch);
+        if (!existingKey.isEmpty()) {
+            existingScheduledKeys.insert(existingKey);
+        }
+    }
+
+    QList<TvGuideScheduledSwitch> addedCandidates;
+    int alreadyScheduledCount = 0;
     for (const TvGuideScheduledSwitch &candidate : matchedCandidates) {
-        appendLog(QString("favorite-show auto: queueing candidate=%1 queue-before=%2")
-                      .arg(scheduledSwitchDebugLabel(candidate),
-                           summarizeScheduledSwitchesDebug(scheduledSwitches_)));
-        addScheduledSwitchCandidate(candidate, "favorite-show auto:", promptForConflict);
-        setAutoFavoriteDismissed(dismissedAutoFavoriteCandidates_,
-                                 currentCacheStamp,
-                                 candidate,
-                                 !scheduledSwitchListContains(scheduledSwitches_, candidate));
-        appendLog(QString("favorite-show auto: candidate-result kept=%1 candidate=%2 queue-after=%3")
-                      .arg(scheduledSwitchListContains(scheduledSwitches_, candidate) ? "true" : "false",
-                           scheduledSwitchDebugLabel(candidate),
-                           summarizeScheduledSwitchesDebug(scheduledSwitches_)));
+        const QString candidateKey = scheduledSwitchKey(candidate);
+        if (candidateKey.isEmpty()) {
+            continue;
+        }
+
+        setAutoFavoriteDismissed(dismissedAutoFavoriteCandidates_, currentCacheStamp, candidate, false);
+        if (existingScheduledKeys.contains(candidateKey)) {
+            ++alreadyScheduledCount;
+            continue;
+        }
+
+        scheduledSwitches_.append(candidate);
+        existingScheduledKeys.insert(candidateKey);
+        addedCandidates.append(candidate);
+    }
+
+    if (!addedCandidates.isEmpty()) {
+        std::sort(scheduledSwitches_.begin(), scheduledSwitches_.end(), [](const TvGuideScheduledSwitch &left,
+                                                                           const TvGuideScheduledSwitch &right) {
+            if (left.startUtc == right.startUtc) {
+                return left.channelName < right.channelName;
+            }
+            return left.startUtc < right.startUtc;
+        });
+        saveScheduledSwitches();
+        refreshScheduledSwitchList();
+        updateTvGuideDialogFromCurrentCache(false);
+        refreshScheduledSwitchTimer();
     }
 
     lastAutoFavoriteScheduleStamp_ = currentCacheStamp;
     savePersistedAutoFavoriteConflictState(currentCacheStamp, dismissedAutoFavoriteCandidates_);
     if (!promptForConflict && !guideRefreshInProgress_) {
         const QString statusText = matchedCandidates.isEmpty()
-                                       ? "Background favorite-switch scan found no new matches"
-                                       : QString("Background favorite-switch scan checked %1 match%2")
+                                       ? "Background favorite-switch scan found no future matches"
+                                       : QString("Background favorite-switch scan checked %1 match%2 and queued %3 new switch%4")
                                              .arg(matchedCandidates.size())
-                                             .arg(matchedCandidates.size() == 1 ? QString() : QString("es"));
+                                             .arg(matchedCandidates.size() == 1 ? QString() : QString("es"))
+                                             .arg(addedCandidates.size())
+                                             .arg(addedCandidates.size() == 1 ? QString() : QString("es"));
         showTransientStatusBarMessage(statusText, 4000);
     }
+    appendLog(QString("favorite-show auto: queued %1 new switch%2 (%3 already scheduled)")
+                  .arg(addedCandidates.size())
+                  .arg(addedCandidates.size() == 1 ? QString() : QString("es"))
+                  .arg(alreadyScheduledCount));
     logInteraction("program",
                    "favorite-show.auto.complete",
                    QString("stamp=%1 final-queue=%2")
@@ -9039,10 +9944,7 @@ bool MainWindow::refreshGuideData(bool interactive, bool updateDialog)
     windowStartUtc = windowStartUtc.addSecs(-(windowStartUtc.time().minute() % 30) * 60);
 
     constexpr int slotMinutes = 30;
-    const qint64 minimumWindowSeconds = 6 * 3600;
-    const qint64 requestedWindowSeconds = std::max(minimumWindowSeconds, windowStartUtc.secsTo(latestEndUtc) + slotMinutes * 60);
-    int slotCount = static_cast<int>(std::ceil(static_cast<double>(requestedWindowSeconds) / (slotMinutes * 60.0)));
-    slotCount = std::clamp(slotCount, 12, 32);
+    const int slotCount = guideWindowSlotCount(windowStartUtc, latestEndUtc, slotMinutes);
 
     QString statusText = QString("Guide events: %1 mapped from %2 decoded across %3/%4 multiplexes.")
                              .arg(mappedEntries)

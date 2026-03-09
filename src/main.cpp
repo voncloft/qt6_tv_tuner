@@ -1,11 +1,14 @@
 #include <QApplication>
+#include <QColor>
 #include <QDateTime>
 #include <QDir>
 #include <QFile>
 #include <QIcon>
 #include <QLoggingCategory>
+#include <QPalette>
 #include <QTextStream>
 
+#include "DisplayTheme.h"
 #include "MainWindow.h"
 
 namespace {
@@ -91,6 +94,19 @@ int main(int argc, char *argv[])
     QApplication app(argc, argv);
     const QIcon appIcon(":/assets/tv-icon.svg");
     app.setWindowIcon(appIcon);
+    QString displayThemeError;
+    DisplayThemeStore displayThemeStore;
+    if (!loadDisplayThemeStore(&displayThemeStore, &displayThemeError)) {
+        displayThemeStore = defaultDisplayThemeStore();
+    }
+    const DisplayTheme currentDisplayTheme = normalizedDisplayTheme(displayThemeStore.currentTheme);
+    app.setFont(
+        qFontFromDisplayFontStyle(displayThemeFontStyle(currentDisplayTheme, DisplayThemeKeys::AppFont), app.font()));
+    app.setPalette(buildApplicationPalette(currentDisplayTheme, app.palette()));
+    app.setStyleSheet(buildScrollBarStyleSheet(currentDisplayTheme));
+    if (!displayThemeError.trimmed().isEmpty()) {
+        qWarning().noquote() << "display-theme:" << displayThemeError;
+    }
     qInfo() << "Startup env:"
             << "QT_QPA_PLATFORM=" << qEnvironmentVariable("QT_QPA_PLATFORM")
             << "QT_XCB_GL_INTEGRATION=" << qEnvironmentVariable("QT_XCB_GL_INTEGRATION")

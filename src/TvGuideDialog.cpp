@@ -59,6 +59,84 @@ enum SearchResultRoles {
     SearchIsFavoriteRole
 };
 
+struct TvGuideVisualTheme {
+    QColor background;
+    QColor text;
+    QColor secondaryText;
+    QColor episodeText;
+    QColor border;
+    QColor tabBackground;
+    QColor tabSelectedBackground;
+    QColor tabText;
+    QColor buttonBackground;
+    QColor buttonText;
+    QColor buttonBorder;
+    QColor gridLine;
+    QColor entryBackground;
+    QColor currentEntryBackground;
+    QColor entryBorder;
+    QColor nowLine;
+    QColor actionBackground;
+    QColor actionBorder;
+    QColor actionText;
+    QColor actionFavoriteText;
+    QColor emptyText;
+    QFont guideFont;
+    QFont guideHeaderFont;
+    QFont guideChannelFont;
+    QFont guideSearchFont;
+    QFont logFont;
+    QFont tabFont;
+    QFont buttonFont;
+    QFont inputFont;
+};
+
+TvGuideVisualTheme guideVisualThemeFor(const DisplayTheme &theme)
+{
+    const DisplayTheme normalized = normalizedDisplayTheme(theme);
+    const QFont fallbackFont = QApplication::font();
+
+    TvGuideVisualTheme visualTheme;
+    visualTheme.background = displayThemeColor(normalized, DisplayThemeKeys::GuideBackground);
+    visualTheme.text = displayThemeColor(normalized, DisplayThemeKeys::GuideText);
+    visualTheme.secondaryText = displayThemeColor(normalized, DisplayThemeKeys::GuideSecondaryText);
+    visualTheme.episodeText = displayThemeColor(normalized, DisplayThemeKeys::GuideEpisodeText);
+    visualTheme.border = displayThemeColor(normalized, DisplayThemeKeys::GuideBorder);
+    visualTheme.tabBackground = displayThemeColor(normalized, DisplayThemeKeys::GuideTabBackground);
+    visualTheme.tabSelectedBackground = displayThemeColor(normalized, DisplayThemeKeys::GuideTabSelectedBackground);
+    visualTheme.tabText = displayThemeColor(normalized, DisplayThemeKeys::GuideTabText);
+    visualTheme.buttonBackground = displayThemeColor(normalized, DisplayThemeKeys::GuideButtonBackground);
+    visualTheme.buttonText = displayThemeColor(normalized, DisplayThemeKeys::GuideButtonText);
+    visualTheme.buttonBorder = displayThemeColor(normalized, DisplayThemeKeys::GuideButtonBorder);
+    visualTheme.gridLine = displayThemeColor(normalized, DisplayThemeKeys::GuideGridLine);
+    visualTheme.entryBackground = displayThemeColor(normalized, DisplayThemeKeys::GuideEntryBackground);
+    visualTheme.currentEntryBackground = displayThemeColor(normalized, DisplayThemeKeys::GuideCurrentEntryBackground);
+    visualTheme.entryBorder = displayThemeColor(normalized, DisplayThemeKeys::GuideEntryBorder);
+    visualTheme.nowLine = displayThemeColor(normalized, DisplayThemeKeys::GuideNowLine);
+    visualTheme.actionBackground = displayThemeColor(normalized, DisplayThemeKeys::GuideActionBackground);
+    visualTheme.actionBorder = displayThemeColor(normalized, DisplayThemeKeys::GuideActionBorder);
+    visualTheme.actionText = displayThemeColor(normalized, DisplayThemeKeys::GuideActionText);
+    visualTheme.actionFavoriteText = displayThemeColor(normalized, DisplayThemeKeys::GuideActionFavoriteText);
+    visualTheme.emptyText = displayThemeColor(normalized, DisplayThemeKeys::GuideEmptyText);
+    visualTheme.guideFont =
+        qFontFromDisplayFontStyle(displayThemeFontStyle(normalized, DisplayThemeKeys::GuideFont), fallbackFont);
+    visualTheme.guideHeaderFont =
+        qFontFromDisplayFontStyle(displayThemeFontStyle(normalized, DisplayThemeKeys::GuideHeaderFont), fallbackFont);
+    visualTheme.guideChannelFont =
+        qFontFromDisplayFontStyle(displayThemeFontStyle(normalized, DisplayThemeKeys::GuideChannelFont), fallbackFont);
+    visualTheme.guideSearchFont =
+        qFontFromDisplayFontStyle(displayThemeFontStyle(normalized, DisplayThemeKeys::GuideSearchFont), fallbackFont);
+    visualTheme.logFont =
+        qFontFromDisplayFontStyle(displayThemeFontStyle(normalized, DisplayThemeKeys::LogFont), fallbackFont);
+    visualTheme.tabFont =
+        qFontFromDisplayFontStyle(displayThemeFontStyle(normalized, DisplayThemeKeys::TabFont), fallbackFont);
+    visualTheme.buttonFont =
+        qFontFromDisplayFontStyle(displayThemeFontStyle(normalized, DisplayThemeKeys::ButtonFont), fallbackFont);
+    visualTheme.inputFont =
+        qFontFromDisplayFontStyle(displayThemeFontStyle(normalized, DisplayThemeKeys::InputFont), fallbackFont);
+    return visualTheme;
+}
+
 bool guideEntriesMatch(const TvGuideEntry &left, const TvGuideEntry &right)
 {
     return left.startUtc == right.startUtc
@@ -118,6 +196,12 @@ QString normalizeFavoriteShowRule(const QString &title)
     return title.simplified().toCaseFolded();
 }
 
+QString formatGuideTimelineLabel(const QDateTime &slotStartUtc, bool spansMultipleDays)
+{
+    const QDateTime localStart = slotStartUtc.toLocalTime();
+    return spansMultipleDays ? localStart.toString("ddd HH:mm") : localStart.toString("h:mm AP");
+}
+
 int favoriteShowRatingForTitle(const QHash<QString, int> &favoriteShowRatings, const QString &title)
 {
     const QString normalizedTitle = normalizeFavoriteShowRule(title);
@@ -159,20 +243,24 @@ QString formatEntryLabel(const TvGuideEntry &entry, const QHash<QString, int> &f
     return lines.join('\n');
 }
 
-QString formatEntryHtml(const TvGuideEntry &entry, const QHash<QString, int> &favoriteShowRatings)
+QString formatEntryHtml(const TvGuideEntry &entry,
+                        const QHash<QString, int> &favoriteShowRatings,
+                        const TvGuideVisualTheme &visualTheme)
 {
     const GuideEntryDisplayParts parts = displayPartsForEntry(entry);
     const QString ratedTitle = formatRatedShowTitle(parts.title, favoriteShowRatings);
     QString html = QString("<div style=\"color:#ffffff;\">"
                            "<div style=\"font-weight:600; margin-bottom:4px;\">%1</div>")
                        .arg(ratedTitle.toHtmlEscaped());
+    html.replace("#ffffff", visualTheme.text.name());
     if (!parts.episodeTitle.isEmpty()) {
-        html += QString("<div style=\"color:#f1d27a; font-style:italic; margin-bottom:4px;\">%1</div>")
-                    .arg(parts.episodeTitle.toHtmlEscaped());
+        html += QString("<div style=\"color:%1; font-style:italic; margin-bottom:4px;\">%2</div>")
+                    .arg(visualTheme.episodeText.name(), parts.episodeTitle.toHtmlEscaped());
     }
     if (!parts.synopsisBody.isEmpty()) {
-        html += QString("<div style=\"color:#d4d4d4; font-size:90%%;\">%1</div>")
-                    .arg(parts.synopsisBody.toHtmlEscaped().replace('\n', "<br/>"));
+        html += QString("<div style=\"color:%1; font-size:90%%;\">%2</div>")
+                    .arg(visualTheme.secondaryText.name(),
+                         parts.synopsisBody.toHtmlEscaped().replace('\n', "<br/>"));
     }
     html += "</div>";
     return html;
@@ -228,10 +316,12 @@ struct SearchResultTextColors {
     QColor synopsis;
 };
 
-SearchResultTextColors searchResultTextColors(const QPalette &palette, bool selected)
+SearchResultTextColors searchResultTextColors(const QPalette &palette,
+                                             bool selected,
+                                             const TvGuideVisualTheme &visualTheme)
 {
     if (!selected) {
-        return {QColor("#ffffff"), QColor("#d4d4d4"), QColor("#f1d27a"), QColor("#c2c2c2")};
+        return {visualTheme.text, visualTheme.secondaryText, visualTheme.episodeText, visualTheme.secondaryText};
     }
 
     const QColor highlightedText = palette.color(QPalette::HighlightedText);
@@ -271,7 +361,8 @@ int measureSearchResultTextHeight(const QFont &font,
                                   const QString &title,
                                   const QString &timeChannel,
                                   const QString &episode,
-                                  const QString &synopsis)
+                                  const QString &synopsis,
+                                  const TvGuideVisualTheme &visualTheme)
 {
     if (width <= 0 || title.isEmpty()) {
         return 0;
@@ -284,7 +375,7 @@ int measureSearchResultTextHeight(const QFont &font,
                                             timeChannel,
                                             episode,
                                             synopsis,
-                                            searchResultTextColors(QPalette(), false)));
+                                            searchResultTextColors(QPalette(), false, visualTheme)));
     document.setTextWidth(width);
     return std::max(0, static_cast<int>(std::ceil(document.size().height())));
 }
@@ -296,7 +387,8 @@ void drawSearchResultText(QPainter &painter,
                           const QString &episode,
                           const QString &synopsis,
                           const QPalette &palette,
-                          bool selected)
+                          bool selected,
+                          const TvGuideVisualTheme &visualTheme)
 {
     if (!textRect.isValid() || title.isEmpty()) {
         return;
@@ -306,7 +398,11 @@ void drawSearchResultText(QPainter &painter,
     document.setDefaultFont(painter.font());
     document.setDocumentMargin(0);
     document.setHtml(
-        formatSearchResultHtml(title, timeChannel, episode, synopsis, searchResultTextColors(palette, selected)));
+        formatSearchResultHtml(title,
+                               timeChannel,
+                               episode,
+                               synopsis,
+                               searchResultTextColors(palette, selected, visualTheme)));
     document.setTextWidth(textRect.width());
 
     painter.save();
@@ -351,15 +447,16 @@ SearchResultLayoutRects searchResultLayoutRects(const QRect &itemRect, bool isCu
 void drawGuideStyleActionButton(QPainter &painter,
                                 const QRect &rect,
                                 const QString &text,
-                                const QColor &textColor = QColor(255, 255, 255))
+                                const TvGuideVisualTheme &visualTheme,
+                                const QColor &textColor)
 {
     if (!rect.isValid() || text.isEmpty()) {
         return;
     }
 
     painter.save();
-    painter.setPen(QPen(QColor(255, 96, 96), 1));
-    painter.setBrush(QColor(58, 12, 12));
+    painter.setPen(QPen(visualTheme.actionBorder, 1));
+    painter.setBrush(visualTheme.actionBackground);
     painter.drawRoundedRect(rect, 4, 4);
     painter.setPen(textColor);
     painter.drawText(rect.adjusted(6, 0, -6, 0), Qt::AlignCenter, text);
@@ -369,8 +466,9 @@ void drawGuideStyleActionButton(QPainter &painter,
 class SearchResultItemDelegate final : public QStyledItemDelegate
 {
 public:
-    explicit SearchResultItemDelegate(QObject *parent = nullptr)
+    explicit SearchResultItemDelegate(const TvGuideVisualTheme &visualTheme, QObject *parent = nullptr)
         : QStyledItemDelegate(parent)
+        , visualTheme_(visualTheme)
     {
     }
 
@@ -415,22 +513,29 @@ public:
                              index.data(SearchEpisodeRole).toString(),
                              index.data(SearchSynopsisRole).toString(),
                              option.palette,
-                             isSelected);
+                             isSelected,
+                             visualTheme_);
 
         if (isCurrent) {
             drawGuideStyleActionButton(*painter,
                                        rects.watchRect,
-                                       watchActionLabelForWidth(option.fontMetrics, rects.watchRect.width()));
+                                       watchActionLabelForWidth(option.fontMetrics, rects.watchRect.width()),
+                                       visualTheme_,
+                                       visualTheme_.actionText);
         }
         drawGuideStyleActionButton(
-            *painter, rects.favoriteRect, favoriteActionLabel(isFavorite), QColor(96, 255, 96));
+            *painter, rects.favoriteRect, favoriteActionLabel(isFavorite), visualTheme_, visualTheme_.actionFavoriteText);
     }
+
+private:
+    TvGuideVisualTheme visualTheme_;
 };
 
 int measureEntryTextHeight(const QFont &font,
                            int width,
                            const TvGuideEntry &entry,
-                           const QHash<QString, int> &favoriteShowRatings)
+                           const QHash<QString, int> &favoriteShowRatings,
+                           const TvGuideVisualTheme &visualTheme)
 {
     if (width <= 0 || entry.title.trimmed().isEmpty()) {
         return 0;
@@ -439,7 +544,7 @@ int measureEntryTextHeight(const QFont &font,
     QTextDocument document;
     document.setDefaultFont(font);
     document.setDocumentMargin(0);
-    document.setHtml(formatEntryHtml(entry, favoriteShowRatings));
+    document.setHtml(formatEntryHtml(entry, favoriteShowRatings, visualTheme));
     document.setTextWidth(width);
     return std::max(0, static_cast<int>(std::ceil(document.size().height())));
 }
@@ -447,7 +552,8 @@ int measureEntryTextHeight(const QFont &font,
 void drawEntryText(QPainter &painter,
                    const QRect &textRect,
                    const TvGuideEntry &entry,
-                   const QHash<QString, int> &favoriteShowRatings)
+                   const QHash<QString, int> &favoriteShowRatings,
+                   const TvGuideVisualTheme &visualTheme)
 {
     if (!textRect.isValid() || entry.title.trimmed().isEmpty()) {
         return;
@@ -456,7 +562,7 @@ void drawEntryText(QPainter &painter,
     QTextDocument document;
     document.setDefaultFont(painter.font());
     document.setDocumentMargin(0);
-    document.setHtml(formatEntryHtml(entry, favoriteShowRatings));
+    document.setHtml(formatEntryHtml(entry, favoriteShowRatings, visualTheme));
     document.setTextWidth(textRect.width());
 
     painter.save();
@@ -491,16 +597,19 @@ public:
                               int slotMinutes,
                               int slotCount,
                               int timelineWidth,
+                              const TvGuideVisualTheme &visualTheme,
                               QWidget *parent = nullptr)
         : QWidget(parent)
         , windowStartUtc_(windowStartUtc)
         , slotMinutes_(slotMinutes)
         , slotCount_(slotCount)
         , timelineWidth_(timelineWidth)
+        , visualTheme_(visualTheme)
     {
         setMinimumHeight(kGuideHeaderHeight);
         setMaximumHeight(kGuideHeaderHeight);
         setMinimumWidth(std::max(timelineWidth_, 1));
+        setFont(visualTheme_.guideHeaderFont);
     }
 
     QSize sizeHint() const override
@@ -514,8 +623,8 @@ protected:
         Q_UNUSED(event);
 
         QPainter painter(this);
-        painter.fillRect(rect(), QColor(0, 0, 0));
-        painter.setPen(QPen(QColor(74, 74, 74), kGuideGridLineWidth));
+        painter.fillRect(rect(), visualTheme_.background);
+        painter.setPen(QPen(visualTheme_.border, kGuideGridLineWidth));
 
         const int slotCount = std::max(slotCount_, 1);
         for (int col = 0; col <= slotCount; ++col) {
@@ -524,14 +633,21 @@ protected:
         }
         painter.drawLine(0, height() - 1, width(), height() - 1);
 
-        painter.setPen(QColor(255, 255, 255));
+        painter.setPen(visualTheme_.text);
+        painter.setFont(visualTheme_.guideHeaderFont);
+        const QDateTime windowEndUtc =
+            windowStartUtc_.addSecs(static_cast<qint64>(std::max(slotCount_, 0)) * slotMinutes_ * 60);
+        const bool spansMultipleDays =
+            windowStartUtc_.isValid()
+            && windowEndUtc.isValid()
+            && windowStartUtc_.toLocalTime().date() != windowEndUtc.toLocalTime().date();
         for (int col = 0; col < slotCount_; ++col) {
             const int left = std::lround(static_cast<double>(col) * width() / slotCount);
             const int right = std::lround(static_cast<double>(col + 1) * width() / slotCount);
             const QRect slotRect(left, 0, std::max(1, right - left), height());
-            const QString label = windowStartUtc_.addSecs(static_cast<qint64>(col) * slotMinutes_ * 60)
-                                      .toLocalTime()
-                                      .toString("h:mm AP");
+            const QString label =
+                formatGuideTimelineLabel(windowStartUtc_.addSecs(static_cast<qint64>(col) * slotMinutes_ * 60),
+                                         spansMultipleDays);
             painter.drawText(slotRect.adjusted(6, 0, -6, 0), Qt::AlignHCenter | Qt::AlignVCenter, label);
         }
 
@@ -548,7 +664,7 @@ protected:
         const int nowX = std::clamp(static_cast<int>(std::llround(static_cast<double>(nowOffset) * width() / totalSeconds)),
                                     0,
                                     width() - 1);
-        painter.setPen(QPen(QColor(255, 96, 96), 2));
+        painter.setPen(QPen(visualTheme_.nowLine, 2));
         painter.drawLine(nowX, 0, nowX, height());
     }
 
@@ -557,6 +673,7 @@ private:
     int slotMinutes_{30};
     int slotCount_{0};
     int timelineWidth_{0};
+    TvGuideVisualTheme visualTheme_;
 };
 
 class GuideChannelBandWidget final : public QWidget
@@ -568,6 +685,7 @@ public:
                            int slotMinutes,
                            int slotCount,
                            int timelineWidth,
+                           const TvGuideVisualTheme &visualTheme,
                            std::function<bool(const TvGuideEntry &)> isEntryScheduled,
                            std::function<void(const TvGuideEntry &, bool)> toggleSchedule,
                            std::function<void(const TvGuideEntry &)> watchNow,
@@ -579,11 +697,13 @@ public:
         , slotMinutes_(slotMinutes)
         , slotCount_(slotCount)
         , timelineWidth_(timelineWidth)
+        , visualTheme_(visualTheme)
         , isEntryScheduled_(std::move(isEntryScheduled))
         , toggleSchedule_(std::move(toggleSchedule))
         , watchNow_(std::move(watchNow))
     {
         setMouseTracking(true);
+        setFont(visualTheme_.guideFont);
         setMinimumWidth(std::max(timelineWidth_, 1));
         rowHeight_ = preferredRowHeight();
         setMinimumHeight(rowHeight_);
@@ -601,10 +721,10 @@ protected:
         Q_UNUSED(event);
 
         QPainter painter(this);
-        painter.fillRect(rect(), QColor(0, 0, 0));
+        painter.fillRect(rect(), visualTheme_.background);
 
         const int slotCount = std::max(slotCount_, 1);
-        painter.setPen(QPen(QColor(52, 52, 52), kGuideGridLineWidth));
+        painter.setPen(QPen(visualTheme_.gridLine, kGuideGridLineWidth));
         for (int col = 0; col <= slotCount; ++col) {
             const int x = std::lround(static_cast<double>(col) * width() / slotCount);
             painter.drawLine(x, 0, x, height());
@@ -672,17 +792,17 @@ protected:
                     watchRect = box.adjusted(6, 6, -6, -6);
                 }
             }
-            painter.setPen(QPen(QColor(120, 120, 120), kGuideBoxBorderWidth));
-            painter.setBrush(airingNow ? QColor(28, 28, 28) : QColor(16, 16, 16));
+            painter.setPen(QPen(visualTheme_.entryBorder, kGuideBoxBorderWidth));
+            painter.setBrush(airingNow ? visualTheme_.currentEntryBackground : visualTheme_.entryBackground);
             painter.drawRect(box);
 
             if (canSchedule) {
-                painter.setPen(QPen(QColor(205, 205, 205), 1));
-                painter.setBrush(scheduled ? QColor(255, 96, 96) : QColor(0, 0, 0));
+                painter.setPen(QPen(visualTheme_.secondaryText, 1));
+                painter.setBrush(scheduled ? visualTheme_.nowLine : visualTheme_.background);
                 painter.drawRect(checkboxRect);
                 if (scheduled) {
                     painter.setRenderHint(QPainter::Antialiasing, true);
-                    painter.setPen(QPen(QColor(255, 255, 255), 2));
+                    painter.setPen(QPen(visualTheme_.text, 2));
                     painter.drawLine(checkboxRect.left() + 3,
                                      checkboxRect.center().y(),
                                      checkboxRect.left() + 7,
@@ -696,18 +816,20 @@ protected:
             } else if (canWatchNow) {
                 if (watchRect.width() >= 44) {
                     const QString watchLabel = watchActionLabelForWidth(painter.fontMetrics(), watchRect.width());
-                    drawGuideStyleActionButton(painter, watchRect, watchLabel);
+                    drawGuideStyleActionButton(painter, watchRect, watchLabel, visualTheme_, visualTheme_.actionText);
                 }
             }
             entryActionTargets_.append({checkboxRect, watchRect, box, entry, scheduled});
 
-            painter.setPen(QColor(255, 255, 255));
-            drawEntryText(painter, box.adjusted(10, 8, -actionInset, -8), entry, favoriteShowRatings_);
+            painter.setPen(visualTheme_.text);
+            painter.setFont(visualTheme_.guideFont);
+            drawEntryText(
+                painter, box.adjusted(10, 8, -actionInset, -8), entry, favoriteShowRatings_, visualTheme_);
             renderedAny = true;
         }
 
         if (!renderedAny) {
-            painter.setPen(QColor(160, 160, 160));
+            painter.setPen(visualTheme_.emptyText);
             painter.drawText(rect().adjusted(10, 0, -10, 0), Qt::AlignCenter, "NO GUIDE DATA");
         }
 
@@ -716,7 +838,7 @@ protected:
             const int nowX = std::clamp(static_cast<int>(std::llround(static_cast<double>(nowOffset) * width() / totalSeconds)),
                                         0,
                                         width() - 1);
-            painter.setPen(QPen(QColor(255, 96, 96), 2));
+            painter.setPen(QPen(visualTheme_.nowLine, 2));
             painter.drawLine(nowX, 0, nowX, height());
         }
     }
@@ -835,7 +957,8 @@ private:
                                                       : (airingNow && static_cast<bool>(watchNow_) && boxWidth >= 62
                                                              ? (kGuideWatchNowButtonWidth + 16)
                                                              : 0)));
-            const int textHeight = measureEntryTextHeight(font(), textWidth, entry, favoriteShowRatings_);
+            const int textHeight =
+                measureEntryTextHeight(visualTheme_.guideFont, textWidth, entry, favoriteShowRatings_, visualTheme_);
             preferred = std::max(preferred, textHeight + 26);
         }
 
@@ -849,6 +972,7 @@ private:
     int slotCount_{0};
     int timelineWidth_{0};
     int rowHeight_{kGuideRowHeight};
+    TvGuideVisualTheme visualTheme_;
     std::function<bool(const TvGuideEntry &)> isEntryScheduled_;
     std::function<void(const TvGuideEntry &, bool)> toggleSchedule_;
     std::function<void(const TvGuideEntry &)> watchNow_;
@@ -861,17 +985,6 @@ TvGuideDialog::TvGuideDialog(QWidget *parent)
     : QWidget(parent)
 {
     auto *layout = new QVBoxLayout(this);
-    setStyleSheet(
-        "QWidget { background-color: #000000; color: #ffffff; }"
-        "QPushButton { background-color: #0f0f0f; color: #ffffff; border: 1px solid #444444; padding: 6px 12px; }"
-        "QPushButton:disabled { color: #888888; border-color: #222222; }"
-        "QTabWidget::pane { border: 1px solid #4a4a4a; top: -1px; }"
-        "QTabBar::tab { background-color: #0a0a0a; color: #ffffff; border: 1px solid #4a4a4a; padding: 8px 14px; min-width: 110px; }"
-        "QTabBar::tab:selected { background-color: #111111; }"
-        "QLineEdit, QListWidget { background-color: #050505; color: #ffffff; border: 1px solid #4a4a4a; }"
-        "QPlainTextEdit { background-color: #000000; color: #ffffff; border: 1px solid #4a4a4a; }"
-        "QTableWidget { background-color: #000000; alternate-background-color: #090909; color: #ffffff; gridline-color: #4a4a4a; }"
-        "QHeaderView::section { background-color: #000000; color: #ffffff; border: 1px solid #4a4a4a; padding: 4px; }");
 
     auto *controls = new QHBoxLayout();
     refreshButton_ = new QPushButton("Reload Cache", this);
@@ -895,12 +1008,12 @@ TvGuideDialog::TvGuideDialog(QWidget *parent)
     guideMatrixLayout->setVerticalSpacing(0);
 
     auto *cornerLabel = new QLabel("Channel", guideMatrix);
+    cornerLabel->setObjectName("guideCornerLabel");
     cornerLabel->setMinimumWidth(kGuideChannelLabelWidth);
     cornerLabel->setMaximumWidth(kGuideChannelLabelWidth);
     cornerLabel->setMinimumHeight(kGuideHeaderHeight);
     cornerLabel->setMaximumHeight(kGuideHeaderHeight);
     cornerLabel->setAlignment(Qt::AlignLeft | Qt::AlignVCenter);
-    cornerLabel->setStyleSheet("QLabel { color: #ffffff; font-weight: 600; }");
     guideMatrixLayout->addWidget(cornerLabel, 0, 0);
 
     guideHeaderViewport_ = new QWidget(guideMatrix);
@@ -970,7 +1083,6 @@ TvGuideDialog::TvGuideDialog(QWidget *parent)
     showSearchResultsList_->setSelectionMode(QAbstractItemView::SingleSelection);
     showSearchResultsList_->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
     showSearchResultsList_->setWordWrap(true);
-    showSearchResultsList_->setItemDelegate(new SearchResultItemDelegate(showSearchResultsList_));
     showSearchResultsList_->viewport()->installEventFilter(this);
     searchLayout->addWidget(showSearchResultsList_, 1);
 
@@ -1010,6 +1122,79 @@ TvGuideDialog::TvGuideDialog(QWidget *parent)
     logsView_->setPlainText("No guide data loaded yet.");
     logsLayout->addWidget(logsView_);
     tabs_->addTab(logsTab, "Status");
+
+    setDisplayTheme(defaultDisplayTheme());
+}
+
+void TvGuideDialog::setDisplayTheme(const DisplayTheme &theme)
+{
+    displayTheme_ = normalizedDisplayTheme(theme);
+    const TvGuideVisualTheme visualTheme = guideVisualThemeFor(displayTheme_);
+
+    setFont(visualTheme.guideFont);
+    setStyleSheet(
+        QString(
+            "QWidget { background-color: %1; color: %2; }"
+            "QPushButton { background-color: %3; color: %4; border: 1px solid %5; padding: 6px 12px; }"
+            "QPushButton:disabled { color: %6; border-color: %7; }"
+            "QTabWidget::pane { border: 1px solid %8; top: -1px; }"
+            "QTabBar::tab { background-color: %9; color: %10; border: 1px solid %8; padding: 8px 14px; min-width: 110px; }"
+            "QTabBar::tab:selected { background-color: %11; }"
+            "QLineEdit, QListWidget { background-color: %12; color: %13; border: 1px solid %8; }"
+            "QPlainTextEdit { background-color: %1; color: %2; border: 1px solid %8; }"
+            "QTableWidget { background-color: %1; alternate-background-color: %12; color: %2; gridline-color: %8; }"
+            "QHeaderView::section { background-color: %1; color: %2; border: 1px solid %8; padding: 4px; }")
+            .arg(visualTheme.background.name(),
+                 visualTheme.text.name(),
+                 visualTheme.buttonBackground.name(),
+                 visualTheme.buttonText.name(),
+                 visualTheme.buttonBorder.name(),
+                 displayThemeColor(displayTheme_, DisplayThemeKeys::ButtonDisabledText).name(),
+                 displayThemeColor(displayTheme_, DisplayThemeKeys::ButtonDisabledBorder).name(),
+                 visualTheme.border.name(),
+                 visualTheme.tabBackground.name(),
+                 visualTheme.tabText.name(),
+                 visualTheme.tabSelectedBackground.name(),
+                 displayThemeColor(displayTheme_, DisplayThemeKeys::InputBackground).name(),
+                 displayThemeColor(displayTheme_, DisplayThemeKeys::InputText).name()));
+
+    if (tabs_ != nullptr && tabs_->tabBar() != nullptr) {
+        tabs_->tabBar()->setFont(visualTheme.tabFont);
+    }
+    for (QLabel *label : findChildren<QLabel *>()) {
+        if (label != nullptr) {
+            label->setFont(visualTheme.guideSearchFont);
+        }
+    }
+    if (QLabel *cornerLabel = findChild<QLabel *>("guideCornerLabel")) {
+        cornerLabel->setFont(visualTheme.guideHeaderFont);
+        cornerLabel->setStyleSheet(QString("QLabel { color: %1; }").arg(visualTheme.text.name()));
+    }
+    if (refreshButton_ != nullptr) {
+        refreshButton_->setFont(visualTheme.buttonFont);
+    }
+    if (showSearchEdit_ != nullptr) {
+        showSearchEdit_->setFont(visualTheme.inputFont);
+    }
+    if (showSearchResultsList_ != nullptr) {
+        showSearchResultsList_->setFont(visualTheme.guideSearchFont);
+        if (QAbstractItemDelegate *existingDelegate = showSearchResultsList_->itemDelegate();
+            existingDelegate != nullptr && existingDelegate->parent() == showSearchResultsList_) {
+            existingDelegate->deleteLater();
+        }
+        showSearchResultsList_->setItemDelegate(new SearchResultItemDelegate(visualTheme, showSearchResultsList_));
+    }
+    if (showSearchSummaryLabel_ != nullptr) {
+        showSearchSummaryLabel_->setFont(visualTheme.guideSearchFont);
+    }
+    if (logsView_ != nullptr) {
+        logsView_->setFont(visualTheme.logFont);
+    }
+
+    if (slotCount_ > 0) {
+        updateSearchResults();
+        renderGuideTable();
+    }
 }
 
 bool TvGuideDialog::eventFilter(QObject *watched, QEvent *event)
@@ -1129,6 +1314,7 @@ void TvGuideDialog::showEvent(QShowEvent *event)
         }
         if (pendingGuideRender_ || (pendingSyncToCurrentTime_ && slotCount_ > 0)) {
             pendingGuideRender_ = false;
+            updateSearchResults();
             renderGuideTable();
         }
     });
@@ -1183,7 +1369,6 @@ void TvGuideDialog::setGuideData(const QStringList &channelOrder,
     windowStartUtc_ = windowStartUtc;
     slotMinutes_ = slotMinutes;
     slotCount_ = slotCount;
-    updateSearchResults();
 
     if (!isVisible()
         || guideScrollArea_ == nullptr
@@ -1194,6 +1379,7 @@ void TvGuideDialog::setGuideData(const QStringList &channelOrder,
     }
 
     pendingGuideRender_ = false;
+    updateSearchResults();
     renderGuideTable();
 }
 
@@ -1267,6 +1453,7 @@ void TvGuideDialog::updateSearchResults()
     });
 
     searchResults_ = matchedResults;
+    const TvGuideVisualTheme visualTheme = guideVisualThemeFor(displayTheme_);
     const int viewportWidth =
         showSearchResultsList_->viewport() != nullptr ? showSearchResultsList_->viewport()->width() : 720;
     const int buttonWidth = searchResultButtonWidth(QFontMetrics(showSearchResultsList_->font()));
@@ -1301,7 +1488,8 @@ void TvGuideDialog::updateSearchResults()
                                                          ratedTitle,
                                                          timeChannelText,
                                                          parts.episodeTitle,
-                                                         parts.synopsisBody),
+                                                         parts.synopsisBody,
+                                                         visualTheme),
                            isCurrent ? (2 * kSearchButtonHeight) + kSearchButtonSpacing : kSearchButtonHeight)
                       + (2 * kSearchResultMargin)));
 
@@ -1424,11 +1612,13 @@ void TvGuideDialog::renderGuideTable()
 
     currentGuideSlotPixelWidth_ = guideSlotPixelWidth();
     const int timelineWidth = std::max(slotCount_, 1) * currentGuideSlotPixelWidth_;
+    const TvGuideVisualTheme visualTheme = guideVisualThemeFor(displayTheme_);
 
     auto *timelineHeader = new GuideTimelineHeaderWidget(windowStartUtc_,
                                                          slotMinutes_,
                                                          slotCount_,
                                                          timelineWidth,
+                                                         visualTheme,
                                                          guideHeaderContent_);
     guideHeaderLayout->addWidget(timelineHeader);
 
@@ -1440,6 +1630,7 @@ void TvGuideDialog::renderGuideTable()
                                                       slotMinutes_,
                                                       slotCount_,
                                                       timelineWidth,
+                                                      visualTheme,
                                                       [this, channel](const TvGuideEntry &entry) {
                                                           return isEntryScheduled(channel, entry);
                                                       },
@@ -1459,7 +1650,9 @@ void TvGuideDialog::renderGuideTable()
         channelLabel->setMaximumWidth(kGuideChannelLabelWidth);
         channelLabel->setMinimumHeight(rowHeight);
         channelLabel->setMaximumHeight(rowHeight);
-        channelLabel->setStyleSheet("QLabel { color: #ffffff; padding-right: 8px; }");
+        channelLabel->setFont(visualTheme.guideChannelFont);
+        channelLabel->setStyleSheet(
+            QString("QLabel { color: %1; padding-right: 8px; }").arg(visualTheme.text.name()));
         guideChannelsLayout->addWidget(channelLabel);
 
         guideRowsLayout->addWidget(bandWidget);
@@ -1476,6 +1669,7 @@ void TvGuideDialog::renderGuideTable()
 
         auto *emptyLabel = new QLabel("No channels matched the current guide filter.", guideContent_);
         emptyLabel->setAlignment(Qt::AlignCenter);
+        emptyLabel->setStyleSheet(QString("QLabel { color: %1; }").arg(visualTheme.emptyText.name()));
         emptyLabel->setMinimumHeight(kGuideRowHeight);
         emptyLabel->setMaximumHeight(kGuideRowHeight);
         guideRowsLayout->addWidget(emptyLabel);
