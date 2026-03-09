@@ -188,6 +188,7 @@ private:
     void saveTestingBugItems() const;
     bool addTestingBugItemEntry(const QString &text, bool checked);
     bool addFavoriteShowRule(const QString &title);
+    bool removeFavoriteShowRule(const QString &title);
     bool resolveScheduledSwitchChoices(const QList<TvGuideScheduledSwitch> &candidates,
                                        const QString &sourceDescription,
                                        bool promptForConflict,

@@ -17,6 +17,9 @@
 #include <QPushButton>
 #include <QScrollArea>
 #include <QScrollBar>
+#include <QStyledItemDelegate>
+#include <QStyle>
+#include <QStyleOptionButton>
 #include <QTabWidget>
 #include <QTextDocument>
 #include <QTimer>
@@ -39,6 +42,22 @@ constexpr int kGuideScheduleCheckboxSize = 16;
 constexpr int kGuideWatchNowButtonWidth = 118;
 constexpr int kGuideWatchNowButtonHeight = 24;
 constexpr int kDefaultFavoriteShowRating = 1;
+constexpr int kSearchResultMargin = 8;
+constexpr int kSearchResultSpacing = 10;
+constexpr int kSearchButtonMinWidth = 132;
+constexpr int kSearchButtonHeight = 28;
+constexpr int kSearchButtonSpacing = 6;
+constexpr int kSearchMinimumTextWidth = 240;
+constexpr int kSearchButtonHorizontalPadding = 28;
+
+enum SearchResultRoles {
+    SearchTitleRole = Qt::UserRole + 1,
+    SearchTimeChannelRole,
+    SearchEpisodeRole,
+    SearchSynopsisRole,
+    SearchIsCurrentRole,
+    SearchIsFavoriteRole
+};
 
 bool guideEntriesMatch(const TvGuideEntry &left, const TvGuideEntry &right)
 {
@@ -187,6 +206,226 @@ QString watchActionLabelForWidth(const QFontMetrics &metrics, int width)
     }
     return {};
 }
+
+int searchResultButtonWidth(const QFontMetrics &metrics)
+{
+    return std::max(kSearchButtonMinWidth,
+                    std::max({metrics.horizontalAdvance("Watch Now"),
+                              metrics.horizontalAdvance("Add to Favorites"),
+                              metrics.horizontalAdvance("Remove from Favorites")})
+                        + kSearchButtonHorizontalPadding);
+}
+
+QString favoriteActionLabel(bool isFavorite)
+{
+    return isFavorite ? "Remove from Favorites" : "Add to Favorites";
+}
+
+struct SearchResultTextColors {
+    QColor title;
+    QColor meta;
+    QColor episode;
+    QColor synopsis;
+};
+
+SearchResultTextColors searchResultTextColors(const QPalette &palette, bool selected)
+{
+    if (!selected) {
+        return {QColor("#ffffff"), QColor("#d4d4d4"), QColor("#f1d27a"), QColor("#c2c2c2")};
+    }
+
+    const QColor highlightedText = palette.color(QPalette::HighlightedText);
+    return {highlightedText,
+            highlightedText.lighter(125),
+            highlightedText.lighter(110),
+            highlightedText.lighter(115)};
+}
+
+QString formatSearchResultHtml(const QString &title,
+                              const QString &timeChannel,
+                              const QString &episode,
+                              const QString &synopsis,
+                              const SearchResultTextColors &colors)
+{
+    QString html = QString("<div style=\"color:%1;\">"
+                           "<div style=\"font-weight:600; margin-bottom:4px;\">%2</div>")
+                       .arg(colors.title.name(), title.toHtmlEscaped());
+    if (!timeChannel.isEmpty()) {
+        html += QString("<div style=\"color:%1; margin-bottom:4px;\">%2</div>")
+                    .arg(colors.meta.name(), timeChannel.toHtmlEscaped());
+    }
+    if (!episode.isEmpty()) {
+        html += QString("<div style=\"color:%1; font-style:italic; margin-bottom:4px;\">Episode: %2</div>")
+                    .arg(colors.episode.name(), episode.toHtmlEscaped());
+    }
+    if (!synopsis.isEmpty()) {
+        html += QString("<div style=\"color:%1;\">Synopsis: %2</div>")
+                    .arg(colors.synopsis.name(), synopsis.toHtmlEscaped().replace('\n', "<br/>"));
+    }
+    html += "</div>";
+    return html;
+}
+
+int measureSearchResultTextHeight(const QFont &font,
+                                  int width,
+                                  const QString &title,
+                                  const QString &timeChannel,
+                                  const QString &episode,
+                                  const QString &synopsis)
+{
+    if (width <= 0 || title.isEmpty()) {
+        return 0;
+    }
+
+    QTextDocument document;
+    document.setDefaultFont(font);
+    document.setDocumentMargin(0);
+    document.setHtml(formatSearchResultHtml(title,
+                                            timeChannel,
+                                            episode,
+                                            synopsis,
+                                            searchResultTextColors(QPalette(), false)));
+    document.setTextWidth(width);
+    return std::max(0, static_cast<int>(std::ceil(document.size().height())));
+}
+
+void drawSearchResultText(QPainter &painter,
+                          const QRect &textRect,
+                          const QString &title,
+                          const QString &timeChannel,
+                          const QString &episode,
+                          const QString &synopsis,
+                          const QPalette &palette,
+                          bool selected)
+{
+    if (!textRect.isValid() || title.isEmpty()) {
+        return;
+    }
+
+    QTextDocument document;
+    document.setDefaultFont(painter.font());
+    document.setDocumentMargin(0);
+    document.setHtml(
+        formatSearchResultHtml(title, timeChannel, episode, synopsis, searchResultTextColors(palette, selected)));
+    document.setTextWidth(textRect.width());
+
+    painter.save();
+    painter.translate(textRect.topLeft());
+    const QRectF clipRect(0, 0, textRect.width(), textRect.height());
+    document.drawContents(&painter, clipRect);
+    painter.restore();
+}
+
+struct SearchResultLayoutRects {
+    QRect textRect;
+    QRect watchRect;
+    QRect favoriteRect;
+};
+
+SearchResultLayoutRects searchResultLayoutRects(const QRect &itemRect, bool isCurrent, int buttonWidth)
+{
+    SearchResultLayoutRects rects;
+    if (!itemRect.isValid()) {
+        return rects;
+    }
+
+    const int contentWidth =
+        std::max(0, itemRect.width() - (2 * kSearchResultMargin) - buttonWidth - kSearchResultSpacing);
+    const int contentHeight = std::max(0, itemRect.height() - (2 * kSearchResultMargin));
+    const int contentLeft = itemRect.left() + kSearchResultMargin;
+    const int contentTop = itemRect.top() + kSearchResultMargin;
+    const int buttonLeft = itemRect.right() - kSearchResultMargin - buttonWidth + 1;
+
+    rects.textRect = QRect(contentLeft, contentTop, contentWidth, contentHeight);
+    rects.favoriteRect =
+        QRect(buttonLeft,
+              contentTop + (isCurrent ? kSearchButtonHeight + kSearchButtonSpacing : 0),
+              buttonWidth,
+              kSearchButtonHeight);
+    if (isCurrent) {
+        rects.watchRect = QRect(buttonLeft, contentTop, buttonWidth, kSearchButtonHeight);
+    }
+    return rects;
+}
+
+void drawGuideStyleActionButton(QPainter &painter,
+                                const QRect &rect,
+                                const QString &text,
+                                const QColor &textColor = QColor(255, 255, 255))
+{
+    if (!rect.isValid() || text.isEmpty()) {
+        return;
+    }
+
+    painter.save();
+    painter.setPen(QPen(QColor(255, 96, 96), 1));
+    painter.setBrush(QColor(58, 12, 12));
+    painter.drawRoundedRect(rect, 4, 4);
+    painter.setPen(textColor);
+    painter.drawText(rect.adjusted(6, 0, -6, 0), Qt::AlignCenter, text);
+    painter.restore();
+}
+
+class SearchResultItemDelegate final : public QStyledItemDelegate
+{
+public:
+    explicit SearchResultItemDelegate(QObject *parent = nullptr)
+        : QStyledItemDelegate(parent)
+    {
+    }
+
+    QSize sizeHint(const QStyleOptionViewItem &option, const QModelIndex &index) const override
+    {
+        const QSize explicitSize = index.data(Qt::SizeHintRole).toSize();
+        if (explicitSize.isValid()) {
+            return explicitSize;
+        }
+        return QStyledItemDelegate::sizeHint(option, index);
+    }
+
+    void paint(QPainter *painter, const QStyleOptionViewItem &option, const QModelIndex &index) const override
+    {
+        if (painter == nullptr) {
+            return;
+        }
+
+        QStyleOptionViewItem drawOption(option);
+        initStyleOption(&drawOption, index);
+        drawOption.text.clear();
+        drawOption.icon = QIcon();
+
+        QStyle *style = drawOption.widget != nullptr ? drawOption.widget->style() : QApplication::style();
+        style->drawControl(QStyle::CE_ItemViewItem, &drawOption, painter, drawOption.widget);
+
+        const QString title = index.data(SearchTitleRole).toString();
+        if (title.isEmpty()) {
+            return;
+        }
+
+        const bool isCurrent = index.data(SearchIsCurrentRole).toBool();
+        const bool isFavorite = index.data(SearchIsFavoriteRole).toBool();
+        const SearchResultLayoutRects rects =
+            searchResultLayoutRects(option.rect, isCurrent, searchResultButtonWidth(option.fontMetrics));
+        const bool isSelected = option.state.testFlag(QStyle::State_Selected);
+
+        drawSearchResultText(*painter,
+                             rects.textRect,
+                             title,
+                             index.data(SearchTimeChannelRole).toString(),
+                             index.data(SearchEpisodeRole).toString(),
+                             index.data(SearchSynopsisRole).toString(),
+                             option.palette,
+                             isSelected);
+
+        if (isCurrent) {
+            drawGuideStyleActionButton(*painter,
+                                       rects.watchRect,
+                                       watchActionLabelForWidth(option.fontMetrics, rects.watchRect.width()));
+        }
+        drawGuideStyleActionButton(
+            *painter, rects.favoriteRect, favoriteActionLabel(isFavorite), QColor(96, 255, 96));
+    }
+};
 
 int measureEntryTextHeight(const QFont &font,
                            int width,
@@ -457,15 +696,7 @@ protected:
             } else if (canWatchNow) {
                 if (watchRect.width() >= 44) {
                     const QString watchLabel = watchActionLabelForWidth(painter.fontMetrics(), watchRect.width());
-                    painter.setPen(QPen(QColor(255, 96, 96), 1));
-                    painter.setBrush(QColor(58, 12, 12));
-                    painter.drawRoundedRect(watchRect, 4, 4);
-                    if (!watchLabel.isEmpty()) {
-                        painter.setPen(QColor(255, 255, 255));
-                        painter.drawText(watchRect.adjusted(6, 0, -6, 0),
-                                         Qt::AlignCenter,
-                                         watchLabel);
-                    }
+                    drawGuideStyleActionButton(painter, watchRect, watchLabel);
                 }
             }
             entryActionTargets_.append({checkboxRect, watchRect, box, entry, scheduled});
@@ -737,14 +968,29 @@ TvGuideDialog::TvGuideDialog(QWidget *parent)
     showSearchResultsList_ = new QListWidget(searchTab);
     showSearchResultsList_->setAlternatingRowColors(true);
     showSearchResultsList_->setSelectionMode(QAbstractItemView::SingleSelection);
+    showSearchResultsList_->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+    showSearchResultsList_->setWordWrap(true);
+    showSearchResultsList_->setItemDelegate(new SearchResultItemDelegate(showSearchResultsList_));
+    showSearchResultsList_->viewport()->installEventFilter(this);
     searchLayout->addWidget(showSearchResultsList_, 1);
 
-    scheduleSearchResultButton_ = new QPushButton("Add Favorite Switch", searchTab);
-    scheduleSearchResultButton_->setEnabled(false);
-    searchLayout->addWidget(scheduleSearchResultButton_, 0, Qt::AlignRight);
+    searchUpdateTimer_ = new QTimer(this);
+    searchUpdateTimer_->setSingleShot(true);
+    searchUpdateTimer_->setInterval(140);
+    connect(searchUpdateTimer_, &QTimer::timeout, this, &TvGuideDialog::updateSearchResults);
 
     connect(showSearchEdit_, &QLineEdit::textChanged, this, [this]() {
-        updateSearchResults();
+        if (showSearchSummaryLabel_ != nullptr) {
+            const QString query = showSearchEdit_ != nullptr ? showSearchEdit_->text().simplified() : QString();
+            showSearchSummaryLabel_->setText(query.isEmpty()
+                                                 ? "Search the current guide cache by title or synopsis."
+                                                 : "Searching current guide data...");
+        }
+        if (searchUpdateTimer_ != nullptr) {
+            searchUpdateTimer_->start();
+        } else {
+            updateSearchResults();
+        }
     });
     connect(showSearchResultsList_, &QListWidget::itemSelectionChanged, this, [this]() {
         updateSearchActionState();
@@ -752,7 +998,6 @@ TvGuideDialog::TvGuideDialog(QWidget *parent)
     connect(showSearchResultsList_, &QListWidget::itemDoubleClicked, this, [this](QListWidgetItem *) {
         scheduleSelectedSearchResult();
     });
-    connect(scheduleSearchResultButton_, &QPushButton::clicked, this, &TvGuideDialog::scheduleSelectedSearchResult);
     tabs_->addTab(searchTab, "Search");
 
     auto *logsTab = new QWidget(this);
@@ -765,6 +1010,52 @@ TvGuideDialog::TvGuideDialog(QWidget *parent)
     logsView_->setPlainText("No guide data loaded yet.");
     logsLayout->addWidget(logsView_);
     tabs_->addTab(logsTab, "Status");
+}
+
+bool TvGuideDialog::eventFilter(QObject *watched, QEvent *event)
+{
+    if (showSearchResultsList_ != nullptr
+        && watched == showSearchResultsList_->viewport()
+        && event != nullptr) {
+        if (event->type() == QEvent::Leave) {
+            showSearchResultsList_->viewport()->unsetCursor();
+        } else if (event->type() == QEvent::MouseMove || event->type() == QEvent::MouseButtonRelease) {
+            const auto *mouseEvent = static_cast<QMouseEvent *>(event);
+            QListWidgetItem *item = showSearchResultsList_->itemAt(mouseEvent->pos());
+            bool overActionButton = false;
+            if (item != nullptr) {
+                const QRect itemRect = showSearchResultsList_->visualItemRect(item);
+                const bool isCurrent = item->data(SearchIsCurrentRole).toBool();
+                const SearchResultLayoutRects rects =
+                    searchResultLayoutRects(itemRect,
+                                            isCurrent,
+                                            searchResultButtonWidth(QFontMetrics(showSearchResultsList_->font())));
+                overActionButton =
+                    rects.favoriteRect.contains(mouseEvent->pos()) || rects.watchRect.contains(mouseEvent->pos());
+
+                if (event->type() == QEvent::MouseButtonRelease
+                    && mouseEvent->button() == Qt::LeftButton
+                    && overActionButton) {
+                    const int row = showSearchResultsList_->row(item);
+                    if (row >= 0 && row < searchResults_.size()) {
+                        showSearchResultsList_->setCurrentItem(item);
+                        const SearchResult &result = searchResults_.at(row);
+                        if (rects.watchRect.contains(mouseEvent->pos()) && isCurrent) {
+                            emit watchRequested(result.channelName, result.entry);
+                        } else if (rects.favoriteRect.contains(mouseEvent->pos())) {
+                            emit searchScheduleRequested(
+                                result.entry.title.simplified(), result.channelName, result.entry);
+                        }
+                        return true;
+                    }
+                }
+            }
+
+            showSearchResultsList_->viewport()->setCursor(overActionButton ? Qt::PointingHandCursor : Qt::ArrowCursor);
+        }
+    }
+
+    return QWidget::eventFilter(watched, event);
 }
 
 void TvGuideDialog::setLoadingState(const QString &message)
@@ -818,6 +1109,9 @@ void TvGuideDialog::resizeEvent(QResizeEvent *event)
 
     if (event->size().width() != event->oldSize().width()) {
         renderGuideTable();
+        if (!showSearchEdit_->text().simplified().isEmpty()) {
+            updateSearchResults();
+        }
     }
 }
 
@@ -909,6 +1203,9 @@ void TvGuideDialog::updateSearchResults()
         return;
     }
 
+    const bool restoreUpdates = showSearchResultsList_->updatesEnabled();
+    showSearchResultsList_->setUpdatesEnabled(false);
+
     SearchResult selectedResult;
     bool hadSelectedResult = false;
     const int previousRow = showSearchResultsList_->currentRow();
@@ -923,6 +1220,7 @@ void TvGuideDialog::updateSearchResults()
     const QString query = showSearchEdit_->text().simplified();
     if (query.isEmpty()) {
         showSearchSummaryLabel_->setText("Search the current guide cache by title or synopsis.");
+        showSearchResultsList_->setUpdatesEnabled(restoreUpdates);
         updateSearchActionState();
         return;
     }
@@ -969,23 +1267,43 @@ void TvGuideDialog::updateSearchResults()
     });
 
     searchResults_ = matchedResults;
+    const int viewportWidth =
+        showSearchResultsList_->viewport() != nullptr ? showSearchResultsList_->viewport()->width() : 720;
+    const int buttonWidth = searchResultButtonWidth(QFontMetrics(showSearchResultsList_->font()));
+    const int textWidth = std::max(kSearchMinimumTextWidth,
+                                   viewportWidth - (2 * kSearchResultMargin) - buttonWidth
+                                       - kSearchResultSpacing);
     int restoredRow = -1;
     for (const SearchResult &result : searchResults_) {
         const GuideEntryDisplayParts parts = displayPartsForEntry(result.entry);
         const QString ratedTitle = formatRatedShowTitle(parts.title, favoriteShowRatings_);
-        QStringList lines;
-        lines << ratedTitle;
-        if (!parts.episodeTitle.isEmpty()) {
-            lines << "Episode: " + parts.episodeTitle;
-        }
-        lines << QString("%1 - %2 | %3")
-                     .arg(result.entry.startUtc.toLocalTime().toString("ddd h:mm AP"),
-                          result.entry.endUtc.toLocalTime().toString("h:mm AP"),
-                          result.channelName);
-        if (!parts.synopsisBody.isEmpty()) {
-            lines << "Synopsis: " + parts.synopsisBody;
-        }
-        showSearchResultsList_->addItem(lines.join('\n'));
+        const bool isCurrent = searchResultIsCurrent(result);
+        const bool isFavorite = favoriteShowRatings_.contains(normalizeFavoriteShowRule(parts.title));
+        const QString timeChannelText = QString("%1 - %2 | Channel: %3")
+                                            .arg(result.entry.startUtc.toLocalTime().toString("ddd h:mm AP"),
+                                                 result.entry.endUtc.toLocalTime().toString("h:mm AP"),
+                                                 result.channelName);
+
+        QListWidgetItem *item = new QListWidgetItem(showSearchResultsList_);
+        item->setFlags(Qt::ItemIsEnabled | Qt::ItemIsSelectable);
+        item->setToolTip(formatEntryToolTip(result.entry, favoriteShowRatings_));
+        item->setData(SearchTitleRole, ratedTitle);
+        item->setData(SearchTimeChannelRole, timeChannelText);
+        item->setData(SearchEpisodeRole, parts.episodeTitle);
+        item->setData(SearchSynopsisRole, parts.synopsisBody);
+        item->setData(SearchIsCurrentRole, isCurrent);
+        item->setData(SearchIsFavoriteRole, isFavorite);
+        item->setData(
+            Qt::SizeHintRole,
+            QSize(viewportWidth,
+                  std::max(measureSearchResultTextHeight(showSearchResultsList_->font(),
+                                                         textWidth,
+                                                         ratedTitle,
+                                                         timeChannelText,
+                                                         parts.episodeTitle,
+                                                         parts.synopsisBody),
+                           isCurrent ? (2 * kSearchButtonHeight) + kSearchButtonSpacing : kSearchButtonHeight)
+                      + (2 * kSearchResultMargin)));
 
         if (restoredRow < 0
             && hadSelectedResult
@@ -1007,17 +1325,15 @@ void TvGuideDialog::updateSearchResults()
         showSearchResultsList_->setCurrentRow(restoredRow);
     }
 
+    showSearchResultsList_->setUpdatesEnabled(restoreUpdates);
     updateSearchActionState();
 }
 
 void TvGuideDialog::updateSearchActionState()
 {
-    if (scheduleSearchResultButton_ == nullptr || showSearchResultsList_ == nullptr) {
+    if (showSearchResultsList_ == nullptr) {
         return;
     }
-
-    const int row = showSearchResultsList_->currentRow();
-    scheduleSearchResultButton_->setEnabled(row >= 0 && row < searchResults_.size());
 }
 
 void TvGuideDialog::scheduleSelectedSearchResult()
@@ -1033,6 +1349,16 @@ void TvGuideDialog::scheduleSelectedSearchResult()
 
     const SearchResult result = searchResults_.at(row);
     emit searchScheduleRequested(result.entry.title.simplified(), result.channelName, result.entry);
+}
+
+bool TvGuideDialog::searchResultIsCurrent(const SearchResult &result) const
+{
+    if (!result.entry.startUtc.isValid() || !result.entry.endUtc.isValid()) {
+        return false;
+    }
+
+    const QDateTime nowUtc = QDateTime::currentDateTimeUtc();
+    return result.entry.startUtc <= nowUtc && nowUtc < result.entry.endUtc;
 }
 
 bool TvGuideDialog::channelHasVisibleData(const QString &channel) const

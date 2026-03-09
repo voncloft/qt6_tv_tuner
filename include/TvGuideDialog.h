@@ -18,6 +18,8 @@ class QWidget;
 class QLineEdit;
 class QLabel;
 class QListWidget;
+class QObject;
+class QEvent;
 
 struct TvGuideEntry {
     QDateTime startUtc;
@@ -57,6 +59,7 @@ public:
                       const QString &statusText);
 
 protected:
+    bool eventFilter(QObject *watched, QEvent *event) override;
     void resizeEvent(QResizeEvent *event) override;
     void showEvent(QShowEvent *event) override;
 
@@ -83,13 +86,14 @@ private:
     void scrollGuideToCurrentTime(bool force);
     void updateSearchResults();
     void updateSearchActionState();
+    bool searchResultIsCurrent(const SearchResult &result) const;
     void scheduleSelectedSearchResult();
     void renderGuideTable();
 
     QLineEdit *showSearchEdit_{};
     QLabel *showSearchSummaryLabel_{};
     QListWidget *showSearchResultsList_{};
-    QPushButton *scheduleSearchResultButton_{};
+    QTimer *searchUpdateTimer_{};
     QPlainTextEdit *logsView_{};
     QPushButton *refreshButton_{};
     QTabWidget *tabs_{};

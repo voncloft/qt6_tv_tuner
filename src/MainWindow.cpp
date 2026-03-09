@@ -6445,6 +6445,55 @@ bool MainWindow::addFavoriteShowRule(const QString &title)
     return true;
 }
 
+bool MainWindow::removeFavoriteShowRule(const QString &title)
+{
+    const QString trimmedTitle = title.simplified();
+    if (trimmedTitle.isEmpty()) {
+        return false;
+    }
+
+    const QString normalizedRemovedRule = normalizeFavoriteShowRule(trimmedTitle);
+    int row = -1;
+    for (int index = 0; index < favoriteShowRules_.size(); ++index) {
+        if (normalizeFavoriteShowRule(favoriteShowRules_.at(index)) == normalizedRemovedRule) {
+            row = index;
+            break;
+        }
+    }
+    if (row < 0) {
+        return false;
+    }
+
+    const QString removedRule = favoriteShowRules_.at(row);
+    favoriteShowRules_.removeAt(row);
+    favoriteShowRatings_.remove(normalizedRemovedRule);
+    int removedScheduledSwitchCount = 0;
+    for (int index = scheduledSwitches_.size() - 1; index >= 0; --index) {
+        if (normalizeFavoriteShowRule(scheduledSwitches_.at(index).title) != normalizedRemovedRule) {
+            continue;
+        }
+
+        scheduledSwitches_.removeAt(index);
+        ++removedScheduledSwitchCount;
+    }
+    saveFavoriteShowRules();
+    refreshFavoriteShowRuleList();
+    if (removedScheduledSwitchCount > 0) {
+        saveScheduledSwitches();
+        refreshScheduledSwitchList();
+        updateTvGuideDialogFromCurrentCache(false);
+        refreshScheduledSwitchTimer();
+        appendLog(QString("favorite-show: removed %1 scheduled switch%2 for %3")
+                      .arg(removedScheduledSwitchCount)
+                      .arg(removedScheduledSwitchCount == 1 ? QString() : QString("es"))
+                      .arg(removedRule));
+    } else {
+        updateTvGuideDialogFromCurrentCache(false);
+    }
+    appendLog(QString("favorite-show: removed %1").arg(removedRule));
+    return true;
+}
+
 void MainWindow::handleCurrentTabChanged(int index)
 {
     if (tabs_ == nullptr) {
@@ -7487,6 +7536,12 @@ void MainWindow::handleSearchScheduleRequested(const QString &favoriteShowTitle,
         return;
     }
 
+    const QString normalizedTitle = normalizeFavoriteShowRule(trimmedFavoriteTitle);
+    if (favoriteShowRatings_.contains(normalizedTitle)) {
+        removeFavoriteShowRule(trimmedFavoriteTitle);
+        return;
+    }
+
     const bool addedFavoriteRule = addFavoriteShowRule(trimmedFavoriteTitle);
     const TvGuideScheduledSwitch candidate = scheduledSwitchFromGuideEntry(trimmedChannelName, entry);
 
@@ -7507,32 +7562,7 @@ void MainWindow::removeSelectedFavoriteShowRule()
         return;
     }
 
-    const QString removedRule = favoriteShowRules_.at(row);
-    const QString normalizedRemovedRule = normalizeFavoriteShowRule(removedRule);
-    favoriteShowRules_.removeAt(row);
-    favoriteShowRatings_.remove(normalizedRemovedRule);
-    int removedScheduledSwitchCount = 0;
-    for (int index = scheduledSwitches_.size() - 1; index >= 0; --index) {
-        if (normalizeFavoriteShowRule(scheduledSwitches_.at(index).title) != normalizedRemovedRule) {
-            continue;
-        }
-
-        scheduledSwitches_.removeAt(index);
-        ++removedScheduledSwitchCount;
-    }
-    saveFavoriteShowRules();
-    refreshFavoriteShowRuleList();
-    if (removedScheduledSwitchCount > 0) {
-        saveScheduledSwitches();
-        refreshScheduledSwitchList();
-        updateTvGuideDialogFromCurrentCache(false);
-        refreshScheduledSwitchTimer();
-        appendLog(QString("favorite-show: removed %1 scheduled switch%2 for %3")
-                      .arg(removedScheduledSwitchCount)
-                      .arg(removedScheduledSwitchCount == 1 ? QString() : QString("es"))
-                      .arg(removedRule));
-    }
-    appendLog(QString("favorite-show: removed %1").arg(removedRule));
+    removeFavoriteShowRule(favoriteShowRules_.at(row));
 }
 
 void MainWindow::removeSelectedScheduledSwitch()
