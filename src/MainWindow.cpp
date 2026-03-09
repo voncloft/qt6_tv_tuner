@@ -106,6 +106,7 @@ constexpr auto kLockedAutoFavoriteSelectionsSetting = "tvGuide/lockedAutoFavorit
 constexpr auto kTestingBugItemsSetting = "testing/bugItems";
 constexpr auto kMutedSetting = "audio/muted";
 constexpr auto kAutoPictureInPictureSetting = "video/autoPictureInPicture";
+constexpr auto kProcessedPlaybackSetting = "video/processLivePlayback";
 constexpr auto kHideStartupSwitchSummarySetting = "tvGuide/hideStartupSwitchSummary";
 constexpr auto kLogAutoScrollSetting = "logs/autoScroll";
 constexpr auto kGuideRefreshIntervalMinutesSetting = "tvGuide/refreshIntervalMinutes";
@@ -3939,6 +3940,10 @@ MainWindow::MainWindow(QWidget *parent)
         const QSignalBlocker blocker(autoPictureInPictureCheckBox_);
         autoPictureInPictureCheckBox_->setChecked(autoPictureInPictureEnabled_);
     }
+    if (processedPlaybackCheckBox_ != nullptr) {
+        const QSignalBlocker blocker(processedPlaybackCheckBox_);
+        processedPlaybackCheckBox_->setChecked(settings.value(kProcessedPlaybackSetting, false).toBool());
+    }
     if (hideStartupSwitchSummaryCheckBox_ != nullptr) {
         const QSignalBlocker blocker(hideStartupSwitchSummaryCheckBox_);
         hideStartupSwitchSummaryCheckBox_->setChecked(
@@ -4286,6 +4291,17 @@ bool MainWindow::eventFilter(QObject *watched, QEvent *event)
         return true;
     }
 
+    if (watched == pipWindow_ && event->type() == QEvent::Close) {
+        if (videoDetachedToPip_) {
+            manualPictureInPictureRequested_ = false;
+            attachVideoFromPip();
+            appendLog("player: PiP window closed; video returned to the main window.");
+            setStatusBarStateMessage("Video returned to main window");
+        }
+        event->ignore();
+        return true;
+    }
+
     if (watched == pipVideoWidget_ && event->type() == QEvent::MouseButtonDblClick) {
         if (tabs_ != nullptr && watchPage_ != nullptr) {
             tabs_->setCurrentWidget(watchPage_);
@@ -4603,9 +4619,15 @@ void MainWindow::buildUi()
     auto *playbackOptionsGroup = new QGroupBox("Playback", configPage_);
     auto *playbackOptionsLayout = new QVBoxLayout(playbackOptionsGroup);
     autoPictureInPictureCheckBox_ = new QCheckBox("Pop video out when leaving the Video tab", playbackOptionsGroup);
+    processedPlaybackCheckBox_ =
+        new QCheckBox("Always process live audio/video before playback", playbackOptionsGroup);
+    processedPlaybackCheckBox_->setToolTip(
+        "Deinterlaces video and rebuilds audio/video before playback. This can smooth motion and sanitize messy "
+        "streams, but it adds latency and disables raw passthrough.");
     hideStartupSwitchSummaryCheckBox_ =
         new QCheckBox("Hide the scheduled switches summary at startup", playbackOptionsGroup);
     playbackOptionsLayout->addWidget(autoPictureInPictureCheckBox_);
+    playbackOptionsLayout->addWidget(processedPlaybackCheckBox_);
     playbackOptionsLayout->addWidget(hideStartupSwitchSummaryCheckBox_);
 
     auto *cacheOptionsGroup = new QGroupBox("Guide Cache", configPage_);
@@ -4726,6 +4748,7 @@ void MainWindow::buildUi()
     watchButton_ = new QPushButton("Watch Selected", watchPage_);
     stopWatchButton_ = new QPushButton("Stop Watching", watchPage_);
     openFileButton_ = new QPushButton("Open File", watchPage_);
+    pipToggleButton_ = new QPushButton("Pop Out Video", watchPage_);
     fullscreenButton_ = new QPushButton("Fullscreen", watchPage_);
     muteButton_ = new QPushButton("Mute", watchPage_);
     volumeSlider_ = new QSlider(Qt::Horizontal, watchPage_);
@@ -4738,6 +4761,7 @@ void MainWindow::buildUi()
 
     stopButton_->setEnabled(false);
     stopWatchButton_->setEnabled(false);
+    pipToggleButton_->setEnabled(false);
     muteButton_->setCheckable(true);
     const auto setStableButtonWidth = [](QPushButton *button, const QStringList &labels) {
         if (button == nullptr) {
@@ -4754,6 +4778,7 @@ void MainWindow::buildUi()
     setStableButtonWidth(watchButton_, {"Watch Selected"});
     setStableButtonWidth(stopWatchButton_, {"Stop Watching"});
     setStableButtonWidth(openFileButton_, {"Open File"});
+    setStableButtonWidth(pipToggleButton_, {"Pop Out Video", "Return Video"});
     setStableButtonWidth(fullscreenButton_, {"Fullscreen", "Exit Fullscreen"});
     setStableButtonWidth(muteButton_, {"Mute", "Unmute"});
     volumeSlider_->setRange(0, 100);
@@ -4782,6 +4807,7 @@ void MainWindow::buildUi()
     watchControlsRow->addWidget(watchButton_);
     watchControlsRow->addWidget(stopWatchButton_);
     watchControlsRow->addWidget(openFileButton_);
+    watchControlsRow->addWidget(pipToggleButton_);
     watchControlsRow->addWidget(fullscreenButton_);
     watchControlsRow->addSpacing(12);
     watchControlsRow->addWidget(new QLabel("Volume:", watchPage_));
@@ -4990,6 +5016,7 @@ void MainWindow::buildUi()
     fullscreenWindow_->hide();
 
     videoWidget_->installEventFilter(this);
+    pipWindow_->installEventFilter(this);
     pipVideoWidget_->installEventFilter(this);
     fullscreenWindow_->installEventFilter(this);
     fullscreenVideoWidget_->installEventFilter(this);
@@ -5079,6 +5106,23 @@ void MainWindow::buildUi()
     connect(watchButton_, &QPushButton::clicked, this, &MainWindow::watchSelectedChannel);
     connect(stopWatchButton_, &QPushButton::clicked, this, &MainWindow::stopWatching);
     connect(openFileButton_, &QPushButton::clicked, this, &MainWindow::openMediaFile);
+    connect(pipToggleButton_, &QPushButton::clicked, this, [this]() {
+        if (currentChannelName_.trimmed().isEmpty()) {
+            return;
+        }
+        if (videoDetachedToPip_) {
+            manualPictureInPictureRequested_ = false;
+            attachVideoFromPip();
+            appendLog("player: returned video from the floating PiP window.");
+            setStatusBarStateMessage("Video returned to main window");
+        } else {
+            manualPictureInPictureRequested_ = true;
+            detachVideoToPip();
+            appendLog("player: moved video into the floating PiP window.");
+            setStatusBarStateMessage("Video popped out to PiP");
+        }
+        syncFullscreenOverlayState();
+    });
     connect(addFavoriteButton_, &QPushButton::clicked, this, &MainWindow::addSelectedFavorite);
     connect(removeFavoriteButton_, &QPushButton::clicked, this, &MainWindow::removeSelectedFavorite);
     connect(tvGuideDialog_, &TvGuideDialog::refreshRequested, this, &MainWindow::refreshTvGuide);
@@ -5099,6 +5143,16 @@ void MainWindow::buildUi()
         settings.setValue(kFavoriteShowRatingsOverrideSetting, favoriteShowRatingsOverrideEnabled_);
     });
     connect(autoPictureInPictureCheckBox_, &QCheckBox::toggled, this, &MainWindow::handleAutoPictureInPictureToggled);
+    connect(processedPlaybackCheckBox_, &QCheckBox::toggled, this, [this](bool checked) {
+        QSettings settings("tv_tuner_gui", "watcher");
+        settings.setValue(kProcessedPlaybackSetting, checked);
+        appendLog(checked
+                      ? "player: processed live playback enabled; future retunes will deinterlace video and rebuild audio/video."
+                      : "player: processed live playback disabled; future retunes will use passthrough unless recovery is needed.");
+        if (!currentChannelName_.isEmpty() && !currentChannelName_.startsWith("File: ")) {
+            showTransientStatusBarMessage("Processed playback change will apply on the next retune/reconnect", 4000);
+        }
+    });
     connect(hideStartupSwitchSummaryCheckBox_,
             &QCheckBox::toggled,
             this,
@@ -5291,9 +5345,11 @@ void MainWindow::handleAutoPictureInPictureToggled(bool checked)
     settings.setValue(kAutoPictureInPictureSetting, autoPictureInPictureEnabled_);
 
     if (!autoPictureInPictureEnabled_) {
-        attachVideoFromPip();
-        if (pipWindow_ != nullptr) {
-            pipWindow_->hide();
+        if (!manualPictureInPictureRequested_) {
+            attachVideoFromPip();
+            if (pipWindow_ != nullptr) {
+                pipWindow_->hide();
+            }
         }
         return;
     }
@@ -6842,7 +6898,9 @@ void MainWindow::handleCurrentTabChanged(int index)
     }
 
     if (tabs_->widget(index) == watchPage_) {
-        attachVideoFromPip();
+        if (videoDetachedToPip_ && !manualPictureInPictureRequested_) {
+            attachVideoFromPip();
+        }
         return;
     }
 
@@ -6852,7 +6910,7 @@ void MainWindow::handleCurrentTabChanged(int index)
 
     if (shouldDetachVideoForCurrentTab(index)) {
         detachVideoToPip();
-    } else if (videoDetachedToPip_) {
+    } else if (videoDetachedToPip_ && !manualPictureInPictureRequested_) {
         attachVideoFromPip();
     }
 }
@@ -6898,6 +6956,7 @@ void MainWindow::detachVideoToPip()
 
     pipWindow_->show();
     pipWindow_->raise();
+    syncFullscreenOverlayState();
 }
 
 void MainWindow::attachVideoFromPip()
@@ -6919,6 +6978,7 @@ void MainWindow::attachVideoFromPip()
     }
     videoWidget_->show();
     videoDetachedToPip_ = false;
+    syncFullscreenOverlayState();
 }
 
 bool MainWindow::purgeExpiredGuideCacheFiles(bool clearLoadedState, bool includeSchedulesDirect)
@@ -9790,6 +9850,7 @@ bool MainWindow::startWatchingChannel(const QString &channelName,
     ++playbackStartSerial_;
     if (!reconnectAttempt) {
         reconnectAttemptCount_ = 0;
+        processedPlaybackActive_ = false;
         useResilientBridgeMode_ = false;
         resilientBridgeTried_ = false;
         useVideoOnlyBridgeMode_ = false;
@@ -9798,10 +9859,12 @@ bool MainWindow::startWatchingChannel(const QString &channelName,
         muteRecoveryAfterAudioRebuildFailure_ = false;
         clearRecoveryAudioMute();
     } else if (muteRecoveryAfterAudioRebuildFailure_) {
+        processedPlaybackActive_ = false;
         beginRecoveryAudioMute(useVideoOnlyBridgeMode_
                                    ? "audio rebuild already failed once; keeping recovery muted during video-only fallback"
                                    : "audio rebuild already failed once; retrying rebuilt audio while muted");
     } else {
+        processedPlaybackActive_ = false;
         clearRecoveryAudioMute();
     }
 
@@ -9894,6 +9957,7 @@ bool MainWindow::startWatchingChannel(const QString &channelName,
 void MainWindow::stopWatching()
 {
     exitFullscreen();
+    manualPictureInPictureRequested_ = false;
     attachVideoFromPip();
     if (pipWindow_ != nullptr) {
         pipWindow_->hide();
@@ -9910,6 +9974,7 @@ void MainWindow::stopWatching()
     waitingForDvrReady_ = false;
     pendingDvrPath_.clear();
     reconnectAttemptCount_ = 0;
+    processedPlaybackActive_ = false;
     useResilientBridgeMode_ = false;
     resilientBridgeTried_ = false;
     useVideoOnlyBridgeMode_ = false;
@@ -10002,6 +10067,10 @@ void MainWindow::startPlaybackFromDvr(const QString &dvrPath)
 
     QStringList ffmpegArgs;
     bridgeSawCodecParameterFailure_ = false;
+    const bool processedPlaybackRequested = processedPlaybackEnabled();
+    const bool useProcessedPlayback = processedPlaybackRequested && !useVideoOnlyBridgeMode_ && !useResilientBridgeMode_;
+    const QString deinterlaceFilter = "bwdif=mode=send_frame:parity=auto:deint=all";
+    processedPlaybackActive_ = useProcessedPlayback;
     if (useVideoOnlyBridgeMode_) {
         ffmpegArgs << "-hide_banner"
                    << "-nostdin"
@@ -10016,6 +10085,9 @@ void MainWindow::startPlaybackFromDvr(const QString &dvrPath)
             ffmpegArgs << "-map" << QString("0:p:%1?").arg(currentProgramId_);
         } else {
             ffmpegArgs << "-map" << "0:v:0?";
+        }
+        if (processedPlaybackRequested) {
+            ffmpegArgs << "-vf" << deinterlaceFilter;
         }
         ffmpegArgs << "-an"
                    << "-sn"
@@ -10042,12 +10114,44 @@ void MainWindow::startPlaybackFromDvr(const QString &dvrPath)
             ffmpegArgs << "-map" << "0:v:0?"
                        << "-map" << "0:a:0?";
         }
+        if (processedPlaybackRequested) {
+            ffmpegArgs << "-vf" << deinterlaceFilter;
+        }
         ffmpegArgs << "-sn"
                    << "-dn"
                    << "-c:v" << "mpeg2video"
                    << "-q:v" << "3"
                    << "-c:a" << "aac"
                    << "-b:a" << "160k"
+                   << "-ac" << "2"
+                   << "-ar" << "48000"
+                   << "-mpegts_flags" << "+resend_headers+pat_pmt_at_frames"
+                   << "-flush_packets" << "1"
+                   << "-f" << "mpegts"
+                   << QString("udp://127.0.0.1:%1?pkt_size=1316").arg(23000 + adapterSpin_->value());
+    } else if (useProcessedPlayback) {
+        ffmpegArgs << "-hide_banner"
+                   << "-nostdin"
+                   << "-loglevel" << "warning"
+                   << "-fflags" << "+genpts+discardcorrupt"
+                   << "-err_detect" << "ignore_err"
+                   << "-analyzeduration" << "4M"
+                   << "-probesize" << "4M"
+                   << "-f" << "mpegts"
+                   << "-i" << dvrPath;
+        if (!currentProgramId_.isEmpty()) {
+            ffmpegArgs << "-map" << QString("0:p:%1?").arg(currentProgramId_);
+        } else {
+            ffmpegArgs << "-map" << "0:v:0?"
+                       << "-map" << "0:a:0?";
+        }
+        ffmpegArgs << "-vf" << deinterlaceFilter
+                   << "-sn"
+                   << "-dn"
+                   << "-c:v" << "mpeg2video"
+                   << "-q:v" << "2"
+                   << "-c:a" << "aac"
+                   << "-b:a" << "192k"
                    << "-ac" << "2"
                    << "-ar" << "48000"
                    << "-mpegts_flags" << "+resend_headers+pat_pmt_at_frames"
@@ -10094,10 +10198,13 @@ void MainWindow::startPlaybackFromDvr(const QString &dvrPath)
     const int attachSerial = playbackStartSerial_;
     const int udpPort = 23000 + adapterSpin_->value();
     const QUrl liveUrl(QString("udp://127.0.0.1:%1").arg(udpPort));
+    const QString playbackMode = useVideoOnlyBridgeMode_
+                                     ? "video-only"
+                                     : (useResilientBridgeMode_ ? "resilient" : (useProcessedPlayback ? "processed" : "normal"));
     appendLog(QString("player: Starting playback from DVR %1 via %2 (mode=%3, program=%4)")
                   .arg(dvrPath,
                        liveUrl.toString(),
-                       useVideoOnlyBridgeMode_ ? "video-only" : (useResilientBridgeMode_ ? "resilient" : "normal"),
+                       playbackMode,
                        currentProgramId_.isEmpty() ? "unknown" : currentProgramId_));
     if (useResilientBridgeMode_) {
         setStatusBarStateMessage(recoveryAudioMuted_ ? "Retrying rebuilt audio (muted)..."
@@ -10108,6 +10215,9 @@ void MainWindow::startPlaybackFromDvr(const QString &dvrPath)
         setStatusBarStateMessage(muteRecoveryAfterAudioRebuildFailure_
                                      ? "Video-only recovery active; muted audio retry pending"
                                      : "Video-only recovery active");
+    } else if (useProcessedPlayback) {
+        appendLog("player: processed live playback active (deinterlaced video, rebuilt audio).");
+        setStatusBarStateMessage("Processed live playback active");
     }
     if (useVideoOnlyBridgeMode_ && !videoOnlyAudioRecoveryTried_) {
         const int recoverySerial = playbackStartSerial_;
@@ -10301,6 +10411,15 @@ QString MainWindow::playbackStatusText() const
 
     const QString stateText = (mediaPlayer_->playbackState() == QMediaPlayer::PlayingState) ? "Playing" : "Buffering";
     return QString("%1: %2").arg(stateText, currentChannelName_);
+}
+
+bool MainWindow::processedPlaybackEnabled() const
+{
+    if (processedPlaybackCheckBox_ != nullptr) {
+        return processedPlaybackCheckBox_->isChecked();
+    }
+    QSettings settings("tv_tuner_gui", "watcher");
+    return settings.value(kProcessedPlaybackSetting, false).toBool();
 }
 
 void MainWindow::startSignalMonitor(int adapter, int frontend)
@@ -10533,6 +10652,8 @@ bool MainWindow::tryDynamicBridgeFallback(const QString &reason)
         return false;
     }
 
+    const bool processedPlaybackWasActive = processedPlaybackActive_ && !useResilientBridgeMode_ && !useVideoOnlyBridgeMode_;
+
     const bool shouldTryVideoOnly =
         useResilientBridgeMode_
         && (bridgeSawCodecParameterFailure_
@@ -10563,8 +10684,14 @@ bool MainWindow::tryDynamicBridgeFallback(const QString &reason)
     useVideoOnlyBridgeMode_ = false;
     reconnectTimer_->stop();
     reconnectAttemptCount_ = 0;
-    appendLog(QString("player: %1; switching to rebuilt audio recovery mode (lower audio quality).").arg(reason));
-    setStatusBarStateMessage("Recovering audio with rebuilt stream...");
+    appendLog(QString("player: %1; %2")
+                  .arg(reason,
+                       processedPlaybackWasActive
+                           ? "processed playback failed, retrying with resilient recovery mode."
+                           : "switching to rebuilt audio recovery mode (lower audio quality)."));
+    setStatusBarStateMessage(processedPlaybackWasActive
+                                 ? "Processed playback failed; retrying resilient recovery..."
+                                 : "Recovering audio with rebuilt stream...");
     startWatchingChannel(currentChannelName_, true, currentChannelLine_);
     return true;
 }
@@ -10842,6 +10969,10 @@ void MainWindow::syncFullscreenOverlayState()
         fullscreenMuteButton_->setChecked(muteButton_->isChecked());
         fullscreenMuteButton_->setText(muteButton_->text());
         fullscreenMuteButton_->setEnabled(muteButton_->isEnabled());
+    }
+    if (pipToggleButton_ != nullptr) {
+        pipToggleButton_->setText(videoDetachedToPip_ ? "Return Video" : "Pop Out Video");
+        pipToggleButton_->setEnabled(!currentChannelName_.trimmed().isEmpty());
     }
     if (fullscreenVolumeSlider_ != nullptr && volumeSlider_ != nullptr) {
         const QSignalBlocker blocker(fullscreenVolumeSlider_);

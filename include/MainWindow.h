@@ -118,6 +118,7 @@ private:
     void scheduleReconnect(const QString &reason);
     bool tryDynamicBridgeFallback(const QString &reason);
     QString playbackStatusText() const;
+    bool processedPlaybackEnabled() const;
     void applyAudioOutputState();
     void armRecoveryAudioMute(const QString &reason);
     void beginRecoveryAudioMute(const QString &reason);
@@ -242,6 +243,7 @@ private:
     QPushButton *quickFavoriteButtons_[kQuickFavoriteCount]{};
     QPushButton *muteButton_{};
     QPushButton *fullscreenButton_{};
+    QPushButton *pipToggleButton_{};
     QPlainTextEdit *logOutput_{};
     QTableWidget *channelsTable_{};
     QVideoWidget *videoWidget_{};
@@ -270,6 +272,7 @@ private:
     QCheckBox *autoFavoriteShowSchedulingCheckBox_{};
     QCheckBox *favoriteShowRatingsOverrideCheckBox_{};
     QCheckBox *autoPictureInPictureCheckBox_{};
+    QCheckBox *processedPlaybackCheckBox_{};
     QCheckBox *hideStartupSwitchSummaryCheckBox_{};
     QCheckBox *useSchedulesDirectGuideCheckBox_{};
     QCheckBox *refreshGuideWhenCacheRunsOutCheckBox_{};
@@ -342,6 +345,7 @@ private:
     bool useVideoOnlyBridgeMode_{false};
     bool videoOnlyBridgeTried_{false};
     bool videoOnlyAudioRecoveryTried_{false};
+    bool processedPlaybackActive_{false};
     bool muteRecoveryAfterAudioRebuildFailure_{false};
     bool recoveryAudioMuted_{false};
     bool bridgeSawCodecParameterFailure_{false};
@@ -351,6 +355,7 @@ private:
     QString lastStatusBarMessage_{};
     bool fullscreenActive_{false};
     bool fullscreenCursorHidden_{false};
+    bool manualPictureInPictureRequested_{false};
     QDateTime guideCacheRunoutRefreshRetryUtc_;
     QTimer *reconnectTimer_{};
     QTimer *currentShowTimer_{};
