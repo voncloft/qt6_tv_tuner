@@ -4778,7 +4778,7 @@ void MainWindow::buildUi()
     setStableButtonWidth(watchButton_, {"Watch Selected"});
     setStableButtonWidth(stopWatchButton_, {"Stop Watching"});
     setStableButtonWidth(openFileButton_, {"Open File"});
-    setStableButtonWidth(pipToggleButton_, {"Pop Out Video", "Return Video"});
+    setStableButtonWidth(pipToggleButton_, {"Pop Out Video"});
     setStableButtonWidth(fullscreenButton_, {"Fullscreen", "Exit Fullscreen"});
     setStableButtonWidth(muteButton_, {"Mute", "Unmute"});
     volumeSlider_->setRange(0, 100);
@@ -5111,16 +5111,18 @@ void MainWindow::buildUi()
             return;
         }
         if (videoDetachedToPip_) {
-            manualPictureInPictureRequested_ = false;
-            attachVideoFromPip();
-            appendLog("player: returned video from the floating PiP window.");
-            setStatusBarStateMessage("Video returned to main window");
-        } else {
-            manualPictureInPictureRequested_ = true;
-            detachVideoToPip();
-            appendLog("player: moved video into the floating PiP window.");
-            setStatusBarStateMessage("Video popped out to PiP");
+            if (pipWindow_ != nullptr) {
+                pipWindow_->show();
+                pipWindow_->raise();
+                pipWindow_->activateWindow();
+            }
+            setStatusBarStateMessage("Video is already popped out");
+            return;
         }
+        manualPictureInPictureRequested_ = true;
+        detachVideoToPip();
+        appendLog("player: moved video into the floating PiP window.");
+        setStatusBarStateMessage("Video popped out to PiP");
         syncFullscreenOverlayState();
     });
     connect(addFavoriteButton_, &QPushButton::clicked, this, &MainWindow::addSelectedFavorite);
@@ -10971,8 +10973,8 @@ void MainWindow::syncFullscreenOverlayState()
         fullscreenMuteButton_->setEnabled(muteButton_->isEnabled());
     }
     if (pipToggleButton_ != nullptr) {
-        pipToggleButton_->setText(videoDetachedToPip_ ? "Return Video" : "Pop Out Video");
-        pipToggleButton_->setEnabled(!currentChannelName_.trimmed().isEmpty());
+        pipToggleButton_->setText("Pop Out Video");
+        pipToggleButton_->setEnabled(!currentChannelName_.trimmed().isEmpty() && !videoDetachedToPip_);
     }
     if (fullscreenVolumeSlider_ != nullptr && volumeSlider_ != nullptr) {
         const QSignalBlocker blocker(fullscreenVolumeSlider_);

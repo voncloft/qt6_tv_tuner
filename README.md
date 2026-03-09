@@ -1,6 +1,6 @@
 # TV Tuner GUI
 
-Desktop Linux TV tuner application built with Qt 6. It scans channels with `w_scan2`, plays live DVB/ATSC channels inside the app, keeps a cached TV Guide, and lets you schedule channel switches from guide data.
+Desktop Linux TV tuner application built with Qt 6. It scans channels with `w_scan2`, tunes live DVB/ATSC channels with `dvbv5-zap`, bridges playback through `ffmpeg`, keeps a cached TV Guide, and lets you schedule future channel switches from guide data.
 
 ## Main UI
 
@@ -16,27 +16,41 @@ The app currently has these top-level tabs:
 
 ## Features
 
-### Video
+### Video and Playback
 
-- In-app live viewing with `dvbv5-zap` + `ffmpeg`; no VLC handoff.
+- In-app live viewing with `dvbv5-zap` + `ffmpeg` + `QMediaPlayer`; there is no VLC handoff.
 - Local file playback from the `Open File` button.
 - Channel table built from scan results or saved channel data.
-- `Watch Selected`, `Stop Watching`, `Fullscreen`, mute, and volume controls.
+- `Watch Selected`, `Stop Watching`, `Open File`, `Pop Out Video`, `Fullscreen`, mute, and volume controls.
 - Fullscreen playback window with its own overlay controls and current-show info.
-- Optional mini-player / picture-in-picture window when leaving the `Video` tab.
+- Manual floating picture-in-picture from the main `Video` page.
+- Optional automatic picture-in-picture when leaving the `Video` tab.
+- Closing the floating PiP window returns video to the main player automatically.
 - Add/remove favorites directly from the watch view.
 - Up to `10` quick favorite buttons for one-click channel changes.
-- Current playback state, current show title, and synopsis shown in the main view.
+- Current playback state, signal status, current show title, and synopsis shown in the main view.
+- Optional frontend signal monitoring through `dvb-fe-tool --femon` when available.
+
+### Live Playback Modes and Recovery
+
+- `normal` mode passes the live transport stream through with `-c copy` for the lowest-latency, highest-fidelity path.
+- `processed` mode deinterlaces video with `bwdif` and rebuilds audio/video before playback. This can reduce combing and sanitize messy streams, but it adds some latency and disables raw passthrough.
+- `resilient` mode is the first automatic recovery path after live playback failures. It rebuilds video and re-encodes audio to AAC stereo.
+- `video-only` mode is a temporary fallback if rebuilt audio still fails during recovery.
+- When `video-only` recovery succeeds visually, the app automatically retries an audio-capable path after a short stability window.
+- If rebuilt audio fails once, later rebuilt-audio retries stay muted until audio and video are both stable again.
+- Status-bar messages and log entries show these transitions so recovery behavior is visible in real time.
 
 ### TV Guide
 
-- Cached guide grid with a channel column and time-based timeline.
+- Cached guide grid with channel and time-based timeline views.
 - `Guide`, `Search`, and `Status` sub-tabs inside the TV Guide view.
 - Future airings can be scheduled directly from the guide.
 - Search the cached guide by title or synopsis.
 - Search results can be turned into favorite-show switches with `Add Favorite Switch`.
 - Guide display can be filtered to hide channels without EIT data or show only favorites.
 - `Reload Cache` requests a guide refresh and falls back to the current cache if refresh fails.
+- Guide data can come from live OTA EIT capture or optional Schedules Direct OTA JSON downloads.
 
 ### Scheduling and Favorites
 
@@ -51,17 +65,25 @@ The app currently has these top-level tabs:
 ### Config and Data Sources
 
 - Scan settings for frontend type, country code, adapter, frontend, and output format.
+- Playback options for automatic PiP-on-tab-change, processed live playback, and hiding the startup scheduled-switch summary.
 - Background guide refresh interval and guide-cache retention settings.
 - Optional Schedules Direct OTA JSON download and guide refresh source.
-- Option to hide the scheduled-switch startup summary.
-- Option to pop video out automatically when leaving the `Video` tab.
+- Schedules Direct username, password hash, and ZIP/postal-code storage through app settings.
 
-### Logging and Miscellaneous
+### Logging and Diagnostics
 
-- Live scan/tuning/playback logs in the `Logs` tab.
+- Live scan, tuning, ffmpeg, player, guide, scheduling, and recovery logs in the `Logs` tab.
+- `Auto-scroll logs` checkbox so logs can keep appending while you inspect older entries in real time.
 - TV Guide status text in the guide's `Status` tab.
 - A `Testing/bugs` tab for saving ad hoc test/watch items.
-- Status bar updates for background guide refreshes, playback state, cache activity, and scheduling activity.
+- Status-bar updates for guide refreshes, playback state, cache activity, scheduling, PiP actions, and recovery steps.
+
+## Live Playback Pipeline
+
+- Live tuner playback starts from device nodes such as `/dev/dvb/adapter0/dvr0`.
+- `ffmpeg` bridges the live transport stream to a local UDP feed such as `udp://127.0.0.1:23000`.
+- `QMediaPlayer` plays that local UDP stream inside the app.
+- Processed and recovery modes run in memory through ffmpeg and player buffers; they do not intentionally create a temporary media file on disk.
 
 ## Build Requirements
 
@@ -80,6 +102,7 @@ The app currently has these top-level tabs:
 - `dvbv5-zap` in `PATH` for live tuning
 - `ffmpeg` in `PATH` for the live playback bridge
 - `timeout` and `dd` in `PATH` for live EIT guide capture
+- Optional: `dvb-fe-tool` in `PATH` for signal monitoring
 - Optional: Schedules Direct credentials plus ZIP/postal code for OTA JSON downloads
 
 ## Build
@@ -98,11 +121,13 @@ cmake --build build -j
 ## Stored Data
 
 - `channels.conf`, guide cache JSON, scheduled-switch JSON, Schedules Direct export JSON, and channel hints are stored under the app-data location returned by `QStandardPaths::AppDataLocation`.
-- Settings such as favorites, favorite-show rules, ratings, and toggles are stored with `QSettings`.
-- The main log file is `tv_tuner_gui.log` in the source/project directory by default.
+- Settings such as favorites, favorite-show rules, ratings, volume, mute state, PiP toggles, processed playback, and guide/config options are stored with `QSettings`.
+- The main log file defaults to `tv_tuner_gui.log` in the source tree. If the source tree path is unavailable, it falls back to the project working directory.
 - You can override the log path with `TV_TUNER_GUI_LOG_PATH`.
 
 ## Notes
 
 - The app defaults to adapter `0`, frontend `0`, and country code `US`.
-- On startup it forces `QT_QPA_PLATFORM=xcb`, `QT_XCB_GL_INTEGRATION=none`, `QT_MEDIA_BACKEND=ffmpeg`, and software video decode when those variables are not already set.
+- On startup it forces `QT_QPA_PLATFORM=xcb`, `QT_XCB_GL_INTEGRATION=none`, `QT_MEDIA_BACKEND=ffmpeg`, and `QT_FFMPEG_DECODING_HW_DEVICE_TYPES=none` when those variables are not already set.
+- `processed` playback is meant for smoother motion and a cleaner live stream, not for true source-quality improvement.
+- `normal` passthrough is still the best choice when you want the raw broadcast with minimum extra processing.
