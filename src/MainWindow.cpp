@@ -107,26 +107,152 @@ constexpr auto kMutedSetting = "audio/muted";
 constexpr auto kAutoPictureInPictureSetting = "video/autoPictureInPicture";
 constexpr auto kHideStartupSwitchSummarySetting = "tvGuide/hideStartupSwitchSummary";
 constexpr auto kGuideRefreshIntervalMinutesSetting = "tvGuide/refreshIntervalMinutes";
+constexpr auto kGuideRefreshWhenCacheRunsOutSetting = "tvGuide/refreshWhenCacheRunsOut";
 constexpr auto kGuideCacheRetentionHoursSetting = "tvGuide/cacheRetentionHours";
 constexpr auto kLockedScheduledSwitchesSetting = "tvGuide/lockedScheduledSwitches";
 constexpr auto kUseSchedulesDirectGuideSetting = "tvGuide/useSchedulesDirect";
 constexpr auto kSchedulesDirectUsernameSetting = "schedulesDirect/username";
 constexpr auto kSchedulesDirectPasswordSha1Setting = "schedulesDirect/passwordSha1";
 constexpr auto kSchedulesDirectPostalCodeSetting = "schedulesDirect/postalCode";
+constexpr int kMinGuideRefreshIntervalMinutes = 1;
+constexpr int kMaxGuideRefreshIntervalMinutes = 2880;
+constexpr int kGuideRunoutRefreshRetryMinutes = 15;
 constexpr int kDefaultGuideRefreshIntervalMinutes = 60;
 constexpr int kDefaultGuideCacheRetentionHours = 24;
 constexpr int kDefaultFavoriteShowRating = 1;
 constexpr int kMaxFavoriteShowRating = 5;
 
-int guideCacheRetentionHoursValue(const QSpinBox *spinBox = nullptr)
+QString formatGuideDurationText(int totalMinutes);
+QString guideRefreshIntervalText(int minutes);
+
+QString guideCacheRetentionText(int hours)
 {
-    const int configuredHours = spinBox != nullptr
-                                    ? spinBox->value()
+    return hours <= 0 ? "Never" : formatGuideDurationText(hours * 60);
+}
+
+const QList<int> &guideCacheRetentionOptionsHours()
+{
+    static const QList<int> options{1, 2, 12, 24, 48};
+    return options;
+}
+
+int nearestGuideCacheRetentionHours(int hours)
+{
+    const int boundedHours = std::max(0, hours);
+    int nearestHours = guideCacheRetentionOptionsHours().front();
+    int nearestDistance = std::abs(nearestHours - boundedHours);
+    for (const int optionHours : guideCacheRetentionOptionsHours()) {
+        const int distance = std::abs(optionHours - boundedHours);
+        if (distance < nearestDistance) {
+            nearestHours = optionHours;
+            nearestDistance = distance;
+        }
+    }
+    return nearestHours;
+}
+
+int currentGuideCacheRetentionHours(const QComboBox *comboBox)
+{
+    if (comboBox != nullptr) {
+        bool ok = false;
+        const int hours = comboBox->currentData().toInt(&ok);
+        if (ok) {
+            return std::max(0, hours);
+        }
+    }
+    return kDefaultGuideCacheRetentionHours;
+}
+
+int guideCacheRetentionHoursValue(const QComboBox *comboBox = nullptr)
+{
+    const int configuredHours = comboBox != nullptr
+                                    ? currentGuideCacheRetentionHours(comboBox)
                                     : QSettings("tv_tuner_gui", "watcher")
                                           .value(kGuideCacheRetentionHoursSetting,
                                                  kDefaultGuideCacheRetentionHours)
                                           .toInt();
     return std::max(0, configuredHours);
+}
+
+int boundedGuideRefreshIntervalMinutes(int minutes)
+{
+    return std::clamp(minutes, kMinGuideRefreshIntervalMinutes, kMaxGuideRefreshIntervalMinutes);
+}
+
+QString pluralizedIntervalUnit(int value, const char *singular)
+{
+    return QString("%1 %2%3").arg(value).arg(singular).arg(value == 1 ? "" : "s");
+}
+
+QString guideRefreshIntervalText(int minutes)
+{
+    return formatGuideDurationText(boundedGuideRefreshIntervalMinutes(minutes));
+}
+
+QString formatGuideDurationText(int totalMinutes)
+{
+    const int safeMinutes = std::max(0, totalMinutes);
+    int remainingMinutes = safeMinutes;
+    const int days = remainingMinutes / (24 * 60);
+    remainingMinutes %= (24 * 60);
+    const int hours = remainingMinutes / 60;
+    remainingMinutes %= 60;
+
+    QStringList parts;
+    if (days > 0) {
+        parts.append(pluralizedIntervalUnit(days, "day"));
+    }
+    if (hours > 0) {
+        parts.append(pluralizedIntervalUnit(hours, "hour"));
+    }
+    if (remainingMinutes > 0 || parts.isEmpty()) {
+        parts.append(pluralizedIntervalUnit(remainingMinutes, "minute"));
+    }
+    return parts.join(" ");
+}
+
+const QList<int> &guideRefreshIntervalOptionsMinutes()
+{
+    static const QList<int> options{60, 120, 720, 1440, 2880};
+    return options;
+}
+
+int nearestGuideRefreshIntervalMinutes(int minutes)
+{
+    const int boundedMinutes = boundedGuideRefreshIntervalMinutes(minutes);
+    int nearestMinutes = guideRefreshIntervalOptionsMinutes().front();
+    int nearestDistance = std::abs(nearestMinutes - boundedMinutes);
+    for (const int optionMinutes : guideRefreshIntervalOptionsMinutes()) {
+        const int distance = std::abs(optionMinutes - boundedMinutes);
+        if (distance < nearestDistance) {
+            nearestMinutes = optionMinutes;
+            nearestDistance = distance;
+        }
+    }
+    return nearestMinutes;
+}
+
+int currentGuideRefreshIntervalMinutes(const QComboBox *comboBox)
+{
+    if (comboBox != nullptr) {
+        bool ok = false;
+        const int minutes = comboBox->currentData().toInt(&ok);
+        if (ok) {
+            return boundedGuideRefreshIntervalMinutes(minutes);
+        }
+    }
+    return kDefaultGuideRefreshIntervalMinutes;
+}
+
+QString guideRefreshDateTimeText(const QDateTime &localDateTime)
+{
+    if (!localDateTime.isValid()) {
+        return {};
+    }
+
+    const QDate today = QDate::currentDate();
+    return localDateTime.date() == today ? localDateTime.toString("h:mm AP")
+                                         : localDateTime.toString("ddd h:mm AP");
 }
 
 QString quoteArg(const QString &arg)
@@ -3820,17 +3946,28 @@ MainWindow::MainWindow(QWidget *parent)
         const QSignalBlocker blocker(useSchedulesDirectGuideCheckBox_);
         useSchedulesDirectGuideCheckBox_->setChecked(settings.value(kUseSchedulesDirectGuideSetting, false).toBool());
     }
-    if (guideRefreshIntervalSpin_ != nullptr) {
-        const QSignalBlocker blocker(guideRefreshIntervalSpin_);
-        guideRefreshIntervalSpin_->setValue(settings.value(kGuideRefreshIntervalMinutesSetting,
-                                                           kDefaultGuideRefreshIntervalMinutes)
-                                                .toInt());
+    if (refreshGuideWhenCacheRunsOutCheckBox_ != nullptr) {
+        const QSignalBlocker blocker(refreshGuideWhenCacheRunsOutCheckBox_);
+        refreshGuideWhenCacheRunsOutCheckBox_->setChecked(
+            settings.value(kGuideRefreshWhenCacheRunsOutSetting, false).toBool());
     }
-    if (guideCacheRetentionSpin_ != nullptr) {
-        const QSignalBlocker blocker(guideCacheRetentionSpin_);
-        guideCacheRetentionSpin_->setValue(settings.value(kGuideCacheRetentionHoursSetting,
-                                                          kDefaultGuideCacheRetentionHours)
-                                               .toInt());
+    if (guideRefreshIntervalCombo_ != nullptr) {
+        const QSignalBlocker blocker(guideRefreshIntervalCombo_);
+        const int selectedMinutes =
+            nearestGuideRefreshIntervalMinutes(settings.value(kGuideRefreshIntervalMinutesSetting,
+                                                              kDefaultGuideRefreshIntervalMinutes)
+                                                   .toInt());
+        const int index = guideRefreshIntervalCombo_->findData(selectedMinutes);
+        guideRefreshIntervalCombo_->setCurrentIndex(index >= 0 ? index : 0);
+    }
+    if (guideCacheRetentionCombo_ != nullptr) {
+        const QSignalBlocker blocker(guideCacheRetentionCombo_);
+        const int selectedHours =
+            nearestGuideCacheRetentionHours(settings.value(kGuideCacheRetentionHoursSetting,
+                                                           kDefaultGuideCacheRetentionHours)
+                                                .toInt());
+        const int index = guideCacheRetentionCombo_->findData(selectedHours);
+        guideCacheRetentionCombo_->setCurrentIndex(index >= 0 ? index : 0);
     }
     if (schedulesDirectUsernameEdit_ != nullptr) {
         const QSignalBlocker blocker(schedulesDirectUsernameEdit_);
@@ -3960,7 +4097,8 @@ MainWindow::MainWindow(QWidget *parent)
     guideCachePollTimer_->setInterval(kGuideCachePollIntervalMs);
     connect(guideCachePollTimer_, &QTimer::timeout, this, [this]() {
         const bool guideDialogVisible = tvGuideDialog_ != nullptr && tvGuideDialog_->isVisible();
-        if (!guideDialogVisible) {
+        const bool refreshedBecauseCacheRanOut = maybeRefreshGuideWhenCacheRunsOut(guideDialogVisible);
+        if (!guideDialogVisible || refreshedBecauseCacheRanOut) {
             return;
         }
         if (loadGuideCacheFile()) {
@@ -4014,7 +4152,9 @@ MainWindow::MainWindow(QWidget *parent)
                                 favoriteShowRules_.join(" | "),
                                 summarizeScheduledSwitchesDebug(scheduledSwitches_)));
         autoScheduleFavoriteShowsFromGuideCache(false, true);
-        guideRefreshTimer_->start();
+        if (!refreshGuideWhenCacheRunsOutEnabled()) {
+            guideRefreshTimer_->start();
+        }
         setStatusBarStateMessage(lastStatusBarMessage_);
         restoreChannelSidebarSizing();
         restoreLastPlayedChannel();
@@ -4436,15 +4576,23 @@ void MainWindow::buildUi()
 
     auto *cacheOptionsGroup = new QGroupBox("Guide Cache", configPage_);
     auto *cacheOptionsForm = new QFormLayout(cacheOptionsGroup);
-    guideRefreshIntervalSpin_ = new QSpinBox(cacheOptionsGroup);
-    guideRefreshIntervalSpin_->setRange(5, 1440);
-    guideRefreshIntervalSpin_->setSuffix(" min");
-    guideCacheRetentionSpin_ = new QSpinBox(cacheOptionsGroup);
-    guideCacheRetentionSpin_->setRange(0, 168);
-    guideCacheRetentionSpin_->setSpecialValueText("Never");
-    guideCacheRetentionSpin_->setSuffix(" hr");
-    cacheOptionsForm->addRow("Refresh guide JSON every:", guideRefreshIntervalSpin_);
-    cacheOptionsForm->addRow("Delete guide cache after:", guideCacheRetentionSpin_);
+    guideRefreshIntervalCombo_ = new QComboBox(cacheOptionsGroup);
+    for (const int minutes : guideRefreshIntervalOptionsMinutes()) {
+        guideRefreshIntervalCombo_->addItem(guideRefreshIntervalText(minutes), minutes);
+    }
+    guideRefreshIntervalCombo_->setToolTip("Choose how often the guide JSON should refresh.");
+    refreshGuideWhenCacheRunsOutCheckBox_ =
+        new QCheckBox("Until JSON is empty", cacheOptionsGroup);
+    refreshGuideWhenCacheRunsOutCheckBox_->setToolTip(
+        "Disable the timer and refresh only after the cached guide no longer covers the current time.");
+    guideCacheRetentionCombo_ = new QComboBox(cacheOptionsGroup);
+    for (const int hours : guideCacheRetentionOptionsHours()) {
+        guideCacheRetentionCombo_->addItem(guideCacheRetentionText(hours), hours);
+    }
+    guideCacheRetentionCombo_->setToolTip("Choose how long guide JSON entries stay in cache before cleanup.");
+    cacheOptionsForm->addRow("Refresh guide JSON every:", guideRefreshIntervalCombo_);
+    cacheOptionsForm->addRow(QString(), refreshGuideWhenCacheRunsOutCheckBox_);
+    cacheOptionsForm->addRow("Delete guide cache after:", guideCacheRetentionCombo_);
 
     auto *schedulesDirectGroup = new QGroupBox("Schedules Direct", configPage_);
     auto *schedulesDirectLayout = new QVBoxLayout(schedulesDirectGroup);
@@ -4915,12 +5063,26 @@ void MainWindow::buildUi()
             &QCheckBox::toggled,
             this,
             &MainWindow::handleHideStartupSwitchSummaryToggled);
-    connect(guideRefreshIntervalSpin_,
-            qOverload<int>(&QSpinBox::valueChanged),
+    connect(guideRefreshIntervalCombo_,
+            qOverload<int>(&QComboBox::currentIndexChanged),
             this,
             &MainWindow::handleGuideRefreshIntervalChanged);
-    connect(guideCacheRetentionSpin_,
-            qOverload<int>(&QSpinBox::valueChanged),
+    connect(refreshGuideWhenCacheRunsOutCheckBox_, &QCheckBox::toggled, this, [this](bool checked) {
+        QSettings settings("tv_tuner_gui", "watcher");
+        settings.setValue(kGuideRefreshWhenCacheRunsOutSetting, checked);
+        guideCacheRunoutRefreshRetryUtc_ = QDateTime();
+        applyGuideRefreshIntervalSetting();
+        if (!checked && guideRefreshTimer_ != nullptr) {
+            guideRefreshTimer_->start();
+        }
+        if (checked) {
+            const bool dialogVisible = tvGuideDialog_ != nullptr && tvGuideDialog_->isVisible();
+            maybeRefreshGuideWhenCacheRunsOut(dialogVisible);
+        }
+        setStatusBarStateMessage(lastStatusBarMessage_);
+    });
+    connect(guideCacheRetentionCombo_,
+            qOverload<int>(&QComboBox::currentIndexChanged),
             this,
             &MainWindow::handleGuideCacheRetentionChanged);
     connect(useSchedulesDirectGuideCheckBox_, &QCheckBox::toggled, this, [this](bool checked) {
@@ -5107,16 +5269,18 @@ void MainWindow::handleHideStartupSwitchSummaryToggled(bool checked)
     settings.setValue(kHideStartupSwitchSummarySetting, checked);
 }
 
-void MainWindow::handleGuideRefreshIntervalChanged(int minutes)
+void MainWindow::handleGuideRefreshIntervalChanged(int)
 {
+    const int boundedMinutes = currentGuideRefreshIntervalMinutes(guideRefreshIntervalCombo_);
     QSettings settings("tv_tuner_gui", "watcher");
-    settings.setValue(kGuideRefreshIntervalMinutesSetting, minutes);
+    settings.setValue(kGuideRefreshIntervalMinutesSetting, boundedMinutes);
     applyGuideRefreshIntervalSetting();
     setStatusBarStateMessage(lastStatusBarMessage_);
 }
 
-void MainWindow::handleGuideCacheRetentionChanged(int hours)
+void MainWindow::handleGuideCacheRetentionChanged(int)
 {
+    const int hours = currentGuideCacheRetentionHours(guideCacheRetentionCombo_);
     QSettings settings("tv_tuner_gui", "watcher");
     settings.setValue(kGuideCacheRetentionHoursSetting, hours);
     setStatusBarStateMessage("Cleaning up TV Guide cache");
@@ -5135,6 +5299,53 @@ bool MainWindow::useSchedulesDirectGuideSource() const
     }
     QSettings settings("tv_tuner_gui", "watcher");
     return settings.value(kUseSchedulesDirectGuideSetting, false).toBool();
+}
+
+bool MainWindow::refreshGuideWhenCacheRunsOutEnabled() const
+{
+    if (refreshGuideWhenCacheRunsOutCheckBox_ != nullptr) {
+        return refreshGuideWhenCacheRunsOutCheckBox_->isChecked();
+    }
+    QSettings settings("tv_tuner_gui", "watcher");
+    return settings.value(kGuideRefreshWhenCacheRunsOutSetting, false).toBool();
+}
+
+bool MainWindow::maybeRefreshGuideWhenCacheRunsOut(bool updateDialog)
+{
+    if (!refreshGuideWhenCacheRunsOutEnabled() || guideRefreshInProgress_) {
+        return false;
+    }
+
+    const QDateTime nowUtc = QDateTime::currentDateTimeUtc();
+    if (guideCacheHasEntriesForNow(guideEntriesCache_, nowUtc)) {
+        if (guideCacheRunoutRefreshRetryUtc_.isValid()) {
+            guideCacheRunoutRefreshRetryUtc_ = QDateTime();
+            setStatusBarStateMessage(lastStatusBarMessage_);
+        }
+        return false;
+    }
+
+    if (guideCacheRunoutRefreshRetryUtc_.isValid() && guideCacheRunoutRefreshRetryUtc_ > nowUtc) {
+        return false;
+    }
+
+    appendLog("guide-bg: cached guide no longer covers current time; refreshing.");
+    if (!refreshGuideData(false, updateDialog)) {
+        guideCacheRunoutRefreshRetryUtc_ = nowUtc.addSecs(kGuideRunoutRefreshRetryMinutes * 60);
+        appendLog(QString("guide-bg: runout refresh failed; retry after %1")
+                      .arg(guideRefreshDateTimeText(guideCacheRunoutRefreshRetryUtc_.toLocalTime())));
+        setStatusBarStateMessage(lastStatusBarMessage_);
+        return false;
+    }
+
+    guideCacheRunoutRefreshRetryUtc_ = QDateTime();
+    loadGuideCacheFile();
+    applyCurrentShowStatusFromGuideCache();
+    if (updateDialog) {
+        updateTvGuideDialogFromCurrentCache(false);
+    }
+    setStatusBarStateMessage(lastStatusBarMessage_);
+    return true;
 }
 
 void MainWindow::updateSchedulesDirectControls()
@@ -5209,7 +5420,7 @@ bool MainWindow::ensureSchedulesDirectJson(bool allowCachedExport,
     const QString cachedExportPath = QFileInfo::exists(exportPath)
                                          ? exportPath
                                          : (QFileInfo::exists(legacyExportPath) ? legacyExportPath : QString());
-    const int retentionHours = guideCacheRetentionHoursValue(guideCacheRetentionSpin_);
+    const int retentionHours = guideCacheRetentionHoursValue(guideCacheRetentionCombo_);
     const QDateTime nowUtc = QDateTime::currentDateTimeUtc();
     const bool cachedExportLooksCurrent =
         !cachedExportPath.isEmpty() && guideJsonFileLooksCurrent(cachedExportPath, nowUtc, retentionHours);
@@ -6139,14 +6350,19 @@ void MainWindow::applyGuideFilterSettings()
 
 void MainWindow::applyGuideRefreshIntervalSetting()
 {
+    if (guideRefreshIntervalCombo_ != nullptr) {
+        guideRefreshIntervalCombo_->setEnabled(!refreshGuideWhenCacheRunsOutEnabled());
+    }
     if (guideRefreshTimer_ == nullptr) {
         return;
     }
 
-    const int minutes = std::clamp(guideRefreshIntervalSpin_ != nullptr ? guideRefreshIntervalSpin_->value()
-                                                                        : kDefaultGuideRefreshIntervalMinutes,
-                                   5,
-                                   1440);
+    if (refreshGuideWhenCacheRunsOutEnabled()) {
+        guideRefreshTimer_->stop();
+        return;
+    }
+
+    const int minutes = currentGuideRefreshIntervalMinutes(guideRefreshIntervalCombo_);
     guideRefreshTimer_->setInterval(minutes * 60 * 1000);
     if (guideRefreshTimer_->isActive()) {
         guideRefreshTimer_->start();
@@ -6667,7 +6883,7 @@ void MainWindow::attachVideoFromPip()
 
 bool MainWindow::purgeExpiredGuideCacheFiles(bool clearLoadedState, bool includeSchedulesDirect)
 {
-    const int retentionHours = guideCacheRetentionHoursValue(guideCacheRetentionSpin_);
+    const int retentionHours = guideCacheRetentionHoursValue(guideCacheRetentionCombo_);
     if (retentionHours <= 0) {
         return false;
     }
@@ -8687,7 +8903,7 @@ bool MainWindow::refreshGuideData(bool interactive, bool updateDialog)
     }
 
     const QDateTime nowUtc = QDateTime::currentDateTimeUtc();
-    const int retentionHours = guideCacheRetentionHoursValue(guideCacheRetentionSpin_);
+    const int retentionHours = guideCacheRetentionHoursValue(guideCacheRetentionCombo_);
     int mappedEntries = 0;
     QDateTime latestEndUtc = nowUtc.addSecs(6 * 3600);
 
@@ -9017,7 +9233,7 @@ bool MainWindow::refreshGuideDataFromSchedulesDirect(bool interactive, bool upda
     sortGuideChannelOrder(channelOrder);
 
     const QDateTime nowUtc = QDateTime::currentDateTimeUtc();
-    const int retentionHours = guideCacheRetentionHoursValue(guideCacheRetentionSpin_);
+    const int retentionHours = guideCacheRetentionHoursValue(guideCacheRetentionCombo_);
     QDateTime latestEndUtc = nowUtc.addSecs(6 * 3600);
     QHash<QString, QList<TvGuideEntry>> entriesByChannel;
     const bool hasRawSchedulesDirectLineups = !root.value("lineups").toArray().isEmpty();
@@ -9191,7 +9407,7 @@ bool MainWindow::loadGuideCacheFile()
 
     QHash<QString, QList<TvGuideEntry>> loadedEntries;
     const QJsonObject entriesObject = root.value("entriesByChannel").toObject();
-    const int retentionHours = guideCacheRetentionHoursValue(guideCacheRetentionSpin_);
+    const int retentionHours = guideCacheRetentionHoursValue(guideCacheRetentionCombo_);
     for (auto it = entriesObject.begin(); it != entriesObject.end(); ++it) {
         const QList<TvGuideEntry> cleaned =
             cleanGuideEntries(guideEntriesFromJsonArray(it.value().toArray()), nowUtc, retentionHours);
@@ -9207,6 +9423,9 @@ bool MainWindow::loadGuideCacheFile()
                                                latestGuideEntryEndUtc(guideEntriesCache_),
                                                lastGuideSlotMinutes_);
     lastGuideStatusText_ = root.value("statusText").toString().trimmed();
+    if (guideCacheHasEntriesForNow(guideEntriesCache_, nowUtc)) {
+        guideCacheRunoutRefreshRetryUtc_ = QDateTime();
+    }
     const QString loadedCacheStamp = currentGuideCacheStamp(lastGuideCacheGeneratedUtc_,
                                                             lastGuideWindowStartUtc_,
                                                             lastGuideSlotMinutes_,
@@ -10071,6 +10290,7 @@ void MainWindow::setStatusBarStateMessage(const QString &text)
 {
     lastStatusBarMessage_ = text;
 
+    const QDateTime nowUtc = QDateTime::currentDateTimeUtc();
     QString message = text.trimmed();
     if (guideRefreshInProgress_) {
         if (!message.isEmpty()) {
@@ -10084,12 +10304,29 @@ void MainWindow::setStatusBarStateMessage(const QString &text)
     if (guideRefreshTimer_ != nullptr && guideRefreshTimer_->isActive()) {
         const int remainingMs = guideRefreshTimer_->remainingTime();
         if (remainingMs >= 0) {
-            const QDateTime nextRefreshUtc = QDateTime::currentDateTimeUtc().addMSecs(remainingMs);
+            const QDateTime nextRefreshUtc = nowUtc.addMSecs(remainingMs);
             if (!message.isEmpty()) {
                 message += " | ";
             }
             message += QString("Next JSON update %1")
-                           .arg(nextRefreshUtc.toLocalTime().toString("h:mm AP"));
+                           .arg(guideRefreshDateTimeText(nextRefreshUtc.toLocalTime()));
+        }
+    } else if (refreshGuideWhenCacheRunsOutEnabled()) {
+        if (guideCacheRunoutRefreshRetryUtc_.isValid() && guideCacheRunoutRefreshRetryUtc_ > nowUtc) {
+            if (!message.isEmpty()) {
+                message += " | ";
+            }
+            message += QString("JSON retry %1")
+                           .arg(guideRefreshDateTimeText(guideCacheRunoutRefreshRetryUtc_.toLocalTime()));
+        } else {
+            const QDateTime latestEndUtc = latestGuideEntryEndUtc(guideEntriesCache_);
+            if (latestEndUtc.isValid()) {
+                if (!message.isEmpty()) {
+                    message += " | ";
+                }
+                message += QString("JSON update when cache runs out %1")
+                               .arg(guideRefreshDateTimeText(latestEndUtc.toLocalTime()));
+            }
         }
     }
 

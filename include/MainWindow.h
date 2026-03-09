@@ -179,6 +179,8 @@ private:
     void syncFavoriteShowRatingControls();
     void refreshScheduledSwitchList();
     bool useSchedulesDirectGuideSource() const;
+    bool refreshGuideWhenCacheRunsOutEnabled() const;
+    bool maybeRefreshGuideWhenCacheRunsOut(bool updateDialog);
     void updateSchedulesDirectControls();
     bool ensureSchedulesDirectJson(bool allowCachedExport,
                                    bool *usedCachedExport,
@@ -264,8 +266,9 @@ private:
     QCheckBox *autoPictureInPictureCheckBox_{};
     QCheckBox *hideStartupSwitchSummaryCheckBox_{};
     QCheckBox *useSchedulesDirectGuideCheckBox_{};
-    QSpinBox *guideRefreshIntervalSpin_{};
-    QSpinBox *guideCacheRetentionSpin_{};
+    QCheckBox *refreshGuideWhenCacheRunsOutCheckBox_{};
+    QComboBox *guideRefreshIntervalCombo_{};
+    QComboBox *guideCacheRetentionCombo_{};
     QLineEdit *favoriteShowRuleEdit_{};
     QLineEdit *testingBugItemEdit_{};
     QLineEdit *schedulesDirectUsernameEdit_{};
@@ -338,6 +341,7 @@ private:
     QString lastStatusBarMessage_{};
     bool fullscreenActive_{false};
     bool fullscreenCursorHidden_{false};
+    QDateTime guideCacheRunoutRefreshRetryUtc_;
     QTimer *reconnectTimer_{};
     QTimer *currentShowTimer_{};
     QTimer *playbackAttachTimer_{};
