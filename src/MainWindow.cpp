@@ -67,6 +67,7 @@
 #include <QTextCursor>
 #include <QTimer>
 #include <QTimeZone>
+#include <QToolTip>
 #include <QUrl>
 #include <QUrlQuery>
 #include <QXmlStreamReader>
@@ -111,6 +112,7 @@ constexpr auto kMutedSetting = "audio/muted";
 constexpr auto kAutoPictureInPictureSetting = "video/autoPictureInPicture";
 constexpr auto kProcessedPlaybackSetting = "video/processLivePlayback";
 constexpr auto kHideStartupSwitchSummarySetting = "tvGuide/hideStartupSwitchSummary";
+constexpr auto kDisableTooltipsSetting = "ui/disableTooltips";
 constexpr auto kLogAutoScrollSetting = "logs/autoScroll";
 constexpr auto kGuideRefreshIntervalMinutesSetting = "tvGuide/refreshIntervalMinutes";
 constexpr auto kGuideRefreshWhenCacheRunsOutSetting = "tvGuide/refreshWhenCacheRunsOut";
@@ -276,7 +278,12 @@ QString guideRefreshDateTimeText(const QDateTime &localDateTime)
 
     const QDate today = QDate::currentDate();
     return localDateTime.date() == today ? localDateTime.toString("h:mm AP")
-                                         : localDateTime.toString("ddd h:mm AP");
+                                         : localDateTime.toString("MM/dd/yyyy ddd h:mm AP");
+}
+
+QString scheduledSwitchDateTimeText(const QDateTime &utcDateTime)
+{
+    return utcDateTime.toLocalTime().toString("MM/dd/yyyy ddd h:mm AP");
 }
 
 QString quoteArg(const QString &arg)
@@ -1314,7 +1321,7 @@ QString scheduledSwitchLabel(const TvGuideScheduledSwitch &scheduledSwitch)
     return QString("%1 on %2 at %3")
         .arg(title,
              normalized.channelName,
-             normalized.startUtc.toLocalTime().toString("ddd h:mm AP"));
+             scheduledSwitchDateTimeText(normalized.startUtc));
 }
 
 QString scheduledSwitchListLabel(const TvGuideScheduledSwitch &scheduledSwitch)
@@ -1326,8 +1333,8 @@ QString scheduledSwitchListLabel(const TvGuideScheduledSwitch &scheduledSwitch)
     return QString("%1 | %2 | %3 - %4")
         .arg(title,
              normalized.channelName,
-             normalized.startUtc.toLocalTime().toString("ddd h:mm AP"),
-             normalized.endUtc.toLocalTime().toString("h:mm AP"));
+             scheduledSwitchDateTimeText(normalized.startUtc),
+             scheduledSwitchDateTimeText(normalized.endUtc));
 }
 
 QString scheduledSwitchManagementLabel(const TvGuideScheduledSwitch &scheduledSwitch)
@@ -3907,6 +3914,8 @@ bool captureGuideEventsForChannel(const QString &channelsFilePath,
 MainWindow::MainWindow(QWidget *parent)
     : QMainWindow(parent)
 {
+    QSettings startupSettings("tv_tuner_gui", "watcher");
+    disableTooltips_ = startupSettings.value(kDisableTooltipsSetting, false).toBool();
     defaultDisplayTheme_ = defaultDisplayTheme();
     if (!loadDisplayThemeStore(&displayThemeStore_, &pendingDisplayThemeLoadError_)) {
         displayThemeStore_ = defaultDisplayThemeStore();
@@ -3944,6 +3953,7 @@ MainWindow::MainWindow(QWidget *parent)
     QSettings settings("tv_tuner_gui", "watcher");
     const int savedVolume = std::clamp(settings.value("volume_percent", 85).toInt(), 0, 100);
     const bool savedMuted = settings.value(kMutedSetting, false).toBool();
+    disableTooltips_ = settings.value(kDisableTooltipsSetting, false).toBool();
     obeyScheduledSwitches_ = settings.value(kObeyScheduledSwitchesSetting, true).toBool();
     autoFavoriteShowSchedulingEnabled_ = settings.value(kAutoFavoriteShowSchedulingSetting, true).toBool();
     favoriteShowRatingsOverrideEnabled_ = settings.value(kFavoriteShowRatingsOverrideSetting, false).toBool();
@@ -3992,6 +4002,10 @@ MainWindow::MainWindow(QWidget *parent)
         const QSignalBlocker blocker(hideStartupSwitchSummaryCheckBox_);
         hideStartupSwitchSummaryCheckBox_->setChecked(
             settings.value(kHideStartupSwitchSummarySetting, false).toBool());
+    }
+    if (disableTooltipsCheckBox_ != nullptr) {
+        const QSignalBlocker blocker(disableTooltipsCheckBox_);
+        disableTooltipsCheckBox_->setChecked(disableTooltips_);
     }
     if (hideStartupSwitchSummaryCheckBox_ != nullptr) {
         const QSignalBlocker blocker(hideStartupSwitchSummaryCheckBox_);
@@ -4323,6 +4337,12 @@ void MainWindow::resizeEvent(QResizeEvent *event)
 
 bool MainWindow::eventFilter(QObject *watched, QEvent *event)
 {
+    if (disableTooltips_ && event != nullptr && event->type() == QEvent::ToolTip) {
+        QToolTip::hideText();
+        event->ignore();
+        return true;
+    }
+
     auto *watchedWidget = qobject_cast<QWidget *>(watched);
     const bool watchedInsideFullscreenWindow =
         fullscreenWindow_ != nullptr
@@ -4742,9 +4762,11 @@ void MainWindow::buildUi()
         "streams, but it adds latency and disables raw passthrough.");
     hideStartupSwitchSummaryCheckBox_ =
         new QCheckBox("Hide the scheduled switches summary at startup", configPlaybackOptionsGroup_);
+    disableTooltipsCheckBox_ = new QCheckBox("Disable tooltips", configPlaybackOptionsGroup_);
     playbackOptionsLayout->addWidget(autoPictureInPictureCheckBox_);
     playbackOptionsLayout->addWidget(processedPlaybackCheckBox_);
     playbackOptionsLayout->addWidget(hideStartupSwitchSummaryCheckBox_);
+    playbackOptionsLayout->addWidget(disableTooltipsCheckBox_);
     playbackOptionsLayout->addStretch(1);
 
     configCacheOptionsGroup_ = new QGroupBox("Guide Cache", configPage_);
@@ -5408,6 +5430,14 @@ void MainWindow::buildUi()
             &QCheckBox::toggled,
             this,
             &MainWindow::handleHideStartupSwitchSummaryToggled);
+    connect(disableTooltipsCheckBox_, &QCheckBox::toggled, this, [this](bool checked) {
+        disableTooltips_ = checked;
+        QSettings settings("tv_tuner_gui", "watcher");
+        settings.setValue(kDisableTooltipsSetting, disableTooltips_);
+        if (disableTooltips_) {
+            QToolTip::hideText();
+        }
+    });
     connect(guideRefreshIntervalCombo_,
             qOverload<int>(&QComboBox::currentIndexChanged),
             this,

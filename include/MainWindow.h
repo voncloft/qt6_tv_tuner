@@ -301,6 +301,7 @@ private:
     QCheckBox *autoPictureInPictureCheckBox_{};
     QCheckBox *processedPlaybackCheckBox_{};
     QCheckBox *hideStartupSwitchSummaryCheckBox_{};
+    QCheckBox *disableTooltipsCheckBox_{};
     QCheckBox *useSchedulesDirectGuideCheckBox_{};
     QCheckBox *refreshGuideWhenCacheRunsOutCheckBox_{};
     QCheckBox *logAutoScrollCheckBox_{};
@@ -390,6 +391,7 @@ private:
     bool fullscreenActive_{false};
     bool fullscreenCursorHidden_{false};
     bool manualPictureInPictureRequested_{false};
+    bool disableTooltips_{false};
     QDateTime guideCacheRunoutRefreshRetryUtc_;
     QTimer *reconnectTimer_{};
     QTimer *currentShowTimer_{};

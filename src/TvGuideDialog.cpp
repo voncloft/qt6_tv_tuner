@@ -202,6 +202,11 @@ QString formatGuideTimelineLabel(const QDateTime &slotStartUtc, bool spansMultip
     return spansMultipleDays ? localStart.toString("ddd HH:mm") : localStart.toString("h:mm AP");
 }
 
+QString formatGuideSearchDateTime(const QDateTime &utcDateTime)
+{
+    return utcDateTime.toLocalTime().toString("MM/dd/yyyy ddd h:mm AP");
+}
+
 int favoriteShowRatingForTitle(const QHash<QString, int> &favoriteShowRatings, const QString &title)
 {
     const QString normalizedTitle = normalizeFavoriteShowRule(title);
@@ -272,8 +277,8 @@ QString formatEntryToolTip(const TvGuideEntry &entry, const QHash<QString, int> 
     const QString ratedTitle = formatRatedShowTitle(parts.title, favoriteShowRatings);
     QString text = QString("%1\n%2 - %3")
         .arg(ratedTitle,
-             entry.startUtc.toLocalTime().toString("ddd h:mm AP"),
-             entry.endUtc.toLocalTime().toString("ddd h:mm AP"));
+             formatGuideSearchDateTime(entry.startUtc),
+             formatGuideSearchDateTime(entry.endUtc));
     if (!parts.episodeTitle.isEmpty()) {
         text += "\nEpisode: " + parts.episodeTitle;
     }
@@ -1413,8 +1418,8 @@ void TvGuideDialog::rebuildSearchIndex()
             result.episodeTitle = parts.episodeTitle;
             result.synopsisBody = parts.synopsisBody;
             result.timeChannelText = QString("%1 - %2 | Channel: %3")
-                                         .arg(entry.startUtc.toLocalTime().toString("ddd h:mm AP"),
-                                              entry.endUtc.toLocalTime().toString("h:mm AP"),
+                                         .arg(formatGuideSearchDateTime(entry.startUtc),
+                                              formatGuideSearchDateTime(entry.endUtc),
                                               channelName);
             result.toolTip = formatEntryToolTip(entry, favoriteShowRatings_);
             result.normalizedHaystack =
