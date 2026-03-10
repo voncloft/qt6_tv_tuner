@@ -25,6 +25,9 @@ const QList<DisplayColorRoleSpec> &displayColorSpecsStorage()
         {DisplayThemeKeys::ButtonBorder, "Button border"},
         {DisplayThemeKeys::ButtonDisabledText, "Disabled button text"},
         {DisplayThemeKeys::ButtonDisabledBorder, "Disabled button border"},
+        {DisplayThemeKeys::CheckBoxIndicatorBackground, "Checkbox background"},
+        {DisplayThemeKeys::CheckBoxIndicatorBorder, "Checkbox border"},
+        {DisplayThemeKeys::CheckBoxIndicatorChecked, "Checkbox checked fill"},
         {DisplayThemeKeys::LabelText, "Label text"},
         {DisplayThemeKeys::MutedText, "Muted text"},
         {DisplayThemeKeys::TabBackground, "Main tab background"},
@@ -45,6 +48,11 @@ const QList<DisplayColorRoleSpec> &displayColorSpecsStorage()
         {DisplayThemeKeys::ScrollbarThumb, "Scrollbar thumb"},
         {DisplayThemeKeys::ScrollbarThumbHover, "Scrollbar hover thumb"},
         {DisplayThemeKeys::ScrollbarBorder, "Scrollbar border"},
+        {DisplayThemeKeys::SliderTrack, "Slider track"},
+        {DisplayThemeKeys::SliderFilledTrack, "Slider filled track"},
+        {DisplayThemeKeys::SliderHandle, "Slider handle"},
+        {DisplayThemeKeys::SliderHandleHover, "Slider hover handle"},
+        {DisplayThemeKeys::SliderHandleBorder, "Slider handle border"},
         {DisplayThemeKeys::FullscreenOverlayBackground, "Fullscreen overlay background"},
         {DisplayThemeKeys::FullscreenOverlayText, "Fullscreen overlay text"},
         {DisplayThemeKeys::GuideBackground, "Guide background"},
@@ -200,6 +208,9 @@ DisplayTheme buildDefaultTheme()
         {DisplayThemeKeys::ButtonBorder, QColor("#343434")},
         {DisplayThemeKeys::ButtonDisabledText, QColor("#777777")},
         {DisplayThemeKeys::ButtonDisabledBorder, QColor("#1e1e1e")},
+        {DisplayThemeKeys::CheckBoxIndicatorBackground, QColor("#050505")},
+        {DisplayThemeKeys::CheckBoxIndicatorBorder, QColor("#7a0000")},
+        {DisplayThemeKeys::CheckBoxIndicatorChecked, QColor("#ff3030")},
         {DisplayThemeKeys::LabelText, QColor("#ffffff")},
         {DisplayThemeKeys::MutedText, QColor("#d4d4d4")},
         {DisplayThemeKeys::TabBackground, QColor("#050505")},
@@ -220,6 +231,11 @@ DisplayTheme buildDefaultTheme()
         {DisplayThemeKeys::ScrollbarThumb, QColor("#ff3030")},
         {DisplayThemeKeys::ScrollbarThumbHover, QColor("#ff5252")},
         {DisplayThemeKeys::ScrollbarBorder, QColor("#1a1a1a")},
+        {DisplayThemeKeys::SliderTrack, QColor("#171717")},
+        {DisplayThemeKeys::SliderFilledTrack, QColor("#ff3030")},
+        {DisplayThemeKeys::SliderHandle, QColor("#ff3030")},
+        {DisplayThemeKeys::SliderHandleHover, QColor("#ff5252")},
+        {DisplayThemeKeys::SliderHandleBorder, QColor("#7a0000")},
         {DisplayThemeKeys::FullscreenOverlayBackground, QColor("#b36e6e6e")},
         {DisplayThemeKeys::FullscreenOverlayText, QColor("#f3f3f3")},
         {DisplayThemeKeys::GuideBackground, QColor("#000000")},
@@ -512,6 +528,24 @@ QFont qFontFromDisplayFontStyle(const DisplayFontStyle &style, const QFont &fall
     return font;
 }
 
+QString styleSheetFontFragment(const DisplayFontStyle &style)
+{
+    const QFont font = qFontFromDisplayFontStyle(style);
+    QStringList declarations;
+    if (!font.family().trimmed().isEmpty()) {
+        QString family = font.family().trimmed();
+        family.replace('\'', "\\'");
+        declarations.append(QString("font-family: '%1';").arg(family));
+    }
+    if (font.pointSize() > 0) {
+        declarations.append(QString("font-size: %1pt;").arg(font.pointSize()));
+    }
+    declarations.append(QString("font-weight: %1;").arg(font.bold() ? 700 : 400));
+    declarations.append(QString("font-style: %1;").arg(font.italic() ? "italic" : "normal"));
+    declarations.append(QString("text-decoration: %1;").arg(font.underline() ? "underline" : "none"));
+    return declarations.join(' ');
+}
+
 QPalette buildApplicationPalette(const DisplayTheme &theme, const QPalette &fallback)
 {
     const DisplayTheme normalized = normalizedDisplayTheme(theme);
@@ -592,4 +626,73 @@ QString buildScrollBarStyleSheet(const DisplayTheme &theme)
                " background: %1;"
                "}")
         .arg(track, border, thumb, thumbHover);
+}
+
+QString buildSliderStyleSheet(const DisplayTheme &theme)
+{
+    const DisplayTheme normalized = normalizedDisplayTheme(theme);
+    const QString track = colorToString(normalized.colors.value(DisplayThemeKeys::SliderTrack));
+    const QString filled = colorToString(normalized.colors.value(DisplayThemeKeys::SliderFilledTrack));
+    const QString handle = colorToString(normalized.colors.value(DisplayThemeKeys::SliderHandle));
+    const QString handleHover = colorToString(normalized.colors.value(DisplayThemeKeys::SliderHandleHover));
+    const QString handleBorder = colorToString(normalized.colors.value(DisplayThemeKeys::SliderHandleBorder));
+
+    return QString(
+               "QSlider::groove:horizontal {"
+               " border: 1px solid %1;"
+               " height: 8px;"
+               " background: %2;"
+               " border-radius: 4px;"
+               "}"
+               "QSlider::sub-page:horizontal {"
+               " background: %3;"
+               " border: 1px solid %1;"
+               " height: 8px;"
+               " border-radius: 4px;"
+               "}"
+               "QSlider::add-page:horizontal {"
+               " background: %2;"
+               " border: 1px solid %1;"
+               " height: 8px;"
+               " border-radius: 4px;"
+               "}"
+               "QSlider::handle:horizontal {"
+               " background: %4;"
+               " border: 1px solid %5;"
+               " width: 18px;"
+               " margin: -6px 0;"
+               " border-radius: 9px;"
+               "}"
+               "QSlider::handle:horizontal:hover {"
+               " background: %6;"
+               "}"
+               "QSlider::groove:vertical {"
+               " border: 1px solid %1;"
+               " width: 8px;"
+               " background: %2;"
+               " border-radius: 4px;"
+               "}"
+               "QSlider::sub-page:vertical {"
+               " background: %3;"
+               " border: 1px solid %1;"
+               " width: 8px;"
+               " border-radius: 4px;"
+               "}"
+               "QSlider::add-page:vertical {"
+               " background: %2;"
+               " border: 1px solid %1;"
+               " width: 8px;"
+               " border-radius: 4px;"
+               "}"
+               "QSlider::handle:vertical {"
+               " background: %4;"
+               " border: 1px solid %5;"
+               " height: 18px;"
+               " margin: 0 -6px;"
+               " border-radius: 9px;"
+               "}"
+               "QSlider::handle:vertical:hover {"
+               " background: %6;"
+               "}")
+        .arg(handleBorder, track, filled, handle, handleBorder, handleHover);
 }

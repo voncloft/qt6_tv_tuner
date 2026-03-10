@@ -103,7 +103,7 @@ int main(int argc, char *argv[])
     app.setFont(
         qFontFromDisplayFontStyle(displayThemeFontStyle(currentDisplayTheme, DisplayThemeKeys::AppFont), app.font()));
     app.setPalette(buildApplicationPalette(currentDisplayTheme, app.palette()));
-    app.setStyleSheet(buildScrollBarStyleSheet(currentDisplayTheme));
+    app.setStyleSheet(buildScrollBarStyleSheet(currentDisplayTheme) + buildSliderStyleSheet(currentDisplayTheme));
     if (!displayThemeError.trimmed().isEmpty()) {
         qWarning().noquote() << "display-theme:" << displayThemeError;
     }

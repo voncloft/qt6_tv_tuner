@@ -28,12 +28,14 @@ class QSlider;
 class QTimer;
 class QFile;
 class QCloseEvent;
+class QResizeEvent;
 class QWidget;
 class QSplitter;
 class QTabWidget;
 class QVBoxLayout;
 class QCheckBox;
 class QSpinBox;
+class QGroupBox;
 
 class MainWindow : public QMainWindow
 {
@@ -45,6 +47,7 @@ public:
 
 protected:
     void closeEvent(QCloseEvent *event) override;
+    void resizeEvent(QResizeEvent *event) override;
     bool eventFilter(QObject *watched, QEvent *event) override;
 
 private slots:
@@ -102,6 +105,7 @@ private:
 
     void buildUi();
     void applyDisplayTheme(bool persistCurrentTheme);
+    void syncConfigGroupBoxHeights();
     void refreshDisplayThemeControls();
     void refreshSavedDisplayThemeList(const QString &preferredSelection = QString());
     void chooseDisplayThemeColor(const QString &roleKey);
@@ -324,6 +328,10 @@ private:
     QWidget *watchPage_{};
     QWidget *configPage_{};
     QWidget *displayOptionsPage_{};
+    QGroupBox *configGuideOptionsGroup_{};
+    QGroupBox *configPlaybackOptionsGroup_{};
+    QGroupBox *configCacheOptionsGroup_{};
+    QGroupBox *configSchedulesDirectGroup_{};
     QWidget *watchControlsContainer_{};
     QWidget *favoritesContainer_{};
     QWidget *statusContainer_{};

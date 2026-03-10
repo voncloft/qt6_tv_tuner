@@ -4313,6 +4313,14 @@ void MainWindow::closeEvent(QCloseEvent *event)
     QMainWindow::closeEvent(event);
 }
 
+void MainWindow::resizeEvent(QResizeEvent *event)
+{
+    QMainWindow::resizeEvent(event);
+    QTimer::singleShot(0, this, [this]() {
+        syncConfigGroupBoxHeights();
+    });
+}
+
 bool MainWindow::eventFilter(QObject *watched, QEvent *event)
 {
     auto *watchedWidget = qobject_cast<QWidget *>(watched);
@@ -4700,56 +4708,64 @@ void MainWindow::buildUi()
     tuningLayout->addLayout(scanActionsRow);
     tuningLayout->addStretch(1);
 
-    auto *guideOptionsGroup = new QGroupBox("TV Guide", configPage_);
-    auto *guideOptionsLayout = new QVBoxLayout(guideOptionsGroup);
+    configGuideOptionsGroup_ = new QGroupBox("TV Guide", configPage_);
+    auto *guideOptionsLayout = new QVBoxLayout(configGuideOptionsGroup_);
     guideOptionsLayout->setContentsMargins(12, 14, 12, 12);
     guideOptionsLayout->setSpacing(8);
-    useSchedulesDirectGuideCheckBox_ = new QCheckBox("Use Schedules Direct OTA data for guide refreshes", guideOptionsGroup);
-    hideNoEitChannelsCheckBox_ = new QCheckBox("Hide channels without EIT data", guideOptionsGroup);
-    showFavoritesOnlyCheckBox_ = new QCheckBox("Show only favorites in TV Guide", guideOptionsGroup);
-    obeyScheduledSwitchesCheckBox_ = new QCheckBox("Obey scheduled tuner switches", guideOptionsGroup);
-    autoFavoriteShowSchedulingCheckBox_ = new QCheckBox("Automatically schedule favorite show matches", guideOptionsGroup);
+    useSchedulesDirectGuideCheckBox_ =
+        new QCheckBox("Use Schedules Direct OTA data for guide refreshes", configGuideOptionsGroup_);
+    hideNoEitChannelsCheckBox_ = new QCheckBox("Hide channels without EIT data", configGuideOptionsGroup_);
+    showFavoritesOnlyCheckBox_ = new QCheckBox("Show only favorites in TV Guide", configGuideOptionsGroup_);
+    obeyScheduledSwitchesCheckBox_ = new QCheckBox("Obey scheduled tuner switches", configGuideOptionsGroup_);
+    autoFavoriteShowSchedulingCheckBox_ =
+        new QCheckBox("Automatically schedule favorite show matches", configGuideOptionsGroup_);
     favoriteShowRatingsOverrideCheckBox_ =
-        new QCheckBox("Override conflicts with favorite show priority ratings", guideOptionsGroup);
+        new QCheckBox("Override conflicts with favorite show priority ratings", configGuideOptionsGroup_);
     guideOptionsLayout->addWidget(useSchedulesDirectGuideCheckBox_);
     guideOptionsLayout->addWidget(hideNoEitChannelsCheckBox_);
     guideOptionsLayout->addWidget(showFavoritesOnlyCheckBox_);
     guideOptionsLayout->addWidget(obeyScheduledSwitchesCheckBox_);
     guideOptionsLayout->addWidget(autoFavoriteShowSchedulingCheckBox_);
     guideOptionsLayout->addWidget(favoriteShowRatingsOverrideCheckBox_);
+    guideOptionsLayout->addStretch(1);
 
-    auto *playbackOptionsGroup = new QGroupBox("Playback", configPage_);
-    auto *playbackOptionsLayout = new QVBoxLayout(playbackOptionsGroup);
+    configPlaybackOptionsGroup_ = new QGroupBox("Playback", configPage_);
+    auto *playbackOptionsLayout = new QVBoxLayout(configPlaybackOptionsGroup_);
     playbackOptionsLayout->setContentsMargins(12, 14, 12, 12);
     playbackOptionsLayout->setSpacing(8);
-    autoPictureInPictureCheckBox_ = new QCheckBox("Pop video out when leaving the Video tab", playbackOptionsGroup);
+    autoPictureInPictureCheckBox_ =
+        new QCheckBox("Pop video out when leaving the Video tab", configPlaybackOptionsGroup_);
     processedPlaybackCheckBox_ =
-        new QCheckBox("Always process live audio/video before playback", playbackOptionsGroup);
+        new QCheckBox("Always process live audio/video before playback", configPlaybackOptionsGroup_);
     processedPlaybackCheckBox_->setToolTip(
         "Deinterlaces video and rebuilds audio/video before playback. This can smooth motion and sanitize messy "
         "streams, but it adds latency and disables raw passthrough.");
     hideStartupSwitchSummaryCheckBox_ =
-        new QCheckBox("Hide the scheduled switches summary at startup", playbackOptionsGroup);
+        new QCheckBox("Hide the scheduled switches summary at startup", configPlaybackOptionsGroup_);
     playbackOptionsLayout->addWidget(autoPictureInPictureCheckBox_);
     playbackOptionsLayout->addWidget(processedPlaybackCheckBox_);
     playbackOptionsLayout->addWidget(hideStartupSwitchSummaryCheckBox_);
+    playbackOptionsLayout->addStretch(1);
 
-    auto *cacheOptionsGroup = new QGroupBox("Guide Cache", configPage_);
-    auto *cacheOptionsForm = new QFormLayout(cacheOptionsGroup);
-    cacheOptionsForm->setContentsMargins(12, 14, 12, 12);
+    configCacheOptionsGroup_ = new QGroupBox("Guide Cache", configPage_);
+    auto *cacheOptionsLayout = new QVBoxLayout(configCacheOptionsGroup_);
+    cacheOptionsLayout->setContentsMargins(12, 14, 12, 12);
+    cacheOptionsLayout->setSpacing(10);
+    auto *cacheOptionsForm = new QFormLayout();
+    cacheOptionsForm->setContentsMargins(0, 0, 0, 0);
     cacheOptionsForm->setHorizontalSpacing(12);
     cacheOptionsForm->setVerticalSpacing(10);
     cacheOptionsForm->setFieldGrowthPolicy(QFormLayout::AllNonFixedFieldsGrow);
-    guideRefreshIntervalCombo_ = new QComboBox(cacheOptionsGroup);
+    guideRefreshIntervalCombo_ = new QComboBox(configCacheOptionsGroup_);
     for (const int minutes : guideRefreshIntervalOptionsMinutes()) {
         guideRefreshIntervalCombo_->addItem(guideRefreshIntervalText(minutes), minutes);
     }
     guideRefreshIntervalCombo_->setToolTip("Choose how often the guide JSON should refresh.");
     refreshGuideWhenCacheRunsOutCheckBox_ =
-        new QCheckBox("Until JSON is empty", cacheOptionsGroup);
+        new QCheckBox("Until JSON is empty", configCacheOptionsGroup_);
     refreshGuideWhenCacheRunsOutCheckBox_->setToolTip(
         "Disable the timer and refresh only after the cached guide no longer covers the current time.");
-    guideCacheRetentionCombo_ = new QComboBox(cacheOptionsGroup);
+    guideCacheRetentionCombo_ = new QComboBox(configCacheOptionsGroup_);
     for (const int hours : guideCacheRetentionOptionsHours()) {
         guideCacheRetentionCombo_->addItem(guideCacheRetentionText(hours), hours);
     }
@@ -4757,39 +4773,46 @@ void MainWindow::buildUi()
     cacheOptionsForm->addRow("Refresh guide JSON every:", guideRefreshIntervalCombo_);
     cacheOptionsForm->addRow(QString(), refreshGuideWhenCacheRunsOutCheckBox_);
     cacheOptionsForm->addRow("Delete guide cache after:", guideCacheRetentionCombo_);
+    cacheOptionsLayout->addLayout(cacheOptionsForm);
+    cacheOptionsLayout->addStretch(1);
 
-    auto *schedulesDirectGroup = new QGroupBox("Schedules Direct", configPage_);
-    auto *schedulesDirectLayout = new QVBoxLayout(schedulesDirectGroup);
+    configSchedulesDirectGroup_ = new QGroupBox("Schedules Direct", configPage_);
+    auto *schedulesDirectLayout = new QVBoxLayout(configSchedulesDirectGroup_);
     schedulesDirectLayout->setContentsMargins(12, 14, 12, 12);
     schedulesDirectLayout->setSpacing(10);
     auto *schedulesDirectForm = new QFormLayout();
     schedulesDirectForm->setHorizontalSpacing(12);
     schedulesDirectForm->setVerticalSpacing(10);
     schedulesDirectForm->setFieldGrowthPolicy(QFormLayout::AllNonFixedFieldsGrow);
-    schedulesDirectUsernameEdit_ = new QLineEdit(schedulesDirectGroup);
+    schedulesDirectUsernameEdit_ = new QLineEdit(configSchedulesDirectGroup_);
     schedulesDirectUsernameEdit_->setPlaceholderText("voncloft");
-    schedulesDirectPasswordEdit_ = new QLineEdit(schedulesDirectGroup);
+    schedulesDirectPasswordEdit_ = new QLineEdit(configSchedulesDirectGroup_);
     schedulesDirectPasswordEdit_->setEchoMode(QLineEdit::Password);
     schedulesDirectPasswordEdit_->setPlaceholderText("Saved as SHA1 for background refreshes");
-    schedulesDirectPostalCodeEdit_ = new QLineEdit(schedulesDirectGroup);
+    schedulesDirectPostalCodeEdit_ = new QLineEdit(configSchedulesDirectGroup_);
     schedulesDirectPostalCodeEdit_->setPlaceholderText("46825");
     schedulesDirectPostalCodeEdit_->setMaxLength(16);
     schedulesDirectForm->addRow("Username:", schedulesDirectUsernameEdit_);
     schedulesDirectForm->addRow("Password:", schedulesDirectPasswordEdit_);
     schedulesDirectForm->addRow("ZIP / Postal code:", schedulesDirectPostalCodeEdit_);
-    exportSchedulesDirectButton_ = new QPushButton("Download schedules_direct.org.json", schedulesDirectGroup);
+    exportSchedulesDirectButton_ =
+        new QPushButton("Download schedules_direct.org.json", configSchedulesDirectGroup_);
     exportSchedulesDirectButton_->setEnabled(false);
-    schedulesDirectStatusLabel_ = new QLabel("Downloads OTA lineup, schedule, and program data to a JSON file in the app data folder. When the guide checkbox above is enabled, background guide refreshes use this source instead of live EIT.", schedulesDirectGroup);
+    schedulesDirectStatusLabel_ = new QLabel(
+        "Downloads OTA lineup, schedule, and program data to a JSON file in the app data folder. When the guide "
+        "checkbox above is enabled, background guide refreshes use this source instead of live EIT.",
+        configSchedulesDirectGroup_);
     schedulesDirectStatusLabel_->setWordWrap(true);
     schedulesDirectStatusLabel_->setTextInteractionFlags(Qt::TextSelectableByMouse);
     schedulesDirectLayout->addLayout(schedulesDirectForm);
     schedulesDirectLayout->addWidget(exportSchedulesDirectButton_, 0);
     schedulesDirectLayout->addWidget(schedulesDirectStatusLabel_, 0);
+    schedulesDirectLayout->addStretch(1);
 
-    guideOptionsGroup->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Maximum);
-    playbackOptionsGroup->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Maximum);
-    cacheOptionsGroup->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Maximum);
-    schedulesDirectGroup->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Maximum);
+    configGuideOptionsGroup_->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
+    configPlaybackOptionsGroup_->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
+    configCacheOptionsGroup_->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
+    configSchedulesDirectGroup_->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
 
     auto *favoriteShowsGroup = new QGroupBox("Favorite Shows", metaManagementPage);
     auto *favoriteShowsLayout = new QVBoxLayout(favoriteShowsGroup);
@@ -4837,12 +4860,15 @@ void MainWindow::buildUi()
     configSectionsLayout->setVerticalSpacing(12);
     configSectionsLayout->setColumnStretch(0, 1);
     configSectionsLayout->setColumnStretch(1, 1);
-    configSectionsLayout->addWidget(guideOptionsGroup, 0, 0);
-    configSectionsLayout->addWidget(playbackOptionsGroup, 0, 1);
-    configSectionsLayout->addWidget(cacheOptionsGroup, 1, 0);
-    configSectionsLayout->addWidget(schedulesDirectGroup, 1, 1);
+    configSectionsLayout->addWidget(configGuideOptionsGroup_, 0, 0, Qt::AlignTop);
+    configSectionsLayout->addWidget(configPlaybackOptionsGroup_, 0, 1, Qt::AlignTop);
+    configSectionsLayout->addWidget(configCacheOptionsGroup_, 1, 0, Qt::AlignTop);
+    configSectionsLayout->addWidget(configSchedulesDirectGroup_, 1, 1, Qt::AlignTop);
     configLayout->addLayout(configSectionsLayout);
     configLayout->addStretch(1);
+    QTimer::singleShot(0, this, [this]() {
+        syncConfigGroupBoxHeights();
+    });
 
     auto *themeLibraryGroup = new QGroupBox("Theme Library", displayOptionsPage_);
     auto *themeLibraryLayout = new QVBoxLayout(themeLibraryGroup);
@@ -5694,6 +5720,49 @@ void MainWindow::refreshDisplayThemeControls()
     syncingDisplayThemeUi_ = false;
 }
 
+void MainWindow::syncConfigGroupBoxHeights()
+{
+    const auto releaseHeightConstraint = [](QGroupBox *groupBox) {
+        if (groupBox == nullptr) {
+            return;
+        }
+        groupBox->setMinimumHeight(0);
+        groupBox->setMaximumHeight(QWIDGETSIZE_MAX);
+        groupBox->updateGeometry();
+    };
+
+    const auto preferredHeight = [](QGroupBox *groupBox) {
+        if (groupBox == nullptr) {
+            return 0;
+        }
+        if (QLayout *layout = groupBox->layout()) {
+            layout->activate();
+        }
+        int height = std::max(groupBox->minimumSizeHint().height(), groupBox->sizeHint().height());
+        if (const int width = groupBox->width(); width > 0 && groupBox->hasHeightForWidth()) {
+            height = std::max(height, groupBox->heightForWidth(width));
+        }
+        return height;
+    };
+
+    const auto syncRow = [&](QGroupBox *left, QGroupBox *right) {
+        if (left == nullptr || right == nullptr) {
+            return;
+        }
+        releaseHeightConstraint(left);
+        releaseHeightConstraint(right);
+        const int targetHeight = std::max(preferredHeight(left), preferredHeight(right));
+        if (targetHeight <= 0) {
+            return;
+        }
+        left->setFixedHeight(targetHeight);
+        right->setFixedHeight(targetHeight);
+    };
+
+    syncRow(configGuideOptionsGroup_, configPlaybackOptionsGroup_);
+    syncRow(configCacheOptionsGroup_, configSchedulesDirectGroup_);
+}
+
 void MainWindow::applyDisplayTheme(bool persistCurrentTheme)
 {
     currentDisplayTheme_ = normalizedDisplayTheme(currentDisplayTheme_);
@@ -5706,7 +5775,12 @@ void MainWindow::applyDisplayTheme(bool persistCurrentTheme)
     qApp->setFont(qFontFromDisplayFontStyle(displayThemeFontStyle(currentDisplayTheme_, DisplayThemeKeys::AppFont),
                                             qApp->font()));
     qApp->setPalette(buildApplicationPalette(currentDisplayTheme_, qApp->palette()));
-    qApp->setStyleSheet(buildScrollBarStyleSheet(currentDisplayTheme_));
+    qApp->setStyleSheet(buildScrollBarStyleSheet(currentDisplayTheme_) + buildSliderStyleSheet(currentDisplayTheme_));
+
+    const QString tabFontCss =
+        styleSheetFontFragment(displayThemeFontStyle(currentDisplayTheme_, DisplayThemeKeys::TabFont));
+    const QString checkBoxFontCss =
+        styleSheetFontFragment(displayThemeFontStyle(currentDisplayTheme_, DisplayThemeKeys::ButtonFont));
 
     const QString mainPageStyle =
         QString(
@@ -5715,7 +5789,10 @@ void MainWindow::applyDisplayTheme(bool persistCurrentTheme)
             "QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 4px; color: %2; }"
             "QPushButton { background-color: %4; color: %5; border: 1px solid %6; padding: 6px 12px; }"
             "QPushButton:disabled { color: %7; border-color: %8; }"
-            "QCheckBox { color: %2; spacing: 6px; }"
+            "QCheckBox { color: %2; spacing: 6px; %18 }"
+            "QCheckBox::indicator { width: 16px; height: 16px; background-color: %19; border: 1px solid %20; }"
+            "QCheckBox::indicator:checked { background-color: %21; border: 1px solid %20; image: none; }"
+            "QCheckBox::indicator:unchecked { background-color: %19; border: 1px solid %20; image: none; }"
             "QScrollArea, QScrollArea > QWidget > QWidget { background-color: %1; }"
             "QLineEdit, QComboBox, QListWidget, QPlainTextEdit, QTableWidget, QSpinBox, QFontComboBox {"
             " background-color: %9; color: %10; border: 1px solid %11; selection-background-color: %12; selection-color: %13; }"
@@ -5738,18 +5815,23 @@ void MainWindow::applyDisplayTheme(bool persistCurrentTheme)
                  color(DisplayThemeKeys::HeaderBackground),
                  color(DisplayThemeKeys::HeaderText),
                  color(DisplayThemeKeys::HeaderBorder),
-                 color(DisplayThemeKeys::LabelText));
+                 color(DisplayThemeKeys::LabelText),
+                 checkBoxFontCss,
+                 color(DisplayThemeKeys::CheckBoxIndicatorBackground),
+                 color(DisplayThemeKeys::CheckBoxIndicatorBorder),
+                 color(DisplayThemeKeys::CheckBoxIndicatorChecked));
 
     if (tabs_ != nullptr) {
         tabs_->setStyleSheet(
             QString("QTabWidget::pane { border: 0; background-color: %1; }"
-                    "QTabBar::tab { background-color: %2; color: %3; border: 1px solid %4; padding: 8px 14px; }"
+                    "QTabBar::tab { background-color: %2; color: %3; border: 1px solid %4; padding: 8px 14px; %6 }"
                     "QTabBar::tab:selected { background-color: %5; }")
                 .arg(color(DisplayThemeKeys::WindowBackground),
                      color(DisplayThemeKeys::TabBackground),
                      color(DisplayThemeKeys::TabText),
                      color(DisplayThemeKeys::TabBorder),
-                     color(DisplayThemeKeys::TabSelectedBackground)));
+                     color(DisplayThemeKeys::TabSelectedBackground),
+                     tabFontCss));
         if (tabs_->tabBar() != nullptr) {
             tabs_->tabBar()->setFont(qFontFromDisplayFontStyle(displayThemeFontStyle(currentDisplayTheme_,
                                                                                      DisplayThemeKeys::TabFont),
@@ -5918,6 +6000,7 @@ void MainWindow::applyDisplayTheme(bool persistCurrentTheme)
         tvGuideDialog_->setDisplayTheme(currentDisplayTheme_);
     }
 
+    syncConfigGroupBoxHeights();
     refreshDisplayThemeControls();
     if (persistCurrentTheme) {
         persistDisplayThemeStore("Current theme saved.", false);

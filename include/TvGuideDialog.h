@@ -78,6 +78,13 @@ private:
     struct SearchResult {
         QString channelName;
         TvGuideEntry entry;
+        QString ratedTitle;
+        QString episodeTitle;
+        QString synopsisBody;
+        QString timeChannelText;
+        QString toolTip;
+        QString normalizedHaystack;
+        bool isFavorite{false};
     };
 
     QString entryLabel(const TvGuideEntry &entry) const;
@@ -87,6 +94,7 @@ private:
     int guideSlotPixelWidth() const;
     void applyGuideHorizontalScroll(int value);
     void scrollGuideToCurrentTime(bool force);
+    void rebuildSearchIndex();
     void updateSearchResults();
     void updateSearchActionState();
     bool searchResultIsCurrent(const SearchResult &result) const;
@@ -119,6 +127,7 @@ private:
     bool hideChannelsWithoutEitData_{false};
     bool showFavoritesOnly_{false};
     bool pendingSyncToCurrentTime_{false};
+    QList<SearchResult> searchIndex_;
     QList<SearchResult> searchResults_;
     DisplayTheme displayTheme_;
 };
