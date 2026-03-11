@@ -43,6 +43,7 @@
 #include <QMenu>
 #include <QMenuBar>
 #include <QMessageBox>
+#include <QMediaMetaData>
 #include <QNetworkAccessManager>
 #include <QNetworkReply>
 #include <QNetworkRequest>
@@ -50,6 +51,7 @@
 #include <QProgressDialog>
 #include <QProcess>
 #include <QPushButton>
+#include <QPainter>
 #include <QRegularExpression>
 #include <QSaveFile>
 #include <QShortcut>
@@ -185,6 +187,57 @@ protected:
         QSlider::mousePressEvent(event);
     }
 };
+
+QIcon firstAvailableThemeIcon(const QStringList &names, const QIcon &fallback = QIcon())
+{
+    for (const QString &name : names) {
+        const QIcon icon = QIcon::fromTheme(name);
+        if (!icon.isNull()) {
+            return icon;
+        }
+    }
+    return fallback;
+}
+
+QIcon makeFallbackPipIcon()
+{
+    QPixmap pixmap(24, 24);
+    pixmap.fill(Qt::transparent);
+    QPainter painter(&pixmap);
+    painter.setRenderHint(QPainter::Antialiasing, true);
+    painter.setPen(QPen(QColor(245, 245, 245), 2));
+    painter.setBrush(Qt::NoBrush);
+    painter.drawRoundedRect(QRectF(3.5, 5.5, 17.0, 11.0), 1.5, 1.5);
+    painter.fillRect(QRectF(12.0, 11.0, 6.0, 4.0), QColor(245, 245, 245));
+    return QIcon(pixmap);
+}
+
+QIcon makeFallbackFullscreenIcon()
+{
+    QPixmap pixmap(24, 24);
+    pixmap.fill(Qt::transparent);
+    QPainter painter(&pixmap);
+    painter.setRenderHint(QPainter::Antialiasing, true);
+    painter.setPen(QPen(QColor(245, 245, 245), 2));
+    painter.setBrush(Qt::NoBrush);
+    painter.drawRoundedRect(QRectF(4.0, 6.0, 12.0, 9.0), 1.0, 1.0);
+    painter.drawLine(QPointF(11.0, 13.0), QPointF(19.0, 5.0));
+    painter.drawLine(QPointF(15.0, 5.0), QPointF(19.0, 5.0));
+    painter.drawLine(QPointF(19.0, 5.0), QPointF(19.0, 9.0));
+    return QIcon(pixmap);
+}
+
+void configureIconOnlyButton(QPushButton *button, const QIcon &icon, const QString &toolTip)
+{
+    if (button == nullptr) {
+        return;
+    }
+
+    button->setText(QString());
+    button->setIcon(icon);
+    button->setIconSize(QSize(18, 18));
+    button->setToolTip(toolTip);
+}
 
 QString favoriteKeyBindingActionId(int index)
 {
@@ -4155,7 +4208,6 @@ MainWindow::MainWindow(QWidget *parent)
     if (muteButton_ != nullptr) {
         const QSignalBlocker blocker(muteButton_);
         muteButton_->setChecked(savedMuted);
-        muteButton_->setText(savedMuted ? "Unmute" : "Mute");
     }
     applyAudioOutputState();
     if (hideNoEitChannelsCheckBox_ != nullptr) {
@@ -4319,6 +4371,7 @@ MainWindow::MainWindow(QWidget *parent)
     connect(mediaPlayer_, &QMediaPlayer::playbackStateChanged, this, [this]() {
         appendLog(QString("player: playbackStateChanged=%1").arg(static_cast<int>(mediaPlayer_->playbackState())));
         playbackStatusLabel_->setText(playbackStatusText());
+        refreshLocalMediaSignalStatus();
         syncFullscreenOverlayState();
         refreshRecoveryAudioMuteGate();
     });
@@ -4336,6 +4389,7 @@ MainWindow::MainWindow(QWidget *parent)
     connect(mediaPlayer_, &QMediaPlayer::hasVideoChanged, this, [this](bool hasVideo) {
         appendLog(QString("player: hasVideoChanged=%1").arg(hasVideo ? "true" : "false"));
         Q_UNUSED(hasVideo);
+        refreshLocalMediaSignalStatus();
         refreshRecoveryAudioMuteGate();
     });
     connect(mediaPlayer_, &QMediaPlayer::hasAudioChanged, this, [this](bool hasAudio) {
@@ -4343,7 +4397,11 @@ MainWindow::MainWindow(QWidget *parent)
         if (hasAudio && mediaPlayer_->hasVideo()) {
             bridgeSawCodecParameterFailure_ = false;
         }
+        refreshLocalMediaSignalStatus();
         refreshRecoveryAudioMuteGate();
+    });
+    connect(mediaPlayer_, &QMediaPlayer::metaDataChanged, this, [this]() {
+        refreshLocalMediaSignalStatus();
     });
     connect(mediaPlayer_, &QMediaPlayer::bufferProgressChanged, this, [this](float progress) {
         appendLog(QString("player: bufferProgress=%1").arg(progress, 0, 'f', 3));
@@ -5328,15 +5386,15 @@ void MainWindow::buildUi()
     watchControlsLayout->setContentsMargins(0, 0, 0, 0);
     watchControlsLayout->setSpacing(6);
     auto *watchControlsRow = new QHBoxLayout();
-    watchControlsRow->setContentsMargins(0, 0, 0, 0);
+    watchControlsRow->setContentsMargins(0, 4, 0, 0);
     watchControlsRow->setSpacing(8);
     watchButton_ = new QPushButton(QStringLiteral("▶"), watchPage_);
     stopWatchButton_ = new QPushButton(QStringLiteral("■"), watchPage_);
     pauseButton_ = new QPushButton(QStringLiteral("||"), watchPage_);
-    openFileButton_ = new QPushButton("Open File", watchPage_);
-    pipToggleButton_ = new QPushButton("Pop Out Video", watchPage_);
-    fullscreenButton_ = new QPushButton("Fullscreen", watchPage_);
-    muteButton_ = new QPushButton("Mute", watchPage_);
+    openFileButton_ = new QPushButton(watchPage_);
+    pipToggleButton_ = new QPushButton(watchPage_);
+    fullscreenButton_ = new QPushButton(watchPage_);
+    muteButton_ = new QPushButton(watchPage_);
     volumeSlider_ = new JumpToClickSlider(Qt::Horizontal, watchPage_);
     seekSlider_ = new JumpToClickSlider(Qt::Horizontal, watchPage_);
     playbackStatusLabel_ = new QLabel("Idle", watchPage_);
@@ -5365,13 +5423,33 @@ void MainWindow::buildUi()
         }
         button->setFixedWidth(width);
     };
+    const auto setUniformButtonSize = [](const QList<QPushButton *> &buttons) {
+        int width = 0;
+        int height = 0;
+        for (QPushButton *button : buttons) {
+            if (button == nullptr) {
+                continue;
+            }
+
+            const QSize hint = button->sizeHint();
+            width = std::max(width, hint.width());
+            height = std::max(height, hint.height());
+        }
+
+        if (width <= 0 || height <= 0) {
+            return;
+        }
+
+        for (QPushButton *button : buttons) {
+            if (button == nullptr) {
+                continue;
+            }
+            button->setFixedSize(width, height);
+        }
+    };
     setStableButtonWidth(watchButton_, {QStringLiteral("▶")});
     setStableButtonWidth(stopWatchButton_, {QStringLiteral("■")});
     setStableButtonWidth(pauseButton_, {QStringLiteral("▶"), QStringLiteral("||")});
-    setStableButtonWidth(openFileButton_, {"Open File"});
-    setStableButtonWidth(pipToggleButton_, {"Pop Out Video"});
-    setStableButtonWidth(fullscreenButton_, {"Fullscreen", "Exit Fullscreen"});
-    setStableButtonWidth(muteButton_, {"Mute", "Unmute"});
     volumeSlider_->setRange(0, 100);
     volumeSlider_->setValue(85);
     volumeSlider_->setMinimumWidth(120);
@@ -5412,6 +5490,26 @@ void MainWindow::buildUi()
     watchButton_->setToolTip("Watch selected channel");
     stopWatchButton_->setToolTip("Stop playback");
     pauseButton_->setToolTip("Pause is only available for local media");
+    configureIconOnlyButton(openFileButton_,
+                            firstAvailableThemeIcon({QStringLiteral("folder-open"),
+                                                     QStringLiteral("document-open")},
+                                                    QApplication::style()->standardIcon(QStyle::SP_DirOpenIcon)),
+                            "Open media file");
+    configureIconOnlyButton(pipToggleButton_,
+                            firstAvailableThemeIcon({QStringLiteral("view-picture-in-picture"),
+                                                     QStringLiteral("picture-in-picture")},
+                                                    makeFallbackPipIcon()),
+                            "Pop out video");
+    configureIconOnlyButton(fullscreenButton_,
+                            firstAvailableThemeIcon({QStringLiteral("view-fullscreen")},
+                                                    makeFallbackFullscreenIcon()),
+                            "Enter fullscreen");
+    configureIconOnlyButton(muteButton_,
+                            firstAvailableThemeIcon({QStringLiteral("audio-volume-high")},
+                                                    QApplication::style()->standardIcon(QStyle::SP_MediaVolume)),
+                            "Mute audio");
+    setUniformButtonSize(
+        {watchButton_, stopWatchButton_, openFileButton_, pipToggleButton_, fullscreenButton_, muteButton_});
 
     watchControlsRow->addWidget(watchButton_);
     watchControlsRow->addWidget(stopWatchButton_);
@@ -5458,17 +5556,15 @@ void MainWindow::buildUi()
     contentSplitter_->setStretchFactor(0, 6);
     contentSplitter_->setStretchFactor(1, 2);
 
-    favoritesContainer_ = new QWidget(watchPage_);
+    favoritesContainer_ = new QGroupBox("Favorites", watchPage_);
     auto *favoritesLayout = new QVBoxLayout(favoritesContainer_);
-    favoritesLayout->setContentsMargins(0, 0, 0, 0);
+    favoritesLayout->setContentsMargins(12, 16, 12, 12);
     favoritesLayout->setSpacing(6);
     auto *favoritesControlsRow = new QHBoxLayout();
     favoritesControlsRow->setSpacing(8);
     favoritesControlsRow->addWidget(addFavoriteButton_);
     favoritesControlsRow->addWidget(removeFavoriteButton_);
     favoritesControlsRow->addStretch(1);
-    auto *favoritesLabel = new QLabel("Favorites:", watchPage_);
-
     auto *favoritesButtonsGrid = new QGridLayout();
     favoritesButtonsGrid->setContentsMargins(0, 0, 0, 0);
     favoritesButtonsGrid->setHorizontalSpacing(8);
@@ -5498,7 +5594,6 @@ void MainWindow::buildUi()
     statusRow->addWidget(currentShowLabel_, 4);
 
     favoritesLayout->addLayout(favoritesControlsRow);
-    favoritesLayout->addWidget(favoritesLabel);
     favoritesLayout->addLayout(favoritesButtonsGrid);
 
     watchLayout->addWidget(watchControlsContainer_);
@@ -5582,7 +5677,7 @@ void MainWindow::buildUi()
     fullscreenWatchButton_ = new QPushButton(QStringLiteral("▶"), fullscreenOverlayContainer_);
     fullscreenStopWatchButton_ = new QPushButton(QStringLiteral("■"), fullscreenOverlayContainer_);
     fullscreenPauseButton_ = new QPushButton(QStringLiteral("||"), fullscreenOverlayContainer_);
-    fullscreenMuteButton_ = new QPushButton("Mute", fullscreenOverlayContainer_);
+    fullscreenMuteButton_ = new QPushButton(fullscreenOverlayContainer_);
     fullscreenMuteButton_->setCheckable(true);
     fullscreenVolumeSlider_ = new JumpToClickSlider(Qt::Horizontal, fullscreenOverlayContainer_);
     fullscreenSeekSlider_ = new JumpToClickSlider(Qt::Horizontal, fullscreenOverlayContainer_);
@@ -5700,7 +5795,11 @@ void MainWindow::buildUi()
     setStableButtonWidth(fullscreenWatchButton_, {QStringLiteral("▶")});
     setStableButtonWidth(fullscreenStopWatchButton_, {QStringLiteral("■")});
     setStableButtonWidth(fullscreenPauseButton_, {QStringLiteral("▶"), QStringLiteral("||")});
-    setStableButtonWidth(fullscreenMuteButton_, {"Mute", "Unmute"});
+    configureIconOnlyButton(fullscreenMuteButton_,
+                            firstAvailableThemeIcon({QStringLiteral("audio-volume-high")},
+                                                    QApplication::style()->standardIcon(QStyle::SP_MediaVolume)),
+                            "Mute audio");
+    setUniformButtonSize({fullscreenWatchButton_, fullscreenStopWatchButton_, fullscreenMuteButton_});
     fullscreenWatchButton_->setToolTip("Watch selected channel");
     fullscreenStopWatchButton_->setToolTip("Stop playback");
     fullscreenPauseButton_->setToolTip("Pause is only available for local media");
@@ -10677,13 +10776,14 @@ void MainWindow::openMediaFile()
 
     stopWatching();
     userStoppedWatching_ = true;
-    setSignalMonitorStatus("Signal: local file", "Signal monitoring is only available during live tuner playback.");
+    setSignalMonitorStatus("Signal: loading media...", "Reading local media details...");
     currentChannelName_ = "File: " + QFileInfo(filePath).fileName();
     setCurrentShowStatus(QFileInfo(filePath).fileName());
 
     mediaPlayer_->setAudioOutput(audioOutput_);
     mediaPlayer_->setSource(QUrl::fromLocalFile(filePath));
     mediaPlayer_->play();
+    refreshLocalMediaSignalStatus();
 
     appendLog("player: Opened local media file: " + filePath);
     stopWatchButton_->setEnabled(true);
@@ -12637,6 +12737,46 @@ void MainWindow::applyPlaybackSeekPosition(qint64 positionMs)
     syncPlaybackSeekUi();
 }
 
+void MainWindow::refreshLocalMediaSignalStatus()
+{
+    if (!currentChannelName_.startsWith("File: ")) {
+        return;
+    }
+
+    if (mediaPlayer_ == nullptr) {
+        setSignalMonitorStatus("Signal: local media", "Playing local media.");
+        return;
+    }
+
+    const QSize resolution = mediaPlayer_->metaData().value(QMediaMetaData::Resolution).toSize();
+    if (resolution.isValid() && resolution.width() > 0 && resolution.height() > 0) {
+        const int height = resolution.height();
+        QString qualityLabel;
+        if (height >= 2160) {
+            qualityLabel = "2160p";
+        } else if (height >= 1440) {
+            qualityLabel = "1440p";
+        } else if (height >= 1080) {
+            qualityLabel = "1080p";
+        } else if (height >= 720) {
+            qualityLabel = "720p";
+        } else if (height >= 480) {
+            qualityLabel = "480p";
+        } else {
+            qualityLabel = QString("%1p").arg(height);
+        }
+        setSignalMonitorStatus(QString("Signal: %1").arg(qualityLabel),
+                               QString("Local media resolution: %1 x %2")
+                                   .arg(resolution.width())
+                                   .arg(resolution.height()));
+        return;
+    }
+
+    setSignalMonitorStatus(mediaPlayer_->hasVideo() ? "Signal: video file" : "Signal: audio file",
+                           mediaPlayer_->hasVideo() ? "Local video file quality is still loading."
+                                                    : "Local audio file.");
+}
+
 bool MainWindow::processedPlaybackEnabled() const
 {
     if (processedPlaybackCheckBox_ != nullptr) {
@@ -12839,6 +12979,7 @@ void MainWindow::handleMediaStatusChanged(QMediaPlayer::MediaStatus status)
     appendLog(QString("player: mediaStatusChanged=%1").arg(static_cast<int>(status)));
     playbackStatusLabel_->setText(playbackStatusText());
     syncPlaybackSeekUi();
+    refreshLocalMediaSignalStatus();
     syncFullscreenOverlayState();
     const bool isLocalFile = currentChannelName_.startsWith("File: ");
     if (!currentChannelName_.isEmpty()) {
@@ -13076,7 +13217,6 @@ void MainWindow::handleMuteToggled(bool checked)
     applyAudioOutputState();
     QSettings settings("tv_tuner_gui", "watcher");
     settings.setValue(kMutedSetting, checked);
-    muteButton_->setText(checked ? "Unmute" : "Mute");
     syncFullscreenOverlayState();
 }
 
@@ -13185,7 +13325,13 @@ void MainWindow::toggleFullscreen()
 
 void MainWindow::handleFullscreenChanged(bool fullScreen)
 {
-    fullscreenButton_->setText(fullScreen ? "Exit Fullscreen" : "Fullscreen");
+    if (fullscreenButton_ == nullptr) {
+        return;
+    }
+    configureIconOnlyButton(fullscreenButton_,
+                            firstAvailableThemeIcon({QStringLiteral("view-fullscreen")},
+                                                    makeFallbackFullscreenIcon()),
+                            fullScreen ? "Exit fullscreen" : "Enter fullscreen");
 }
 
 void MainWindow::syncFullscreenOverlayState()
@@ -13228,13 +13374,26 @@ void MainWindow::syncFullscreenOverlayState()
         fullscreenPauseButton_->hide();
     }
     if (fullscreenMuteButton_ != nullptr && muteButton_ != nullptr) {
+        const bool muted = muteButton_->isChecked();
+        const QIcon volumeIcon =
+            firstAvailableThemeIcon({muted ? QStringLiteral("audio-volume-muted")
+                                           : QStringLiteral("audio-volume-high")},
+                                    QApplication::style()->standardIcon(muted ? QStyle::SP_MediaVolumeMuted
+                                                                              : QStyle::SP_MediaVolume));
+        configureIconOnlyButton(muteButton_, volumeIcon, muted ? "Unmute audio" : "Mute audio");
         const QSignalBlocker blocker(fullscreenMuteButton_);
         fullscreenMuteButton_->setChecked(muteButton_->isChecked());
-        fullscreenMuteButton_->setText(muteButton_->text());
+        fullscreenMuteButton_->setIcon(volumeIcon);
+        fullscreenMuteButton_->setText(QString());
+        fullscreenMuteButton_->setToolTip(muted ? "Unmute audio" : "Mute audio");
         fullscreenMuteButton_->setEnabled(muteButton_->isEnabled());
     }
     if (pipToggleButton_ != nullptr) {
-        pipToggleButton_->setText("Pop Out Video");
+        pipToggleButton_->setIcon(firstAvailableThemeIcon({QStringLiteral("view-picture-in-picture"),
+                                                           QStringLiteral("picture-in-picture")},
+                                                          makeFallbackPipIcon()));
+        pipToggleButton_->setText(QString());
+        pipToggleButton_->setToolTip(videoDetachedToPip_ ? "Video already popped out" : "Pop out video");
         pipToggleButton_->setEnabled(!currentChannelName_.trimmed().isEmpty() && !videoDetachedToPip_);
     }
     if (fullscreenVolumeSlider_ != nullptr && volumeSlider_ != nullptr) {

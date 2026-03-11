@@ -156,6 +156,7 @@ private:
     void applyAudioOutputState();
     void syncPlaybackSeekUi();
     void applyPlaybackSeekPosition(qint64 positionMs);
+    void refreshLocalMediaSignalStatus();
     void armRecoveryAudioMute(const QString &reason);
     void beginRecoveryAudioMute(const QString &reason);
     void clearRecoveryAudioMute();
