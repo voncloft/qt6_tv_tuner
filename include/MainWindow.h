@@ -4,6 +4,7 @@
 #include "TvGuideDialog.h"
 
 #include <QByteArray>
+#include <QKeySequence>
 #include <QMainWindow>
 #include <QMediaPlayer>
 #include <QProcess>
@@ -14,9 +15,13 @@
 class QComboBox;
 class QDialog;
 class QFontComboBox;
+class QAction;
+class QKeyEvent;
+class QKeySequenceEdit;
 class QLineEdit;
 class QPushButton;
 class QPlainTextEdit;
+class QShortcut;
 class QTableWidget;
 class QSpinBox;
 class QAudioOutput;
@@ -261,6 +266,16 @@ private:
     void applyGuideRefreshIntervalSetting();
     bool purgeExpiredGuideCacheFiles(bool clearLoadedState, bool includeSchedulesDirect = false);
     void clearLoadedGuideCache();
+    void loadKeyBindings();
+    void applyKeyBindings();
+    void refreshKeyBindingEditors();
+    bool updateKeyBinding(const QString &actionId, const QKeySequence &sequence, bool showConflictStatus = true);
+    QString keyBindingActionLabel(const QString &actionId) const;
+    QKeySequence keyBindingSequence(const QString &actionId) const;
+    bool triggerKeyBindingAction(const QString &actionId);
+    bool handlePlaybackKeyBinding(QKeyEvent *keyEvent);
+    bool stepChannelSelection(int direction);
+    void adjustVolumeByDelta(int delta);
 
     QComboBox *frontendTypeCombo_{};
     QLineEdit *countryEdit_{};
@@ -338,6 +353,7 @@ private:
     QWidget *watchPage_{};
     QWidget *configPage_{};
     QWidget *displayOptionsPage_{};
+    QWidget *keyBindingsPage_{};
     QGroupBox *configGuideOptionsGroup_{};
     QGroupBox *configPlaybackOptionsGroup_{};
     QGroupBox *configCacheOptionsGroup_{};
@@ -363,6 +379,7 @@ private:
     QStringList favorites_;
     QStringList favoriteShowRules_;
     QHash<QString, int> favoriteShowRatings_;
+    QHash<QString, QKeySequence> keyBindings_;
     QHash<QString, QString> xspfNumberByTuneKey_;
     QHash<QString, QString> xspfProgramByChannel_;
     QHash<QString, QStringList> pendingScanChannelNumbersByName_;
@@ -435,6 +452,10 @@ private:
     QPushButton *displayThemeResetButton_{};
     QHash<QString, QPushButton *> displayThemeColorButtons_;
     QHash<QString, DisplayFontEditorWidgets> displayThemeFontEditors_;
+    QHash<QString, QKeySequenceEdit *> keyBindingEditors_;
+    QHash<QString, QLabel *> keyBindingConflictLabels_;
+    QHash<QString, QShortcut *> keyBindingShortcuts_;
+    QAction *aboutAction_{};
     DisplayTheme defaultDisplayTheme_;
     DisplayTheme currentDisplayTheme_;
     DisplayThemeStore displayThemeStore_;

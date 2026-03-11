@@ -34,6 +34,7 @@
 #include <QJsonObject>
 #include <QKeyEvent>
 #include <QLabel>
+#include <QKeySequenceEdit>
 #include <QLineEdit>
 #include <QListWidget>
 #include <QListWidgetItem>
@@ -121,6 +122,7 @@ constexpr auto kGuideRefreshWhenCacheRunsOutSetting = "tvGuide/refreshWhenCacheR
 constexpr auto kGuideCacheRetentionHoursSetting = "tvGuide/cacheRetentionHours";
 constexpr auto kLockedScheduledSwitchesSetting = "tvGuide/lockedScheduledSwitches";
 constexpr auto kUseSchedulesDirectGuideSetting = "tvGuide/useSchedulesDirect";
+constexpr auto kKeyBindingSettingPrefix = "keyBindings/";
 constexpr auto kSchedulesDirectUsernameSetting = "schedulesDirect/username";
 constexpr auto kSchedulesDirectPasswordSha1Setting = "schedulesDirect/passwordSha1";
 constexpr auto kSchedulesDirectPostalCodeSetting = "schedulesDirect/postalCode";
@@ -131,6 +133,103 @@ constexpr int kDefaultGuideRefreshIntervalMinutes = 60;
 constexpr int kDefaultGuideCacheRetentionHours = 24;
 constexpr int kDefaultFavoriteShowRating = 1;
 constexpr int kMaxFavoriteShowRating = 10;
+constexpr int kKeyBindingVolumeStep = 5;
+constexpr int kQuickFavoriteBindingCount = 10;
+
+struct KeyBindingSpec {
+    QString id;
+    QString label;
+    QKeySequence defaultSequence;
+    bool playbackOnly{false};
+    bool allowAutoRepeat{false};
+};
+
+QString favoriteKeyBindingActionId(int index)
+{
+    return QString("favorite%1").arg(index + 1);
+}
+
+const QList<KeyBindingSpec> &keyBindingSpecs()
+{
+    static const QList<KeyBindingSpec> specs = [] {
+        QList<KeyBindingSpec> items;
+        items.append({QStringLiteral("about"),
+                      QStringLiteral("About"),
+                      QKeySequence(QKeyCombination(Qt::ControlModifier, Qt::Key_F1)),
+                      false,
+                      false});
+        for (int index = 0; index < kQuickFavoriteBindingCount; ++index) {
+            items.append({favoriteKeyBindingActionId(index),
+                          QString("Favorite %1").arg(index + 1),
+                          QKeySequence(QKeyCombination(Qt::NoModifier,
+                                                       static_cast<Qt::Key>(Qt::Key_F1 + index))),
+                          false,
+                          false});
+        }
+        items.append({QStringLiteral("channelUp"),
+                      QStringLiteral("Channel Up"),
+                      QKeySequence(QKeyCombination(Qt::NoModifier, Qt::Key_Up)),
+                      true,
+                      false});
+        items.append({QStringLiteral("channelDown"),
+                      QStringLiteral("Channel Down"),
+                      QKeySequence(QKeyCombination(Qt::NoModifier, Qt::Key_Down)),
+                      true,
+                      false});
+        items.append({QStringLiteral("volumeDown"),
+                      QStringLiteral("Volume Down"),
+                      QKeySequence(QKeyCombination(Qt::NoModifier, Qt::Key_Left)),
+                      true,
+                      true});
+        items.append({QStringLiteral("volumeUp"),
+                      QStringLiteral("Volume Up"),
+                      QKeySequence(QKeyCombination(Qt::NoModifier, Qt::Key_Right)),
+                      true,
+                      true});
+        items.append({QStringLiteral("toggleMute"),
+                      QStringLiteral("Toggle Mute"),
+                      QKeySequence(QKeyCombination(Qt::NoModifier, Qt::Key_M)),
+                      true,
+                      false});
+        return items;
+    }();
+    return specs;
+}
+
+const KeyBindingSpec *findKeyBindingSpec(const QString &actionId)
+{
+    for (const KeyBindingSpec &spec : keyBindingSpecs()) {
+        if (spec.id == actionId) {
+            return &spec;
+        }
+    }
+    return nullptr;
+}
+
+QString keyBindingSettingKey(const QString &actionId)
+{
+    return QString::fromLatin1(kKeyBindingSettingPrefix) + actionId;
+}
+
+QKeySequence normalizedKeyBindingSequence(const QKeySequence &sequence)
+{
+    if (sequence.count() <= 0) {
+        return {};
+    }
+    const QKeyCombination combination = sequence[0];
+    return combination.key() != Qt::Key_unknown ? QKeySequence(combination) : QKeySequence();
+}
+
+QKeySequence keySequenceFromKeyEvent(const QKeyEvent *event)
+{
+    if (event == nullptr) {
+        return {};
+    }
+    const Qt::KeyboardModifiers modifiers =
+        event->modifiers() & (Qt::ShiftModifier | Qt::ControlModifier | Qt::AltModifier | Qt::MetaModifier);
+    return normalizedKeyBindingSequence(
+        QKeySequence(QKeyCombination(modifiers, static_cast<Qt::Key>(event->key()))));
+}
 
 QString formatGuideDurationText(int totalMinutes);
 QString guideRefreshIntervalText(int minutes);
@@ -3958,6 +4057,7 @@ MainWindow::MainWindow(QWidget *parent)
     }
     currentDisplayTheme_ = normalizedDisplayTheme(displayThemeStore_.currentTheme);
     buildUi();
+    loadKeyBindings();
     applyDisplayTheme(false);
     qApp->installEventFilter(this);
 
@@ -4493,10 +4593,13 @@ bool MainWindow::eventFilter(QObject *watched, QEvent *event)
         }
     }
 
-    if (fullscreenActive_ && event->type() == QEvent::KeyPress) {
+    if (event != nullptr && event->type() == QEvent::KeyPress) {
         auto *keyEvent = static_cast<QKeyEvent *>(event);
-        if (keyEvent->key() == Qt::Key_Escape) {
+        if (fullscreenActive_ && keyEvent->key() == Qt::Key_Escape) {
             exitFullscreen();
+            return true;
+        }
+        if (handlePlaybackKeyBinding(keyEvent)) {
             return true;
         }
     }
@@ -4641,10 +4744,9 @@ void MainWindow::buildUi()
     resize(1320, 840);
 
     QMenu *fileMenu = menuBar()->addMenu("File");
-    QAction *aboutAction = fileMenu->addAction("About");
-    aboutAction->setShortcut(QKeySequence(Qt::CTRL | Qt::Key_F1));
-    aboutAction->setShortcutContext(Qt::ApplicationShortcut);
-    connect(aboutAction, &QAction::triggered, this, [this]() {
+    aboutAction_ = fileMenu->addAction("About");
+    aboutAction_->setShortcutContext(Qt::ApplicationShortcut);
+    connect(aboutAction_, &QAction::triggered, this, [this]() {
         showAboutDialog("About",
                         QString("Created by Voncloft\nVersion %1")
                             .arg(QStringLiteral(TV_TUNER_GUI_VERSION)));
@@ -4701,6 +4803,21 @@ void MainWindow::buildUi()
     displayOptionsScrollArea->setWidget(displayOptionsContent);
     displayOptionsPageLayout->addWidget(displayOptionsScrollArea);
 
+    keyBindingsPage_ = new QWidget(tabs_);
+    auto *keyBindingsPageLayout = new QVBoxLayout(keyBindingsPage_);
+    keyBindingsPageLayout->setContentsMargins(0, 0, 0, 0);
+    keyBindingsPageLayout->setSpacing(0);
+    auto *keyBindingsScrollArea = new QScrollArea(keyBindingsPage_);
+    keyBindingsScrollArea->setWidgetResizable(true);
+    keyBindingsScrollArea->setFrameShape(QFrame::NoFrame);
+    keyBindingsScrollArea->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+    auto *keyBindingsContent = new QWidget(keyBindingsScrollArea);
+    auto *keyBindingsLayout = new QVBoxLayout(keyBindingsContent);
+    keyBindingsLayout->setContentsMargins(14, 14, 14, 14);
+    keyBindingsLayout->setSpacing(12);
+    keyBindingsScrollArea->setWidget(keyBindingsContent);
+    keyBindingsPageLayout->addWidget(keyBindingsScrollArea);
+
     auto *metaManagementPage = new QWidget(tabs_);
     auto *metaManagementLayout = new QVBoxLayout(metaManagementPage);
 
@@ -4725,6 +4842,7 @@ void MainWindow::buildUi()
     tuningPage->setStyleSheet(mainPageStyle);
     configPage_->setStyleSheet(mainPageStyle);
     displayOptionsPage_->setStyleSheet(mainPageStyle);
+    keyBindingsPage_->setStyleSheet(mainPageStyle);
     metaManagementPage->setStyleSheet(mainPageStyle);
     logsPage->setStyleSheet(mainPageStyle);
     testingBugsPage->setStyleSheet(mainPageStyle);
@@ -5044,6 +5162,51 @@ void MainWindow::buildUi()
     displayOptionsLayout->addWidget(fontsGroup);
     displayOptionsLayout->addStretch(1);
 
+    auto *keyBindingsGroup = new QGroupBox("Key Bindings", keyBindingsPage_);
+    auto *keyBindingsGroupLayout = new QGridLayout(keyBindingsGroup);
+    keyBindingsGroupLayout->setContentsMargins(12, 14, 12, 12);
+    keyBindingsGroupLayout->setHorizontalSpacing(10);
+    keyBindingsGroupLayout->setVerticalSpacing(8);
+    keyBindingsGroupLayout->addWidget(new QLabel("Action", keyBindingsGroup), 0, 0);
+    keyBindingsGroupLayout->addWidget(new QLabel("Shortcut", keyBindingsGroup), 0, 1);
+    keyBindingsGroupLayout->addWidget(new QLabel("Clear", keyBindingsGroup), 0, 2);
+    keyBindingsGroupLayout->addWidget(new QLabel("Status", keyBindingsGroup), 0, 3);
+    keyBindingsGroupLayout->setColumnStretch(1, 1);
+    keyBindingsGroupLayout->setColumnStretch(3, 1);
+
+    auto *keyBindingsHelpLabel = new QLabel(
+        "Each action uses one shortcut. Multi-step shortcuts and conflicting shortcuts are rejected. "
+        "Use Clear to unassign one.",
+        keyBindingsGroup);
+    keyBindingsHelpLabel->setWordWrap(true);
+    keyBindingsGroupLayout->addWidget(keyBindingsHelpLabel, 1, 0, 1, 4);
+
+    int keyBindingRow = 2;
+    for (const KeyBindingSpec &spec : keyBindingSpecs()) {
+        auto *label = new QLabel(spec.label, keyBindingsGroup);
+        auto *editor = new QKeySequenceEdit(keyBindingsGroup);
+        auto *clearButton = new QPushButton("Clear", keyBindingsGroup);
+        auto *statusLabel = new QLabel(keyBindingsGroup);
+        statusLabel->setWordWrap(true);
+        statusLabel->setStyleSheet("QLabel { color: #ff9a9a; }");
+        keyBindingEditors_.insert(spec.id, editor);
+        keyBindingConflictLabels_.insert(spec.id, statusLabel);
+        keyBindingsGroupLayout->addWidget(label, keyBindingRow, 0);
+        keyBindingsGroupLayout->addWidget(editor, keyBindingRow, 1);
+        keyBindingsGroupLayout->addWidget(clearButton, keyBindingRow, 2);
+        keyBindingsGroupLayout->addWidget(statusLabel, keyBindingRow, 3);
+        connect(editor, &QKeySequenceEdit::keySequenceChanged, this, [this, actionId = spec.id](const QKeySequence &sequence) {
+            updateKeyBinding(actionId, sequence, true);
+        });
+        connect(clearButton, &QPushButton::clicked, this, [this, actionId = spec.id]() {
+            updateKeyBinding(actionId, QKeySequence(), false);
+        });
+        ++keyBindingRow;
+    }
+
+    keyBindingsLayout->addWidget(keyBindingsGroup);
+    keyBindingsLayout->addStretch(1);
+
     metaManagementLayout->addWidget(favoriteShowsGroup, 1);
     metaManagementLayout->addWidget(scheduledSwitchesGroup, 1);
 
@@ -5195,17 +5358,6 @@ void MainWindow::buildUi()
         quickFavoriteButtons_[i]->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
         favoritesButtonsGrid->addWidget(quickFavoriteButtons_[i], i / 5, i % 5);
         connect(quickFavoriteButtons_[i], &QPushButton::clicked, this, &MainWindow::triggerQuickFavorite);
-
-        auto *favoriteShortcut =
-            new QShortcut(QKeySequence(QKeyCombination(Qt::NoModifier, static_cast<Qt::Key>(Qt::Key_F1 + i))), this);
-        favoriteShortcut->setContext(Qt::WindowShortcut);
-        connect(favoriteShortcut, &QShortcut::activated, this, [this, i]() {
-            auto *button = quickFavoriteButtons_[i];
-            if (button == nullptr || !button->isEnabled()) {
-                return;
-            }
-            button->click();
-        });
     }
 
     statusContainer_ = new QWidget(watchPage_);
@@ -5265,6 +5417,7 @@ void MainWindow::buildUi()
     tabs_->addTab(tuningPage, "Tuning");
     tabs_->addTab(configPage_, "Config");
     tabs_->addTab(displayOptionsPage_, "Display Options");
+    tabs_->addTab(keyBindingsPage_, "Key Bindings");
     tabs_->addTab(testingBugsPage, "Testing/bugs");
     tabs_->addTab(logsPage, "Logs");
     mainLayout->addWidget(tabs_, 1);
@@ -5499,11 +5652,26 @@ void MainWindow::buildUi()
     connect(processedPlaybackCheckBox_, &QCheckBox::toggled, this, [this](bool checked) {
         QSettings settings("tv_tuner_gui", "watcher");
         settings.setValue(kProcessedPlaybackSetting, checked);
+        const bool liveChannelActive = !currentChannelName_.isEmpty() && !currentChannelName_.startsWith("File: ");
         appendLog(checked
-                      ? "player: processed live playback enabled; future retunes will deinterlace video and rebuild audio/video."
-                      : "player: processed live playback disabled; future retunes will use passthrough unless recovery is needed.");
-        if (!currentChannelName_.isEmpty() && !currentChannelName_.startsWith("File: ")) {
-            showTransientStatusBarMessage("Processed playback change will apply on the next retune/reconnect", 4000);
+                      ? (liveChannelActive
+                             ? "player: processed live playback enabled; restarting the current live channel now."
+                             : "player: processed live playback enabled; the next live channel tune will deinterlace video and rebuild audio/video.")
+                      : (liveChannelActive
+                             ? "player: processed live playback disabled; restarting the current live channel now."
+                             : "player: processed live playback disabled; the next live channel tune will use passthrough unless recovery is needed."));
+        if (liveChannelActive) {
+            const QString channelName = currentChannelName_;
+            const QString channelLine = currentChannelLine_;
+            showTransientStatusBarMessage("Retuning current channel to apply processed playback change", 4000);
+            QTimer::singleShot(0, this, [this, channelName, channelLine]() {
+                if (channelName.isEmpty() || currentChannelName_ != channelName || userStoppedWatching_) {
+                    return;
+                }
+                startWatchingChannel(channelName, false, channelLine);
+            });
+        } else {
+            showTransientStatusBarMessage("Processed playback change saved for the next live tune", 4000);
         }
     });
     connect(hideStartupSwitchSummaryCheckBox_,
@@ -7558,6 +7726,319 @@ void MainWindow::clearLoadedGuideCache()
     showTransientStatusBarMessage("Guide cache expired and was removed.", 4000);
     noAutoCurrentShowLookupChannels_.clear();
     refreshChannelTableShowColumn();
+}
+
+void MainWindow::loadKeyBindings()
+{
+    QSettings settings("tv_tuner_gui", "watcher");
+    keyBindings_.clear();
+
+    QSet<QString> usedBindings;
+    for (const KeyBindingSpec &spec : keyBindingSpecs()) {
+        const QString settingKey = keyBindingSettingKey(spec.id);
+        const QKeySequence storedSequence =
+            QKeySequence::fromString(settings.value(settingKey).toString(), QKeySequence::PortableText);
+        QKeySequence sequence;
+        bool removeStoredBinding = false;
+
+        if (storedSequence.count() > 1) {
+            sequence = normalizedKeyBindingSequence(spec.defaultSequence);
+            removeStoredBinding = true;
+        } else {
+            sequence = normalizedKeyBindingSequence(storedSequence);
+            if (sequence.isEmpty()) {
+                sequence = normalizedKeyBindingSequence(spec.defaultSequence);
+            }
+        }
+
+        QString portableText = sequence.toString(QKeySequence::PortableText);
+        if (!portableText.isEmpty() && usedBindings.contains(portableText)) {
+            const QKeySequence defaultSequence = normalizedKeyBindingSequence(spec.defaultSequence);
+            const QString defaultPortableText = defaultSequence.toString(QKeySequence::PortableText);
+            if (!defaultPortableText.isEmpty() && !usedBindings.contains(defaultPortableText)) {
+                sequence = defaultSequence;
+            } else {
+                sequence = QKeySequence();
+            }
+            portableText = sequence.toString(QKeySequence::PortableText);
+            removeStoredBinding = true;
+        }
+
+        if (removeStoredBinding) {
+            settings.remove(settingKey);
+        }
+        if (!portableText.isEmpty()) {
+            usedBindings.insert(portableText);
+        }
+        keyBindings_.insert(spec.id, sequence);
+    }
+
+    applyKeyBindings();
+    refreshKeyBindingEditors();
+}
+
+void MainWindow::applyKeyBindings()
+{
+    if (aboutAction_ != nullptr) {
+        aboutAction_->setShortcut(keyBindingSequence(QStringLiteral("about")));
+    }
+
+    for (const KeyBindingSpec &spec : keyBindingSpecs()) {
+        if (spec.playbackOnly || spec.id == QStringLiteral("about")) {
+            continue;
+        }
+
+        QShortcut *shortcut = keyBindingShortcuts_.value(spec.id);
+        if (shortcut == nullptr) {
+            shortcut = new QShortcut(this);
+            shortcut->setContext(Qt::ApplicationShortcut);
+            connect(shortcut, &QShortcut::activated, this, [this, actionId = spec.id]() {
+                triggerKeyBindingAction(actionId);
+            });
+            keyBindingShortcuts_.insert(spec.id, shortcut);
+        }
+
+        const QKeySequence sequence = keyBindingSequence(spec.id);
+        shortcut->setKey(sequence);
+        shortcut->setEnabled(!sequence.isEmpty());
+    }
+}
+
+void MainWindow::refreshKeyBindingEditors()
+{
+    for (const KeyBindingSpec &spec : keyBindingSpecs()) {
+        if (QKeySequenceEdit *editor = keyBindingEditors_.value(spec.id, nullptr)) {
+            const QSignalBlocker blocker(editor);
+            editor->setKeySequence(keyBindingSequence(spec.id));
+        }
+        if (QLabel *label = keyBindingConflictLabels_.value(spec.id, nullptr)) {
+            label->clear();
+        }
+    }
+}
+
+bool MainWindow::updateKeyBinding(const QString &actionId, const QKeySequence &sequence, bool showConflictStatus)
+{
+    auto rejectBindingChange = [this, &actionId, showConflictStatus](const QString &labelText,
+                                                                     const QString &statusText) {
+        if (QLabel *label = keyBindingConflictLabels_.value(actionId, nullptr)) {
+            label->setText(labelText);
+        }
+        if (showConflictStatus && !statusText.trimmed().isEmpty()) {
+            showTransientStatusBarMessage(statusText, 4000);
+        }
+        if (QKeySequenceEdit *editor = keyBindingEditors_.value(actionId, nullptr)) {
+            const QSignalBlocker blocker(editor);
+            editor->setKeySequence(keyBindingSequence(actionId));
+        }
+    };
+
+    if (findKeyBindingSpec(actionId) == nullptr) {
+        rejectBindingChange(QStringLiteral("Unknown action"),
+                            QStringLiteral("That key binding entry is not recognized."));
+        return false;
+    }
+
+    if (sequence.count() > 1) {
+        rejectBindingChange(QStringLiteral("Only one shortcut is supported"),
+                            QStringLiteral("Only one shortcut can be assigned per action."));
+        return false;
+    }
+
+    const QKeySequence normalized = normalizedKeyBindingSequence(sequence);
+    if (!normalized.isEmpty()) {
+        for (const KeyBindingSpec &spec : keyBindingSpecs()) {
+            if (spec.id == actionId) {
+                continue;
+            }
+            if (keyBindingSequence(spec.id) != normalized) {
+                continue;
+            }
+
+            rejectBindingChange(QString("Already used by %1").arg(keyBindingActionLabel(spec.id)),
+                                QString("%1 is already assigned to %2.")
+                                    .arg(normalized.toString(QKeySequence::NativeText),
+                                         keyBindingActionLabel(spec.id)));
+            return false;
+        }
+    }
+
+    keyBindings_.insert(actionId, normalized);
+    QSettings settings("tv_tuner_gui", "watcher");
+    if (normalized.isEmpty()) {
+        settings.remove(keyBindingSettingKey(actionId));
+    } else {
+        settings.setValue(keyBindingSettingKey(actionId), normalized.toString(QKeySequence::PortableText));
+    }
+
+    applyKeyBindings();
+    refreshKeyBindingEditors();
+    return true;
+}
+
+QString MainWindow::keyBindingActionLabel(const QString &actionId) const
+{
+    if (const KeyBindingSpec *spec = findKeyBindingSpec(actionId)) {
+        return spec->label;
+    }
+    return actionId;
+}
+
+QKeySequence MainWindow::keyBindingSequence(const QString &actionId) const
+{
+    if (keyBindings_.contains(actionId)) {
+        return normalizedKeyBindingSequence(keyBindings_.value(actionId));
+    }
+    if (const KeyBindingSpec *spec = findKeyBindingSpec(actionId)) {
+        return normalizedKeyBindingSequence(spec->defaultSequence);
+    }
+    return {};
+}
+
+bool MainWindow::triggerKeyBindingAction(const QString &actionId)
+{
+    if (actionId == QStringLiteral("about")) {
+        if (aboutAction_ != nullptr) {
+            aboutAction_->trigger();
+            return true;
+        }
+        return false;
+    }
+
+    if (actionId.startsWith(QStringLiteral("favorite"))) {
+        bool ok = false;
+        const int favoriteNumber = actionId.mid(QStringLiteral("favorite").size()).toInt(&ok);
+        const int favoriteIndex = favoriteNumber - 1;
+        if (!ok || favoriteIndex < 0 || favoriteIndex >= kQuickFavoriteCount) {
+            return false;
+        }
+        QPushButton *button = quickFavoriteButtons_[favoriteIndex];
+        if (button == nullptr || !button->isEnabled()) {
+            return false;
+        }
+        button->click();
+        return true;
+    }
+
+    if (actionId == QStringLiteral("channelUp")) {
+        stepChannelSelection(-1);
+        return true;
+    }
+    if (actionId == QStringLiteral("channelDown")) {
+        stepChannelSelection(1);
+        return true;
+    }
+    if (actionId == QStringLiteral("volumeDown")) {
+        adjustVolumeByDelta(-kKeyBindingVolumeStep);
+        return true;
+    }
+    if (actionId == QStringLiteral("volumeUp")) {
+        adjustVolumeByDelta(kKeyBindingVolumeStep);
+        return true;
+    }
+    if (actionId == QStringLiteral("toggleMute")) {
+        if (muteButton_ != nullptr) {
+            muteButton_->toggle();
+            return true;
+        }
+    }
+
+    return false;
+}
+
+bool MainWindow::handlePlaybackKeyBinding(QKeyEvent *keyEvent)
+{
+    if (keyEvent == nullptr
+        || tabs_ == nullptr
+        || QApplication::activeModalWidget() != nullptr
+        || (!fullscreenActive_ && tabs_->currentWidget() != watchPage_)) {
+        return false;
+    }
+
+    const QKeySequence pressedSequence = keySequenceFromKeyEvent(keyEvent);
+    if (pressedSequence.isEmpty()) {
+        return false;
+    }
+
+    for (const KeyBindingSpec &spec : keyBindingSpecs()) {
+        if (!spec.playbackOnly || keyBindingSequence(spec.id) != pressedSequence) {
+            continue;
+        }
+        if (keyEvent->isAutoRepeat() && !spec.allowAutoRepeat) {
+            return true;
+        }
+        triggerKeyBindingAction(spec.id);
+        return true;
+    }
+
+    return false;
+}
+
+bool MainWindow::stepChannelSelection(int direction)
+{
+    if (channelsTable_ == nullptr || direction == 0 || channelsTable_->rowCount() <= 0) {
+        return false;
+    }
+
+    int currentRow = -1;
+    const QString normalizedCurrentLine = normalizeZapLine(currentChannelLine_).trimmed();
+    if (!normalizedCurrentLine.isEmpty()) {
+        for (int row = 0; row < channelsTable_->rowCount(); ++row) {
+            QTableWidgetItem *rawLineItem = channelsTable_->item(row, kChannelTableRawLineColumn);
+            if (rawLineItem != nullptr
+                && normalizeZapLine(rawLineItem->text()).trimmed() == normalizedCurrentLine) {
+                currentRow = row;
+                break;
+            }
+        }
+    }
+
+    if (currentRow < 0) {
+        currentRow = channelsTable_->currentRow();
+    }
+    if (currentRow < 0 && channelsTable_->selectionModel() != nullptr) {
+        const QModelIndexList rows = channelsTable_->selectionModel()->selectedRows();
+        if (!rows.isEmpty()) {
+            currentRow = rows.first().row();
+        }
+    }
+
+    int targetRow = currentRow;
+    if (targetRow < 0) {
+        targetRow = direction > 0 ? 0 : channelsTable_->rowCount() - 1;
+    } else {
+        targetRow = std::clamp(currentRow + direction, 0, channelsTable_->rowCount() - 1);
+    }
+
+    if (targetRow == currentRow && currentRow >= 0) {
+        showTransientStatusBarMessage(direction < 0 ? "Already on the first channel" : "Already on the last channel",
+                                     2000);
+        return false;
+    }
+
+    QTableWidgetItem *channelItem = channelsTable_->item(targetRow, kChannelTableNameColumn);
+    QTableWidgetItem *rawLineItem = channelsTable_->item(targetRow, kChannelTableRawLineColumn);
+    if (channelItem == nullptr || rawLineItem == nullptr) {
+        return false;
+    }
+
+    channelsTable_->selectRow(targetRow);
+    channelsTable_->setCurrentCell(targetRow, kChannelTableNameColumn);
+    channelsTable_->scrollToItem(channelItem, QAbstractItemView::PositionAtCenter);
+    return startWatchingChannel(channelItem->text().trimmed(), false, normalizeZapLine(rawLineItem->text()).trimmed());
+}
+
+void MainWindow::adjustVolumeByDelta(int delta)
+{
+    if (volumeSlider_ == nullptr || delta == 0) {
+        return;
+    }
+
+    const int nextValue =
+        std::clamp(volumeSlider_->value() + delta, volumeSlider_->minimum(), volumeSlider_->maximum());
+    if (nextValue != volumeSlider_->value()) {
+        volumeSlider_->setValue(nextValue);
+    }
 }
 
 void MainWindow::loadFavoriteShowRules()
