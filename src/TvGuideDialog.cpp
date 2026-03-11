@@ -1,6 +1,7 @@
 #include "TvGuideDialog.h"
 
 #include <QAbstractItemView>
+#include <QAbstractScrollArea>
 #include <QColor>
 #include <QFrame>
 #include <QFontMetrics>
@@ -14,6 +15,7 @@
 #include <QMouseEvent>
 #include <QPainter>
 #include <QPlainTextEdit>
+#include <QPixmap>
 #include <QPushButton>
 #include <QScrollArea>
 #include <QScrollBar>
@@ -41,6 +43,7 @@ constexpr int kGuideBoxBorderWidth = 2;
 constexpr int kGuideScheduleCheckboxSize = 16;
 constexpr int kGuideWatchNowButtonWidth = 118;
 constexpr int kGuideWatchNowButtonHeight = 24;
+constexpr int kGuideEntrySectionSpacing = 4;
 constexpr int kDefaultFavoriteShowRating = 1;
 constexpr int kSearchResultMargin = 8;
 constexpr int kSearchResultSpacing = 10;
@@ -163,6 +166,18 @@ struct GuideEntryDisplayParts {
     QString synopsisBody;
 };
 
+struct GuideEntryTextSections {
+    QString title;
+    QString episodeTitle;
+    QString synopsisBody;
+};
+
+struct GuideEntryFonts {
+    QFont titleFont;
+    QFont episodeFont;
+    QFont synopsisFont;
+};
+
 GuideEntryDisplayParts displayPartsForEntry(const TvGuideEntry &entry)
 {
     GuideEntryDisplayParts parts;
@@ -189,6 +204,48 @@ GuideEntryDisplayParts displayPartsForEntry(const TvGuideEntry &entry)
         parts.synopsisBody = lines.join('\n').trimmed();
     }
     return parts;
+}
+
+GuideEntryFonts guideEntryFonts(const QFont &baseFont)
+{
+    GuideEntryFonts fonts;
+    fonts.titleFont = baseFont;
+    fonts.titleFont.setWeight(QFont::DemiBold);
+
+    fonts.episodeFont = baseFont;
+    fonts.episodeFont.setItalic(true);
+
+    fonts.synopsisFont = baseFont;
+    if (fonts.synopsisFont.pointSizeF() > 0.0) {
+        fonts.synopsisFont.setPointSizeF(std::max(1.0, fonts.synopsisFont.pointSizeF() * 0.9));
+    } else if (fonts.synopsisFont.pixelSize() > 0) {
+        fonts.synopsisFont.setPixelSize(std::max(1, qRound(fonts.synopsisFont.pixelSize() * 0.9)));
+    }
+
+    return fonts;
+}
+
+int wrappedTextHeight(const QFont &font, int width, const QString &text)
+{
+    if (width <= 0 || text.isEmpty()) {
+        return 0;
+    }
+
+    const QFontMetrics metrics(font);
+    const QRect bounds =
+        metrics.boundingRect(QRect(0, 0, width, 1000000), Qt::AlignLeft | Qt::AlignTop | Qt::TextWordWrap, text);
+    return std::max(metrics.lineSpacing(), bounds.height());
+}
+
+bool pixmapMatchesSize(const QPixmap &pixmap, const QSize &logicalSize, qreal devicePixelRatio)
+{
+    if (logicalSize.width() <= 0 || logicalSize.height() <= 0 || pixmap.isNull()) {
+        return false;
+    }
+
+    return qFuzzyCompare(pixmap.devicePixelRatio(), devicePixelRatio)
+           && pixmap.width() == qRound(logicalSize.width() * devicePixelRatio)
+           && pixmap.height() == qRound(logicalSize.height() * devicePixelRatio);
 }
 
 QString normalizeFavoriteShowRule(const QString &title)
@@ -229,6 +286,13 @@ QString formatRatedShowTitle(const QString &title, const QHash<QString, int> &fa
     }
 
     return QString("%1 (rating: %2)").arg(trimmedTitle).arg(favoriteShowRatingForTitle(favoriteShowRatings, trimmedTitle));
+}
+
+GuideEntryTextSections textSectionsForEntry(const TvGuideEntry &entry,
+                                           const QHash<QString, int> &favoriteShowRatings)
+{
+    const GuideEntryDisplayParts parts = displayPartsForEntry(entry);
+    return {formatRatedShowTitle(parts.title, favoriteShowRatings), parts.episodeTitle, parts.synopsisBody};
 }
 
 QString formatEntryLabel(const TvGuideEntry &entry, const QHash<QString, int> &favoriteShowRatings)
@@ -527,124 +591,402 @@ private:
     TvGuideVisualTheme visualTheme_;
 };
 
-int measureEntryTextHeight(const QFont &font,
-                           int width,
-                           const TvGuideEntry &entry,
-                           const QHash<QString, int> &favoriteShowRatings,
-                           const TvGuideVisualTheme &visualTheme)
+int measureEntryTextHeight(const QFont &font, int width, const GuideEntryTextSections &sections)
 {
-    if (width <= 0 || entry.title.trimmed().isEmpty()) {
+    if (width <= 0 || sections.title.isEmpty()) {
         return 0;
     }
 
-    QTextDocument document;
-    document.setDefaultFont(font);
-    document.setDocumentMargin(0);
-    document.setHtml(formatEntryHtml(entry, favoriteShowRatings, visualTheme));
-    document.setTextWidth(width);
-    return std::max(0, static_cast<int>(std::ceil(document.size().height())));
+    const GuideEntryFonts fonts = guideEntryFonts(font);
+    int height = 0;
+    auto appendHeight = [&](const QString &text, const QFont &sectionFont) {
+        if (text.isEmpty()) {
+            return;
+        }
+        if (height > 0) {
+            height += kGuideEntrySectionSpacing;
+        }
+        height += wrappedTextHeight(sectionFont, width, text);
+    };
+
+    appendHeight(sections.title, fonts.titleFont);
+    appendHeight(sections.episodeTitle, fonts.episodeFont);
+    appendHeight(sections.synopsisBody, fonts.synopsisFont);
+    return height;
 }
 
 void drawEntryText(QPainter &painter,
                    const QRect &textRect,
-                   const TvGuideEntry &entry,
-                   const QHash<QString, int> &favoriteShowRatings,
+                   const GuideEntryTextSections &sections,
                    const TvGuideVisualTheme &visualTheme)
 {
-    if (!textRect.isValid() || entry.title.trimmed().isEmpty()) {
+    if (!textRect.isValid() || sections.title.isEmpty()) {
         return;
     }
 
-    QTextDocument document;
-    document.setDefaultFont(painter.font());
-    document.setDocumentMargin(0);
-    document.setHtml(formatEntryHtml(entry, favoriteShowRatings, visualTheme));
-    document.setTextWidth(textRect.width());
+    const GuideEntryFonts fonts = guideEntryFonts(painter.font());
+    int y = textRect.top();
 
     painter.save();
     painter.setClipRect(textRect);
-    painter.translate(textRect.topLeft());
-    document.drawContents(&painter, QRectF(0, 0, textRect.width(), textRect.height()));
+
+    auto drawSection = [&](const QString &text, const QFont &sectionFont, const QColor &color) {
+        if (text.isEmpty() || y > textRect.bottom()) {
+            return;
+        }
+
+        const int sectionHeight = wrappedTextHeight(sectionFont, textRect.width(), text);
+        const QRect sectionRect(textRect.left(),
+                                y,
+                                textRect.width(),
+                                std::min(sectionHeight, textRect.bottom() - y + 1));
+        painter.setFont(sectionFont);
+        painter.setPen(color);
+        painter.drawText(sectionRect, Qt::AlignLeft | Qt::AlignTop | Qt::TextWordWrap, text);
+        y += sectionHeight + kGuideEntrySectionSpacing;
+    };
+
+    drawSection(sections.title, fonts.titleFont, visualTheme.text);
+    drawSection(sections.episodeTitle, fonts.episodeFont, visualTheme.episodeText);
+    drawSection(sections.synopsisBody, fonts.synopsisFont, visualTheme.secondaryText);
     painter.restore();
 }
 
-void clearLayout(QLayout *layout)
+struct GuideEntryActionTarget {
+    QRect checkboxRect;
+    QRect watchRect;
+    QRect boxRect;
+    TvGuideEntry entry;
+    bool scheduled{false};
+};
+
+struct GuidePreparedEntry {
+    TvGuideEntry entry;
+    GuideEntryTextSections textSections;
+};
+
+struct GuidePreparedRow {
+    QString channelName;
+    QList<GuidePreparedEntry> entries;
+    int rowTop{0};
+    int rowHeight{kGuideRowHeight};
+    QList<GuideEntryActionTarget> actionTargets;
+    QPixmap timelinePixmap;
+};
+
+int preferredGuideRowHeight(const QList<GuidePreparedEntry> &preparedEntries,
+                            const QDateTime &windowStartUtc,
+                            int slotMinutes,
+                            int slotCount,
+                            int timelineWidth,
+                            const TvGuideVisualTheme &visualTheme,
+                            bool hasWatchNowAction)
 {
-    if (layout == nullptr) {
+    const qint64 totalSeconds = static_cast<qint64>(slotMinutes) * std::max(slotCount, 1) * 60;
+    if (totalSeconds <= 0 || !windowStartUtc.isValid()) {
+        return kGuideRowHeight;
+    }
+
+    const QDateTime windowEndUtc = windowStartUtc.addSecs(totalSeconds);
+    const int totalWidth = std::max(timelineWidth, 1);
+    const QDateTime nowUtc = QDateTime::currentDateTimeUtc();
+    int preferred = kGuideRowHeight;
+
+    for (const GuidePreparedEntry &preparedEntry : preparedEntries) {
+        const TvGuideEntry &entry = preparedEntry.entry;
+        if (!entry.startUtc.isValid() || !entry.endUtc.isValid() || entry.endUtc <= entry.startUtc) {
+            continue;
+        }
+        if (entry.endUtc <= windowStartUtc || entry.startUtc >= windowEndUtc) {
+            continue;
+        }
+
+        const qint64 visibleStart = std::clamp(windowStartUtc.secsTo(entry.startUtc), 0LL, totalSeconds);
+        const qint64 visibleEnd = std::clamp(windowStartUtc.secsTo(entry.endUtc), 0LL, totalSeconds);
+        if (visibleEnd <= visibleStart) {
+            continue;
+        }
+
+        const int left =
+            std::clamp(static_cast<int>(std::llround(static_cast<double>(visibleStart) * totalWidth / totalSeconds)),
+                       0,
+                       std::max(0, totalWidth - 1));
+        const int right =
+            std::clamp(static_cast<int>(std::llround(static_cast<double>(visibleEnd) * totalWidth / totalSeconds)),
+                       left + 1,
+                       totalWidth);
+        const int boxWidth = std::max(28, right - left - 4);
+        const bool airingNow = entry.startUtc <= nowUtc && entry.endUtc > nowUtc;
+        const int textWidth =
+            std::max(8,
+                     boxWidth - 20
+                         - (entry.startUtc > nowUtc ? (kGuideScheduleCheckboxSize + 16)
+                                                    : (airingNow && hasWatchNowAction && boxWidth >= 62
+                                                           ? (kGuideWatchNowButtonWidth + 16)
+                                                           : 0)));
+        const int textHeight = measureEntryTextHeight(visualTheme.guideFont, textWidth, preparedEntry.textSections);
+        preferred = std::max(preferred, textHeight + 26);
+    }
+
+    return preferred;
+}
+
+void renderGuideHeaderPixmap(QPixmap &pixmap,
+                             const QSize &logicalSize,
+                             qreal devicePixelRatio,
+                             const QDateTime &windowStartUtc,
+                             int slotMinutes,
+                             int slotCount,
+                             const TvGuideVisualTheme &visualTheme)
+{
+    pixmap = QPixmap(qRound(logicalSize.width() * devicePixelRatio), qRound(logicalSize.height() * devicePixelRatio));
+    pixmap.setDevicePixelRatio(devicePixelRatio);
+    pixmap.fill(Qt::transparent);
+
+    QPainter painter(&pixmap);
+    painter.setRenderHint(QPainter::TextAntialiasing, true);
+    painter.fillRect(QRect(QPoint(0, 0), logicalSize), visualTheme.background);
+    painter.setPen(QPen(visualTheme.border, kGuideGridLineWidth));
+
+    const int normalizedSlotCount = std::max(slotCount, 1);
+    for (int col = 0; col <= normalizedSlotCount; ++col) {
+        const int x = std::lround(static_cast<double>(col) * logicalSize.width() / normalizedSlotCount);
+        painter.drawLine(x, 0, x, logicalSize.height());
+    }
+    painter.drawLine(0, logicalSize.height() - 1, logicalSize.width(), logicalSize.height() - 1);
+
+    painter.setPen(visualTheme.text);
+    painter.setFont(visualTheme.guideHeaderFont);
+    const QDateTime windowEndUtc =
+        windowStartUtc.addSecs(static_cast<qint64>(std::max(slotCount, 0)) * slotMinutes * 60);
+    const bool spansMultipleDays =
+        windowStartUtc.isValid()
+        && windowEndUtc.isValid()
+        && windowStartUtc.toLocalTime().date() != windowEndUtc.toLocalTime().date();
+    for (int col = 0; col < slotCount; ++col) {
+        const int left = std::lround(static_cast<double>(col) * logicalSize.width() / normalizedSlotCount);
+        const int right = std::lround(static_cast<double>(col + 1) * logicalSize.width() / normalizedSlotCount);
+        const QRect slotRect(left, 0, std::max(1, right - left), logicalSize.height());
+        const QString label =
+            formatGuideTimelineLabel(windowStartUtc.addSecs(static_cast<qint64>(col) * slotMinutes * 60),
+                                     spansMultipleDays);
+        painter.drawText(slotRect.adjusted(6, 0, -6, 0), Qt::AlignHCenter | Qt::AlignVCenter, label);
+    }
+
+    const qint64 totalSeconds = static_cast<qint64>(slotMinutes) * slotCount * 60;
+    if (totalSeconds <= 0) {
         return;
     }
 
-    while (QLayoutItem *item = layout->takeAt(0)) {
-        if (QWidget *widget = item->widget()) {
-            delete widget;
+    const qint64 nowOffset = windowStartUtc.secsTo(QDateTime::currentDateTimeUtc());
+    if (nowOffset < 0 || nowOffset > totalSeconds) {
+        return;
+    }
+
+    const int nowX =
+        std::clamp(static_cast<int>(std::llround(static_cast<double>(nowOffset) * logicalSize.width() / totalSeconds)),
+                   0,
+                   logicalSize.width() - 1);
+    painter.setPen(QPen(visualTheme.nowLine, 2));
+    painter.drawLine(nowX, 0, nowX, logicalSize.height());
+}
+
+void renderGuideRowPixmap(GuidePreparedRow &row,
+                          const QSize &logicalSize,
+                          qreal devicePixelRatio,
+                          const QDateTime &windowStartUtc,
+                          int slotMinutes,
+                          int slotCount,
+                          const TvGuideVisualTheme &visualTheme,
+                          bool hasWatchNowAction,
+                          const std::function<bool(const QString &, const TvGuideEntry &)> &isEntryScheduled)
+{
+    row.timelinePixmap = QPixmap(qRound(logicalSize.width() * devicePixelRatio),
+                                 qRound(logicalSize.height() * devicePixelRatio));
+    row.timelinePixmap.setDevicePixelRatio(devicePixelRatio);
+    row.timelinePixmap.fill(Qt::transparent);
+
+    QPainter painter(&row.timelinePixmap);
+    painter.setRenderHint(QPainter::TextAntialiasing, true);
+    painter.fillRect(QRect(QPoint(0, 0), logicalSize), visualTheme.background);
+
+    const int normalizedSlotCount = std::max(slotCount, 1);
+    painter.setPen(QPen(visualTheme.gridLine, kGuideGridLineWidth));
+    for (int col = 0; col <= normalizedSlotCount; ++col) {
+        const int x = std::lround(static_cast<double>(col) * logicalSize.width() / normalizedSlotCount);
+        painter.drawLine(x, 0, x, logicalSize.height());
+    }
+    painter.drawLine(0, logicalSize.height() - 1, logicalSize.width(), logicalSize.height() - 1);
+
+    const qint64 totalSeconds = static_cast<qint64>(slotMinutes) * slotCount * 60;
+    if (totalSeconds <= 0) {
+        row.actionTargets.clear();
+        return;
+    }
+
+    const QDateTime windowEndUtc = windowStartUtc.addSecs(totalSeconds);
+    const QDateTime nowUtc = QDateTime::currentDateTimeUtc();
+    bool renderedAny = false;
+    row.actionTargets.clear();
+    row.actionTargets.reserve(row.entries.size());
+
+    for (const GuidePreparedEntry &preparedEntry : row.entries) {
+        const TvGuideEntry &entry = preparedEntry.entry;
+        if (!entry.startUtc.isValid() || !entry.endUtc.isValid() || entry.endUtc <= entry.startUtc) {
+            continue;
         }
-        if (QLayout *childLayout = item->layout()) {
-            clearLayout(childLayout);
-            delete childLayout;
+        if (entry.endUtc <= windowStartUtc || entry.startUtc >= windowEndUtc) {
+            continue;
         }
-        delete item;
+
+        const qint64 visibleStart = std::clamp(windowStartUtc.secsTo(entry.startUtc), 0LL, totalSeconds);
+        const qint64 visibleEnd = std::clamp(windowStartUtc.secsTo(entry.endUtc), 0LL, totalSeconds);
+        if (visibleEnd <= visibleStart) {
+            continue;
+        }
+
+        const int left =
+            std::clamp(static_cast<int>(std::llround(static_cast<double>(visibleStart) * logicalSize.width() / totalSeconds)),
+                       0,
+                       logicalSize.width() - 1);
+        const int right =
+            std::clamp(static_cast<int>(std::llround(static_cast<double>(visibleEnd) * logicalSize.width() / totalSeconds)),
+                       left + 1,
+                       logicalSize.width());
+        QRect box(left + 2, 5, std::max(28, right - left - 4), logicalSize.height() - 10);
+
+        const bool airingNow = entry.startUtc <= nowUtc && entry.endUtc > nowUtc;
+        const bool canSchedule = entry.startUtc > nowUtc;
+        const bool canWatchNow = airingNow && hasWatchNowAction;
+        const bool scheduled = canSchedule && isEntryScheduled && isEntryScheduled(row.channelName, entry);
+        QRect checkboxRect;
+        QRect watchRect;
+        int actionInset = canSchedule ? (kGuideScheduleCheckboxSize + 16) : 10;
+        if (canSchedule) {
+            checkboxRect = QRect(box.right() - kGuideScheduleCheckboxSize - 8,
+                                 box.top() + 8,
+                                 kGuideScheduleCheckboxSize,
+                                 kGuideScheduleCheckboxSize);
+        } else if (canWatchNow) {
+            const int maxWatchButtonWidth = std::max(0, box.width() - 18);
+            const int watchButtonWidth = std::min(kGuideWatchNowButtonWidth, maxWatchButtonWidth);
+            if (watchButtonWidth >= 44) {
+                watchRect = QRect(box.right() - watchButtonWidth - 8,
+                                  box.top() + 6,
+                                  watchButtonWidth,
+                                  kGuideWatchNowButtonHeight);
+                actionInset = watchButtonWidth + 16;
+            } else {
+                watchRect = box.adjusted(6, 6, -6, -6);
+            }
+        }
+
+        painter.setPen(QPen(visualTheme.entryBorder, kGuideBoxBorderWidth));
+        painter.setBrush(airingNow ? visualTheme.currentEntryBackground : visualTheme.entryBackground);
+        painter.drawRect(box);
+
+        if (canSchedule) {
+            painter.setPen(QPen(visualTheme.secondaryText, 1));
+            painter.setBrush(scheduled ? visualTheme.nowLine : visualTheme.background);
+            painter.drawRect(checkboxRect);
+            if (scheduled) {
+                painter.setRenderHint(QPainter::Antialiasing, true);
+                painter.setPen(QPen(visualTheme.text, 2));
+                painter.drawLine(checkboxRect.left() + 3,
+                                 checkboxRect.center().y(),
+                                 checkboxRect.left() + 7,
+                                 checkboxRect.bottom() - 3);
+                painter.drawLine(checkboxRect.left() + 7,
+                                 checkboxRect.bottom() - 3,
+                                 checkboxRect.right() - 2,
+                                 checkboxRect.top() + 3);
+                painter.setRenderHint(QPainter::Antialiasing, false);
+            }
+        } else if (canWatchNow && watchRect.width() >= 44) {
+            const QString watchLabel = watchActionLabelForWidth(painter.fontMetrics(), watchRect.width());
+            drawGuideStyleActionButton(painter, watchRect, watchLabel, visualTheme, visualTheme.actionText);
+        }
+
+        row.actionTargets.append({checkboxRect, watchRect, box, entry, scheduled});
+
+        painter.setPen(visualTheme.text);
+        painter.setFont(visualTheme.guideFont);
+        drawEntryText(painter, box.adjusted(10, 8, -actionInset, -8), preparedEntry.textSections, visualTheme);
+        renderedAny = true;
+    }
+
+    if (!renderedAny) {
+        painter.setPen(visualTheme.emptyText);
+        painter.drawText(QRect(QPoint(0, 0), logicalSize).adjusted(10, 0, -10, 0), Qt::AlignCenter, "NO GUIDE DATA");
+    }
+
+    const qint64 nowOffset = windowStartUtc.secsTo(QDateTime::currentDateTimeUtc());
+    if (nowOffset >= 0 && nowOffset <= totalSeconds) {
+        const int nowX =
+            std::clamp(static_cast<int>(std::llround(static_cast<double>(nowOffset) * logicalSize.width() / totalSeconds)),
+                       0,
+                       logicalSize.width() - 1);
+        painter.setPen(QPen(visualTheme.nowLine, 2));
+        painter.drawLine(nowX, 0, nowX, logicalSize.height());
     }
 }
 
-class GuideTimelineHeaderWidget final : public QWidget
+class GuideCanvasWidget final : public QAbstractScrollArea
 {
 public:
-    GuideTimelineHeaderWidget(const QDateTime &windowStartUtc,
-                              int slotMinutes,
-                              int slotCount,
-                              int timelineWidth,
-                              const TvGuideVisualTheme &visualTheme,
-                              QWidget *parent = nullptr)
-        : QWidget(parent)
-        , windowStartUtc_(windowStartUtc)
-        , slotMinutes_(slotMinutes)
-        , slotCount_(slotCount)
-        , timelineWidth_(timelineWidth)
-        , visualTheme_(visualTheme)
+    explicit GuideCanvasWidget(QWidget *parent = nullptr)
+        : QAbstractScrollArea(parent)
     {
-        setMinimumHeight(kGuideHeaderHeight);
-        setMaximumHeight(kGuideHeaderHeight);
-        setMinimumWidth(std::max(timelineWidth_, 1));
-        setFont(visualTheme_.guideHeaderFont);
+        setFrameShape(QFrame::NoFrame);
+        setMouseTracking(true);
+        viewport()->setMouseTracking(true);
     }
 
-    QSize sizeHint() const override
+    void setGuideData(const QStringList &visibleChannels,
+                      const QHash<QString, QList<TvGuideEntry>> &entriesByChannel,
+                      const QHash<QString, int> &favoriteShowRatings,
+                      const QDateTime &windowStartUtc,
+                      int slotMinutes,
+                      int slotCount,
+                      const TvGuideVisualTheme &visualTheme,
+                      std::function<bool(const QString &, const TvGuideEntry &)> isEntryScheduled,
+                      std::function<void(const QString &, const TvGuideEntry &, bool)> toggleSchedule,
+                      std::function<void(const QString &, const TvGuideEntry &)> watchNow)
     {
-        return {std::max(timelineWidth_, 1), kGuideHeaderHeight};
+        visibleChannels_ = visibleChannels;
+        entriesByChannel_ = entriesByChannel;
+        favoriteShowRatings_ = favoriteShowRatings;
+        windowStartUtc_ = windowStartUtc;
+        slotMinutes_ = slotMinutes;
+        slotCount_ = slotCount;
+        visualTheme_ = visualTheme;
+        isEntryScheduled_ = std::move(isEntryScheduled);
+        toggleSchedule_ = std::move(toggleSchedule);
+        watchNow_ = std::move(watchNow);
+        rebuildLayout(true);
     }
 
-protected:
-    void paintEvent(QPaintEvent *event) override
+    void setVisualTheme(const TvGuideVisualTheme &visualTheme)
     {
-        Q_UNUSED(event);
+        visualTheme_ = visualTheme;
+        invalidateCaches();
+        viewport()->update();
+    }
 
-        QPainter painter(this);
-        painter.fillRect(rect(), visualTheme_.background);
-        painter.setPen(QPen(visualTheme_.border, kGuideGridLineWidth));
+    int slotPixelWidth() const
+    {
+        return currentGuideSlotPixelWidth_;
+    }
 
-        const int slotCount = std::max(slotCount_, 1);
-        for (int col = 0; col <= slotCount; ++col) {
-            const int x = std::lround(static_cast<double>(col) * width() / slotCount);
-            painter.drawLine(x, 0, x, height());
+    void scrollToCurrentTime(bool force)
+    {
+        if (!windowStartUtc_.isValid() || slotMinutes_ <= 0 || slotCount_ <= 0) {
+            return;
         }
-        painter.drawLine(0, height() - 1, width(), height() - 1);
 
-        painter.setPen(visualTheme_.text);
-        painter.setFont(visualTheme_.guideHeaderFont);
-        const QDateTime windowEndUtc =
-            windowStartUtc_.addSecs(static_cast<qint64>(std::max(slotCount_, 0)) * slotMinutes_ * 60);
-        const bool spansMultipleDays =
-            windowStartUtc_.isValid()
-            && windowEndUtc.isValid()
-            && windowStartUtc_.toLocalTime().date() != windowEndUtc.toLocalTime().date();
-        for (int col = 0; col < slotCount_; ++col) {
-            const int left = std::lround(static_cast<double>(col) * width() / slotCount);
-            const int right = std::lround(static_cast<double>(col + 1) * width() / slotCount);
-            const QRect slotRect(left, 0, std::max(1, right - left), height());
-            const QString label =
-                formatGuideTimelineLabel(windowStartUtc_.addSecs(static_cast<qint64>(col) * slotMinutes_ * 60),
-                                         spansMultipleDays);
-            painter.drawText(slotRect.adjusted(6, 0, -6, 0), Qt::AlignHCenter | Qt::AlignVCenter, label);
+        QScrollBar *bar = horizontalScrollBar();
+        if (bar == nullptr) {
+            return;
         }
 
         const qint64 totalSeconds = static_cast<qint64>(slotMinutes_) * slotCount_ * 60;
@@ -657,58 +999,19 @@ protected:
             return;
         }
 
-        const int nowX = std::clamp(static_cast<int>(std::llround(static_cast<double>(nowOffset) * width() / totalSeconds)),
-                                    0,
-                                    width() - 1);
-        painter.setPen(QPen(visualTheme_.nowLine, 2));
-        painter.drawLine(nowX, 0, nowX, height());
-    }
+        const int nowX =
+            std::clamp(static_cast<int>(std::llround(static_cast<double>(nowOffset) * timelineWidth_ / totalSeconds)),
+                       0,
+                       std::max(0, timelineWidth_ - 1));
+        const int viewportWidth = std::max(1, visibleTimelineWidth());
+        const int left = bar->value();
+        const int right = left + viewportWidth;
+        if (!force && nowX >= left && nowX <= right - std::max(1, currentGuideSlotPixelWidth_ / 2)) {
+            return;
+        }
 
-private:
-    QDateTime windowStartUtc_;
-    int slotMinutes_{30};
-    int slotCount_{0};
-    int timelineWidth_{0};
-    TvGuideVisualTheme visualTheme_;
-};
-
-class GuideChannelBandWidget final : public QWidget
-{
-public:
-    GuideChannelBandWidget(const QList<TvGuideEntry> &entries,
-                           const QHash<QString, int> &favoriteShowRatings,
-                           const QDateTime &windowStartUtc,
-                           int slotMinutes,
-                           int slotCount,
-                           int timelineWidth,
-                           const TvGuideVisualTheme &visualTheme,
-                           std::function<bool(const TvGuideEntry &)> isEntryScheduled,
-                           std::function<void(const TvGuideEntry &, bool)> toggleSchedule,
-                           std::function<void(const TvGuideEntry &)> watchNow,
-                           QWidget *parent = nullptr)
-        : QWidget(parent)
-        , entries_(entries)
-        , favoriteShowRatings_(favoriteShowRatings)
-        , windowStartUtc_(windowStartUtc)
-        , slotMinutes_(slotMinutes)
-        , slotCount_(slotCount)
-        , timelineWidth_(timelineWidth)
-        , visualTheme_(visualTheme)
-        , isEntryScheduled_(std::move(isEntryScheduled))
-        , toggleSchedule_(std::move(toggleSchedule))
-        , watchNow_(std::move(watchNow))
-    {
-        setMouseTracking(true);
-        setFont(visualTheme_.guideFont);
-        setMinimumWidth(std::max(timelineWidth_, 1));
-        rowHeight_ = preferredRowHeight();
-        setMinimumHeight(rowHeight_);
-        setMaximumHeight(rowHeight_);
-    }
-
-    QSize sizeHint() const override
-    {
-        return {std::max(timelineWidth_, 1), rowHeight_};
+        const int target = std::clamp(nowX - std::max(1, currentGuideSlotPixelWidth_), 0, bar->maximum());
+        bar->setValue(target);
     }
 
 protected:
@@ -716,127 +1019,100 @@ protected:
     {
         Q_UNUSED(event);
 
-        QPainter painter(this);
-        painter.fillRect(rect(), visualTheme_.background);
+        QPainter painter(viewport());
+        painter.fillRect(viewport()->rect(), visualTheme_.background);
 
-        const int slotCount = std::max(slotCount_, 1);
-        painter.setPen(QPen(visualTheme_.gridLine, kGuideGridLineWidth));
-        for (int col = 0; col <= slotCount; ++col) {
-            const int x = std::lround(static_cast<double>(col) * width() / slotCount);
-            painter.drawLine(x, 0, x, height());
+        const QRect cornerRect(0, 0, std::min(kGuideChannelLabelWidth, viewport()->width()), kGuideHeaderHeight);
+        painter.setPen(QPen(visualTheme_.border, kGuideGridLineWidth));
+        painter.setBrush(visualTheme_.background);
+        painter.drawRect(cornerRect.adjusted(0, 0, -1, -1));
+        painter.setPen(visualTheme_.text);
+        painter.setFont(visualTheme_.guideHeaderFont);
+        painter.drawText(cornerRect.adjusted(8, 0, -8, 0), Qt::AlignLeft | Qt::AlignVCenter, "Channel");
+
+        const int timelineViewportWidth = visibleTimelineWidth();
+        if (timelineViewportWidth > 0 && timelineWidth_ > 0 && slotCount_ > 0) {
+            const QSize logicalHeaderSize(std::max(1, timelineWidth_), kGuideHeaderHeight);
+            const qreal dpr = viewport()->devicePixelRatioF();
+            if (!pixmapMatchesSize(headerPixmap_, logicalHeaderSize, dpr)) {
+                renderGuideHeaderPixmap(
+                    headerPixmap_, logicalHeaderSize, dpr, windowStartUtc_, slotMinutes_, slotCount_, visualTheme_);
+            }
+            const int horizontalOffset = horizontalScrollBar()->value();
+            painter.drawPixmap(QRect(kGuideChannelLabelWidth, 0, timelineViewportWidth, kGuideHeaderHeight),
+                               headerPixmap_,
+                               QRect(horizontalOffset, 0, timelineViewportWidth, kGuideHeaderHeight));
         }
-        painter.drawLine(0, height() - 1, width(), height() - 1);
 
-        const qint64 totalSeconds = static_cast<qint64>(slotMinutes_) * slotCount_ * 60;
-        if (totalSeconds <= 0) {
+        const int verticalOffset = verticalScrollBar()->value();
+        const int rowsViewportHeight = visibleRowsHeight();
+        const int viewportBottom = verticalOffset + rowsViewportHeight;
+
+        if (rows_.isEmpty()) {
+            const QRect emptyLabelRect(0, kGuideHeaderHeight, kGuideChannelLabelWidth, rowsHeight_);
+            painter.setPen(QPen(visualTheme_.gridLine, kGuideGridLineWidth));
+            painter.drawLine(emptyLabelRect.left(),
+                             emptyLabelRect.bottom() - 1,
+                             emptyLabelRect.right(),
+                             emptyLabelRect.bottom() - 1);
+            if (timelineViewportWidth > 0) {
+                const QRect emptyRect(kGuideChannelLabelWidth, kGuideHeaderHeight, timelineViewportWidth, rowsHeight_);
+                painter.setPen(visualTheme_.emptyText);
+                painter.drawText(emptyRect.adjusted(10, 0, -10, 0),
+                                 Qt::AlignCenter,
+                                 "No channels matched the current guide filter.");
+            }
             return;
         }
 
-        const QDateTime windowEndUtc = windowStartUtc_.addSecs(totalSeconds);
-        const QDateTime nowUtc = QDateTime::currentDateTimeUtc();
-        bool renderedAny = false;
-        QList<TvGuideEntry> entries = entries_;
-        std::sort(entries.begin(), entries.end(), [](const TvGuideEntry &a, const TvGuideEntry &b) {
-            return a.startUtc < b.startUtc;
-        });
-        entryActionTargets_.clear();
-
-        for (const TvGuideEntry &entry : entries) {
-            if (!entry.startUtc.isValid() || !entry.endUtc.isValid() || entry.endUtc <= entry.startUtc) {
+        for (GuidePreparedRow &row : rows_) {
+            if (row.rowTop + row.rowHeight < verticalOffset) {
                 continue;
             }
-            if (entry.endUtc <= windowStartUtc_ || entry.startUtc >= windowEndUtc) {
-                continue;
+            if (row.rowTop > viewportBottom) {
+                break;
             }
 
-            const qint64 visibleStart = std::clamp(windowStartUtc_.secsTo(entry.startUtc), 0LL, totalSeconds);
-            const qint64 visibleEnd = std::clamp(windowStartUtc_.secsTo(entry.endUtc), 0LL, totalSeconds);
-            if (visibleEnd <= visibleStart) {
-                continue;
-            }
-
-            const int left = std::clamp(static_cast<int>(std::llround(static_cast<double>(visibleStart) * width() / totalSeconds)),
-                                        0,
-                                        width() - 1);
-            const int right = std::clamp(static_cast<int>(std::llround(static_cast<double>(visibleEnd) * width() / totalSeconds)),
-                                         left + 1,
-                                         width());
-            QRect box(left + 2, 5, std::max(28, right - left - 4), height() - 10);
-
-            const bool airingNow = entry.startUtc <= nowUtc && entry.endUtc > nowUtc;
-            const bool canSchedule = entry.startUtc > nowUtc;
-            const bool canWatchNow = airingNow && static_cast<bool>(watchNow_);
-            const bool scheduled = canSchedule && isEntryScheduled_ && isEntryScheduled_(entry);
-            QRect checkboxRect;
-            QRect watchRect;
-            int actionInset = canSchedule ? (kGuideScheduleCheckboxSize + 16) : 10;
-            if (canSchedule) {
-                checkboxRect = QRect(box.right() - kGuideScheduleCheckboxSize - 8,
-                                     box.top() + 8,
-                                     kGuideScheduleCheckboxSize,
-                                     kGuideScheduleCheckboxSize);
-            } else if (canWatchNow) {
-                const int maxWatchButtonWidth = std::max(0, box.width() - 18);
-                const int watchButtonWidth = std::min(kGuideWatchNowButtonWidth, maxWatchButtonWidth);
-                if (watchButtonWidth >= 44) {
-                    watchRect = QRect(box.right() - watchButtonWidth - 8,
-                                      box.top() + 6,
-                                      watchButtonWidth,
-                                      kGuideWatchNowButtonHeight);
-                    actionInset = watchButtonWidth + 16;
-                } else {
-                    watchRect = box.adjusted(6, 6, -6, -6);
-                }
-            }
-            painter.setPen(QPen(visualTheme_.entryBorder, kGuideBoxBorderWidth));
-            painter.setBrush(airingNow ? visualTheme_.currentEntryBackground : visualTheme_.entryBackground);
-            painter.drawRect(box);
-
-            if (canSchedule) {
-                painter.setPen(QPen(visualTheme_.secondaryText, 1));
-                painter.setBrush(scheduled ? visualTheme_.nowLine : visualTheme_.background);
-                painter.drawRect(checkboxRect);
-                if (scheduled) {
-                    painter.setRenderHint(QPainter::Antialiasing, true);
-                    painter.setPen(QPen(visualTheme_.text, 2));
-                    painter.drawLine(checkboxRect.left() + 3,
-                                     checkboxRect.center().y(),
-                                     checkboxRect.left() + 7,
-                                     checkboxRect.bottom() - 3);
-                    painter.drawLine(checkboxRect.left() + 7,
-                                     checkboxRect.bottom() - 3,
-                                     checkboxRect.right() - 2,
-                                     checkboxRect.top() + 3);
-                    painter.setRenderHint(QPainter::Antialiasing, false);
-                }
-            } else if (canWatchNow) {
-                if (watchRect.width() >= 44) {
-                    const QString watchLabel = watchActionLabelForWidth(painter.fontMetrics(), watchRect.width());
-                    drawGuideStyleActionButton(painter, watchRect, watchLabel, visualTheme_, visualTheme_.actionText);
-                }
-            }
-            entryActionTargets_.append({checkboxRect, watchRect, box, entry, scheduled});
-
+            const int rowViewportTop = kGuideHeaderHeight + row.rowTop - verticalOffset;
+            const QRect labelRect(0, rowViewportTop, kGuideChannelLabelWidth, row.rowHeight);
+            painter.fillRect(labelRect, visualTheme_.background);
+            painter.setPen(QPen(visualTheme_.border, kGuideGridLineWidth));
+            painter.drawLine(labelRect.right(), labelRect.top(), labelRect.right(), labelRect.bottom());
+            painter.setPen(QPen(visualTheme_.gridLine, kGuideGridLineWidth));
+            painter.drawLine(labelRect.left(), labelRect.bottom() - 1, labelRect.right(), labelRect.bottom() - 1);
             painter.setPen(visualTheme_.text);
-            painter.setFont(visualTheme_.guideFont);
-            drawEntryText(
-                painter, box.adjusted(10, 8, -actionInset, -8), entry, favoriteShowRatings_, visualTheme_);
-            renderedAny = true;
-        }
+            painter.setFont(visualTheme_.guideChannelFont);
+            painter.drawText(labelRect.adjusted(6, 6, -8, -6), Qt::AlignLeft | Qt::AlignTop | Qt::TextWordWrap, row.channelName);
 
-        if (!renderedAny) {
-            painter.setPen(visualTheme_.emptyText);
-            painter.drawText(rect().adjusted(10, 0, -10, 0), Qt::AlignCenter, "NO GUIDE DATA");
-        }
+            if (timelineViewportWidth <= 0 || timelineWidth_ <= 0) {
+                continue;
+            }
 
-        const qint64 nowOffset = windowStartUtc_.secsTo(QDateTime::currentDateTimeUtc());
-        if (nowOffset >= 0 && nowOffset <= totalSeconds) {
-            const int nowX = std::clamp(static_cast<int>(std::llround(static_cast<double>(nowOffset) * width() / totalSeconds)),
-                                        0,
-                                        width() - 1);
-            painter.setPen(QPen(visualTheme_.nowLine, 2));
-            painter.drawLine(nowX, 0, nowX, height());
+            const QSize logicalRowSize(std::max(1, timelineWidth_), row.rowHeight);
+            const qreal dpr = viewport()->devicePixelRatioF();
+            if (!pixmapMatchesSize(row.timelinePixmap, logicalRowSize, dpr)) {
+                renderGuideRowPixmap(row,
+                                     logicalRowSize,
+                                     dpr,
+                                     windowStartUtc_,
+                                     slotMinutes_,
+                                     slotCount_,
+                                     visualTheme_,
+                                     static_cast<bool>(watchNow_),
+                                     isEntryScheduled_);
+            }
+
+            const int horizontalOffset = horizontalScrollBar()->value();
+            painter.drawPixmap(QRect(kGuideChannelLabelWidth, rowViewportTop, timelineViewportWidth, row.rowHeight),
+                               row.timelinePixmap,
+                               QRect(horizontalOffset, 0, timelineViewportWidth, row.rowHeight));
         }
+    }
+
+    void resizeEvent(QResizeEvent *event) override
+    {
+        QAbstractScrollArea::resizeEvent(event);
+        rebuildLayout(true);
     }
 
     void mouseMoveEvent(QMouseEvent *event) override
@@ -845,134 +1121,203 @@ protected:
             return;
         }
 
-        const EntryActionTarget *target = targetAt(event->position().toPoint());
-        if (target != nullptr) {
-            const QPoint point = event->position().toPoint();
-            setCursor((target->checkboxRect.contains(point) || target->watchRect.contains(point))
-                          ? Qt::PointingHandCursor
-                          : Qt::ArrowCursor);
-            return;
-        }
-
-        unsetCursor();
-    }
-
-    void leaveEvent(QEvent *event) override
-    {
-        QWidget::leaveEvent(event);
-        unsetCursor();
+        updateCursor(event->position().toPoint());
+        QAbstractScrollArea::mouseMoveEvent(event);
     }
 
     void mousePressEvent(QMouseEvent *event) override
     {
         if (event == nullptr || event->button() != Qt::LeftButton) {
-            QWidget::mousePressEvent(event);
+            QAbstractScrollArea::mousePressEvent(event);
             return;
         }
 
-        const EntryActionTarget *target = targetAt(event->position().toPoint());
-        if (target == nullptr) {
-            QWidget::mousePressEvent(event);
+        const HitTestResult hit = hitTest(event->position().toPoint());
+        if (hit.row == nullptr || hit.target == nullptr) {
+            QAbstractScrollArea::mousePressEvent(event);
             return;
         }
 
-        const QPoint point = event->position().toPoint();
-        if (target->checkboxRect.contains(point) && toggleSchedule_) {
-            toggleSchedule_(target->entry, !target->scheduled);
+        const QPoint rowPoint(horizontalScrollBar()->value() + event->position().toPoint().x() - kGuideChannelLabelWidth,
+                              verticalScrollBar()->value() + event->position().toPoint().y() - kGuideHeaderHeight - hit.row->rowTop);
+        if (hit.target->checkboxRect.contains(rowPoint) && toggleSchedule_) {
+            toggleSchedule_(hit.row->channelName, hit.target->entry, !hit.target->scheduled);
             event->accept();
             return;
         }
-        if (target->watchRect.contains(point) && watchNow_) {
-            watchNow_(target->entry);
+        if (hit.target->watchRect.contains(rowPoint) && watchNow_) {
+            watchNow_(hit.row->channelName, hit.target->entry);
             event->accept();
             return;
         }
 
-        QWidget::mousePressEvent(event);
+        QAbstractScrollArea::mousePressEvent(event);
+    }
+
+    void leaveEvent(QEvent *event) override
+    {
+        QAbstractScrollArea::leaveEvent(event);
+        viewport()->unsetCursor();
+    }
+
+    void scrollContentsBy(int dx, int dy) override
+    {
+        Q_UNUSED(dx);
+        Q_UNUSED(dy);
+        viewport()->update();
     }
 
 private:
-    struct EntryActionTarget {
-        QRect checkboxRect;
-        QRect watchRect;
-        QRect boxRect;
-        TvGuideEntry entry;
-        bool scheduled{false};
+    struct HitTestResult {
+        const GuidePreparedRow *row{nullptr};
+        const GuideEntryActionTarget *target{nullptr};
     };
 
-    const EntryActionTarget *targetAt(const QPoint &point) const
+    int visibleTimelineWidth() const
     {
-        for (const EntryActionTarget &target : entryActionTargets_) {
-            if (target.checkboxRect.contains(point)
-                || target.watchRect.contains(point)
-                || target.boxRect.contains(point)) {
-                return &target;
-            }
-        }
-        return nullptr;
+        const int width = viewport() != nullptr ? viewport()->width() - kGuideChannelLabelWidth : 0;
+        return std::max(0, width);
     }
 
-    int preferredRowHeight() const
+    int visibleRowsHeight() const
     {
-        const qint64 totalSeconds = static_cast<qint64>(slotMinutes_) * std::max(slotCount_, 1) * 60;
-        if (totalSeconds <= 0 || !windowStartUtc_.isValid()) {
-            return kGuideRowHeight;
-        }
-
-        const QDateTime windowEndUtc = windowStartUtc_.addSecs(totalSeconds);
-        const int totalWidth = std::max(timelineWidth_, 1);
-        int preferred = kGuideRowHeight;
-
-        for (const TvGuideEntry &entry : entries_) {
-            if (!entry.startUtc.isValid() || !entry.endUtc.isValid() || entry.endUtc <= entry.startUtc) {
-                continue;
-            }
-            if (entry.endUtc <= windowStartUtc_ || entry.startUtc >= windowEndUtc) {
-                continue;
-            }
-
-            const qint64 visibleStart = std::clamp(windowStartUtc_.secsTo(entry.startUtc), 0LL, totalSeconds);
-            const qint64 visibleEnd = std::clamp(windowStartUtc_.secsTo(entry.endUtc), 0LL, totalSeconds);
-            if (visibleEnd <= visibleStart) {
-                continue;
-            }
-
-            const int left = std::clamp(static_cast<int>(std::llround(static_cast<double>(visibleStart) * totalWidth / totalSeconds)),
-                                        0,
-                                        std::max(0, totalWidth - 1));
-            const int right = std::clamp(static_cast<int>(std::llround(static_cast<double>(visibleEnd) * totalWidth / totalSeconds)),
-                                         left + 1,
-                                         totalWidth);
-            const int boxWidth = std::max(28, right - left - 4);
-            const bool airingNow = entry.startUtc <= QDateTime::currentDateTimeUtc()
-                                   && entry.endUtc > QDateTime::currentDateTimeUtc();
-            const int textWidth = std::max(8,
-                                           boxWidth - 20
-                                               - (entry.startUtc > QDateTime::currentDateTimeUtc()
-                                                      ? (kGuideScheduleCheckboxSize + 16)
-                                                      : (airingNow && static_cast<bool>(watchNow_) && boxWidth >= 62
-                                                             ? (kGuideWatchNowButtonWidth + 16)
-                                                             : 0)));
-            const int textHeight =
-                measureEntryTextHeight(visualTheme_.guideFont, textWidth, entry, favoriteShowRatings_, visualTheme_);
-            preferred = std::max(preferred, textHeight + 26);
-        }
-
-        return preferred;
+        const int height = viewport() != nullptr ? viewport()->height() - kGuideHeaderHeight : 0;
+        return std::max(0, height);
     }
 
-    QList<TvGuideEntry> entries_;
+    void invalidateCaches()
+    {
+        headerPixmap_ = QPixmap();
+        for (GuidePreparedRow &row : rows_) {
+            row.timelinePixmap = QPixmap();
+            row.actionTargets.clear();
+        }
+    }
+
+    void rebuildLayout(bool preserveScroll)
+    {
+        const int previousHorizontal = horizontalScrollBar()->value();
+        const int previousVertical = verticalScrollBar()->value();
+
+        const int timelineViewportWidth =
+            visibleTimelineWidth() > 0 ? visibleTimelineWidth() : (kGuideVisibleColumnCount * kGuideSlotWidth);
+        currentGuideSlotPixelWidth_ = std::max(1, timelineViewportWidth / kGuideVisibleColumnCount);
+        timelineWidth_ = std::max(slotCount_, 1) * currentGuideSlotPixelWidth_;
+        rows_.clear();
+        rows_.reserve(visibleChannels_.size());
+
+        int rowTop = 0;
+        for (const QString &channelName : visibleChannels_) {
+            GuidePreparedRow row;
+            row.channelName = channelName;
+
+            const QList<TvGuideEntry> entries = entriesByChannel_.value(channelName);
+            row.entries.reserve(entries.size());
+            for (const TvGuideEntry &entry : entries) {
+                row.entries.append({entry, textSectionsForEntry(entry, favoriteShowRatings_)});
+            }
+            std::sort(row.entries.begin(), row.entries.end(), [](const GuidePreparedEntry &left, const GuidePreparedEntry &right) {
+                return left.entry.startUtc < right.entry.startUtc;
+            });
+
+            row.rowHeight = preferredGuideRowHeight(row.entries,
+                                                    windowStartUtc_,
+                                                    slotMinutes_,
+                                                    slotCount_,
+                                                    timelineWidth_,
+                                                    visualTheme_,
+                                                    static_cast<bool>(watchNow_));
+            row.rowTop = rowTop;
+            rowTop += row.rowHeight;
+            rows_.append(row);
+        }
+
+        rowsHeight_ = rows_.isEmpty() ? kGuideRowHeight : rowTop;
+        invalidateCaches();
+
+        horizontalScrollBar()->setSingleStep(std::max(12, currentGuideSlotPixelWidth_ / 8));
+        horizontalScrollBar()->setPageStep(std::max(24, visibleTimelineWidth()));
+        horizontalScrollBar()->setRange(0, std::max(0, timelineWidth_ - visibleTimelineWidth()));
+
+        verticalScrollBar()->setSingleStep(std::max(24, kGuideRowHeight / 2));
+        verticalScrollBar()->setPageStep(std::max(24, visibleRowsHeight()));
+        verticalScrollBar()->setRange(0, std::max(0, rowsHeight_ - visibleRowsHeight()));
+
+        if (preserveScroll) {
+            horizontalScrollBar()->setValue(std::clamp(previousHorizontal, 0, horizontalScrollBar()->maximum()));
+            verticalScrollBar()->setValue(std::clamp(previousVertical, 0, verticalScrollBar()->maximum()));
+        } else {
+            horizontalScrollBar()->setValue(0);
+            verticalScrollBar()->setValue(0);
+        }
+
+        viewport()->update();
+    }
+
+    HitTestResult hitTest(const QPoint &viewportPoint) const
+    {
+        if (viewportPoint.y() < kGuideHeaderHeight || viewportPoint.x() < kGuideChannelLabelWidth) {
+            return {};
+        }
+
+        const int contentY = verticalScrollBar()->value() + viewportPoint.y() - kGuideHeaderHeight;
+        const int contentX = horizontalScrollBar()->value() + viewportPoint.x() - kGuideChannelLabelWidth;
+        if (contentY < 0 || contentX < 0) {
+            return {};
+        }
+
+        for (const GuidePreparedRow &row : rows_) {
+            if (contentY < row.rowTop) {
+                break;
+            }
+            if (contentY >= row.rowTop + row.rowHeight) {
+                continue;
+            }
+
+            const QPoint rowPoint(contentX, contentY - row.rowTop);
+            for (const GuideEntryActionTarget &target : row.actionTargets) {
+                if (target.checkboxRect.contains(rowPoint)
+                    || target.watchRect.contains(rowPoint)
+                    || target.boxRect.contains(rowPoint)) {
+                    return {&row, &target};
+                }
+            }
+            break;
+        }
+
+        return {};
+    }
+
+    void updateCursor(const QPoint &viewportPoint)
+    {
+        const HitTestResult hit = hitTest(viewportPoint);
+        if (hit.row == nullptr || hit.target == nullptr) {
+            viewport()->unsetCursor();
+            return;
+        }
+
+        const QPoint rowPoint(horizontalScrollBar()->value() + viewportPoint.x() - kGuideChannelLabelWidth,
+                              verticalScrollBar()->value() + viewportPoint.y() - kGuideHeaderHeight - hit.row->rowTop);
+        viewport()->setCursor((hit.target->checkboxRect.contains(rowPoint) || hit.target->watchRect.contains(rowPoint))
+                                  ? Qt::PointingHandCursor
+                                  : Qt::ArrowCursor);
+    }
+
+    QStringList visibleChannels_;
+    QHash<QString, QList<TvGuideEntry>> entriesByChannel_;
     QHash<QString, int> favoriteShowRatings_;
     QDateTime windowStartUtc_;
     int slotMinutes_{30};
     int slotCount_{0};
-    int timelineWidth_{0};
-    int rowHeight_{kGuideRowHeight};
+    int currentGuideSlotPixelWidth_{kGuideSlotWidth};
+    int timelineWidth_{kGuideVisibleColumnCount * kGuideSlotWidth};
+    int rowsHeight_{kGuideRowHeight};
     TvGuideVisualTheme visualTheme_;
-    std::function<bool(const TvGuideEntry &)> isEntryScheduled_;
-    std::function<void(const TvGuideEntry &, bool)> toggleSchedule_;
-    std::function<void(const TvGuideEntry &)> watchNow_;
-    QList<EntryActionTarget> entryActionTargets_;
+    QPixmap headerPixmap_;
+    QList<GuidePreparedRow> rows_;
+    std::function<bool(const QString &, const TvGuideEntry &)> isEntryScheduled_;
+    std::function<void(const QString &, const TvGuideEntry &, bool)> toggleSchedule_;
+    std::function<void(const QString &, const TvGuideEntry &)> watchNow_;
 };
 
 }
@@ -996,66 +1341,8 @@ TvGuideDialog::TvGuideDialog(QWidget *parent)
     auto *guideTab = new QWidget(this);
     auto *guideLayout = new QVBoxLayout(guideTab);
     guideLayout->setContentsMargins(0, 0, 0, 0);
-
-    auto *guideMatrix = new QWidget(guideTab);
-    auto *guideMatrixLayout = new QGridLayout(guideMatrix);
-    guideMatrixLayout->setContentsMargins(0, 0, 0, 0);
-    guideMatrixLayout->setHorizontalSpacing(10);
-    guideMatrixLayout->setVerticalSpacing(0);
-
-    auto *cornerLabel = new QLabel("Channel", guideMatrix);
-    cornerLabel->setObjectName("guideCornerLabel");
-    cornerLabel->setMinimumWidth(kGuideChannelLabelWidth);
-    cornerLabel->setMaximumWidth(kGuideChannelLabelWidth);
-    cornerLabel->setMinimumHeight(kGuideHeaderHeight);
-    cornerLabel->setMaximumHeight(kGuideHeaderHeight);
-    cornerLabel->setAlignment(Qt::AlignLeft | Qt::AlignVCenter);
-    guideMatrixLayout->addWidget(cornerLabel, 0, 0);
-
-    guideHeaderViewport_ = new QWidget(guideMatrix);
-    guideHeaderViewport_->setMinimumHeight(kGuideHeaderHeight);
-    guideHeaderViewport_->setMaximumHeight(kGuideHeaderHeight);
-    guideHeaderViewport_->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
-    guideHeaderViewport_->setContentsMargins(0, 0, 0, 0);
-    guideHeaderContent_ = new QWidget(guideHeaderViewport_);
-    auto *guideHeaderLayout = new QVBoxLayout(guideHeaderContent_);
-    guideHeaderLayout->setContentsMargins(0, 0, 0, 0);
-    guideHeaderLayout->setSpacing(0);
-    guideMatrixLayout->addWidget(guideHeaderViewport_, 0, 1);
-
-    guideChannelsViewport_ = new QWidget(guideMatrix);
-    guideChannelsViewport_->setMinimumWidth(kGuideChannelLabelWidth);
-    guideChannelsViewport_->setMaximumWidth(kGuideChannelLabelWidth);
-    guideChannelsViewport_->setSizePolicy(QSizePolicy::Fixed, QSizePolicy::Expanding);
-    guideChannelsViewport_->setContentsMargins(0, 0, 0, 0);
-    guideChannelsContent_ = new QWidget(guideChannelsViewport_);
-    auto *guideChannelsLayout = new QVBoxLayout(guideChannelsContent_);
-    guideChannelsLayout->setContentsMargins(0, 0, 0, 0);
-    guideChannelsLayout->setSpacing(0);
-    guideMatrixLayout->addWidget(guideChannelsViewport_, 1, 0);
-
-    guideScrollArea_ = new QScrollArea(guideMatrix);
-    guideScrollArea_->setFrameShape(QFrame::NoFrame);
-    guideScrollArea_->setWidgetResizable(false);
-    guideContent_ = new QWidget(guideScrollArea_);
-    auto *guideRowsLayout = new QVBoxLayout(guideContent_);
-    guideRowsLayout->setContentsMargins(0, 0, 0, 0);
-    guideRowsLayout->setSpacing(0);
-    guideScrollArea_->setWidget(guideContent_);
-    guideMatrixLayout->addWidget(guideScrollArea_, 1, 1);
-    guideMatrixLayout->setColumnStretch(1, 1);
-    guideMatrixLayout->setRowStretch(1, 1);
-    guideLayout->addWidget(guideMatrix, 1);
-
-    connect(guideScrollArea_->horizontalScrollBar(), &QScrollBar::valueChanged, this, [this](int value) {
-        applyGuideHorizontalScroll(value);
-    });
-    connect(guideScrollArea_->verticalScrollBar(), &QScrollBar::valueChanged, this, [this](int value) {
-        if (guideChannelsContent_ == nullptr) {
-            return;
-        }
-        guideChannelsContent_->move(0, -value);
-    });
+    guideView_ = new GuideCanvasWidget(guideTab);
+    guideLayout->addWidget(guideView_, 1);
     tabs_->addTab(guideTab, "Guide");
 
     auto *searchTab = new QWidget(this);
@@ -1190,6 +1477,9 @@ void TvGuideDialog::setDisplayTheme(const DisplayTheme &theme)
     if (logsView_ != nullptr) {
         logsView_->setFont(visualTheme.logFont);
     }
+    if (guideView_ != nullptr) {
+        static_cast<GuideCanvasWidget *>(guideView_)->setVisualTheme(visualTheme);
+    }
 
     if (slotCount_ > 0) {
         updateSearchResults();
@@ -1271,11 +1561,7 @@ void TvGuideDialog::syncToCurrentTime()
 {
     pendingSyncToCurrentTime_ = true;
 
-    if (slotCount_ <= 0
-        || !isVisible()
-        || guideScrollArea_ == nullptr
-        || guideScrollArea_->viewport() == nullptr
-        || guideScrollArea_->viewport()->width() <= 0) {
+    if (slotCount_ <= 0 || !isVisible() || guideView_ == nullptr || guideView_->width() <= 0) {
         return;
     }
 
@@ -1296,7 +1582,7 @@ void TvGuideDialog::resizeEvent(QResizeEvent *event)
 {
     QWidget::resizeEvent(event);
 
-    if (event == nullptr || slotCount_ <= 0 || guideScrollArea_ == nullptr) {
+    if (event == nullptr || slotCount_ <= 0 || guideView_ == nullptr) {
         return;
     }
 
@@ -1330,30 +1616,10 @@ void TvGuideDialog::showEvent(QShowEvent *event)
 
 int TvGuideDialog::guideSlotPixelWidth() const
 {
-    int viewportWidth = 0;
-    if (guideScrollArea_ != nullptr && guideScrollArea_->viewport() != nullptr) {
-        viewportWidth = guideScrollArea_->viewport()->width();
+    if (guideView_ != nullptr) {
+        return static_cast<GuideCanvasWidget *>(guideView_)->slotPixelWidth();
     }
-    if (viewportWidth <= 0) {
-        viewportWidth = kGuideVisibleColumnCount * kGuideSlotWidth;
-    }
-    return std::max(1, viewportWidth / kGuideVisibleColumnCount);
-}
-
-void TvGuideDialog::applyGuideHorizontalScroll(int value)
-{
-    if (guideScrollArea_ == nullptr) {
-        return;
-    }
-
-    QScrollBar *bar = guideScrollArea_->horizontalScrollBar();
-    if (bar == nullptr) {
-        return;
-    }
-
-    if (guideHeaderContent_ != nullptr) {
-        guideHeaderContent_->move(-std::clamp(value, 0, bar->maximum()), 0);
-    }
+    return kGuideSlotWidth;
 }
 
 void TvGuideDialog::setGuideData(const QStringList &channelOrder,
@@ -1379,10 +1645,7 @@ void TvGuideDialog::setGuideData(const QStringList &channelOrder,
     slotCount_ = slotCount;
     rebuildSearchIndex();
 
-    if (!isVisible()
-        || guideScrollArea_ == nullptr
-        || guideScrollArea_->viewport() == nullptr
-        || guideScrollArea_->viewport()->width() <= 0) {
+    if (!isVisible() || guideView_ == nullptr || guideView_->width() <= 0) {
         pendingGuideRender_ = true;
         return;
     }
@@ -1587,15 +1850,9 @@ bool TvGuideDialog::isEntryScheduled(const QString &channelName, const TvGuideEn
 
 void TvGuideDialog::renderGuideTable()
 {
-    auto *guideHeaderLayout = qobject_cast<QVBoxLayout *>(guideHeaderContent_ != nullptr ? guideHeaderContent_->layout() : nullptr);
-    auto *guideChannelsLayout = qobject_cast<QVBoxLayout *>(guideChannelsContent_ != nullptr ? guideChannelsContent_->layout() : nullptr);
-    auto *guideRowsLayout = qobject_cast<QVBoxLayout *>(guideContent_ != nullptr ? guideContent_->layout() : nullptr);
-    if (guideHeaderLayout == nullptr || guideChannelsLayout == nullptr || guideRowsLayout == nullptr) {
+    if (guideView_ == nullptr) {
         return;
     }
-
-    const int horizontalScroll = guideScrollArea_ != nullptr ? guideScrollArea_->horizontalScrollBar()->value() : 0;
-    const int verticalScroll = guideScrollArea_ != nullptr ? guideScrollArea_->verticalScrollBar()->value() : 0;
 
     QStringList visibleChannels;
     visibleChannels.reserve(channelOrder_.size());
@@ -1608,96 +1865,25 @@ void TvGuideDialog::renderGuideTable()
         }
         visibleChannels << channel;
     }
-
-    clearLayout(guideHeaderLayout);
-    clearLayout(guideChannelsLayout);
-    clearLayout(guideRowsLayout);
-
-    currentGuideSlotPixelWidth_ = guideSlotPixelWidth();
-    const int timelineWidth = std::max(slotCount_, 1) * currentGuideSlotPixelWidth_;
     const TvGuideVisualTheme visualTheme = guideVisualThemeFor(displayTheme_);
-
-    auto *timelineHeader = new GuideTimelineHeaderWidget(windowStartUtc_,
-                                                         slotMinutes_,
-                                                         slotCount_,
-                                                         timelineWidth,
-                                                         visualTheme,
-                                                         guideHeaderContent_);
-    guideHeaderLayout->addWidget(timelineHeader);
-
-    int rowsHeight = 0;
-    for (const QString &channel : visibleChannels) {
-        auto *bandWidget = new GuideChannelBandWidget(entriesByChannel_.value(channel),
-                                                      favoriteShowRatings_,
-                                                      windowStartUtc_,
-                                                      slotMinutes_,
-                                                      slotCount_,
-                                                      timelineWidth,
-                                                      visualTheme,
-                                                      [this, channel](const TvGuideEntry &entry) {
-                                                          return isEntryScheduled(channel, entry);
-                                                      },
-                                                      [this, channel](const TvGuideEntry &entry, bool enabled) {
-                                                          emit scheduleSwitchRequested(channel, entry, enabled);
-                                                      },
-                                                      [this, channel](const TvGuideEntry &entry) {
-                                                          emit watchRequested(channel, entry);
-                                                      },
-                                                      guideContent_);
-        const int rowHeight = bandWidget->sizeHint().height();
-
-        auto *channelLabel = new QLabel(channel, guideChannelsContent_);
-        channelLabel->setWordWrap(true);
-        channelLabel->setAlignment(Qt::AlignLeft | Qt::AlignTop);
-        channelLabel->setMinimumWidth(kGuideChannelLabelWidth);
-        channelLabel->setMaximumWidth(kGuideChannelLabelWidth);
-        channelLabel->setMinimumHeight(rowHeight);
-        channelLabel->setMaximumHeight(rowHeight);
-        channelLabel->setFont(visualTheme.guideChannelFont);
-        channelLabel->setStyleSheet(
-            QString("QLabel { color: %1; padding-right: 8px; }").arg(visualTheme.text.name()));
-        guideChannelsLayout->addWidget(channelLabel);
-
-        guideRowsLayout->addWidget(bandWidget);
-        rowsHeight += rowHeight;
-    }
-
-    if (visibleChannels.isEmpty()) {
-        auto *emptyChannelLabel = new QLabel("", guideChannelsContent_);
-        emptyChannelLabel->setMinimumWidth(kGuideChannelLabelWidth);
-        emptyChannelLabel->setMaximumWidth(kGuideChannelLabelWidth);
-        emptyChannelLabel->setMinimumHeight(kGuideRowHeight);
-        emptyChannelLabel->setMaximumHeight(kGuideRowHeight);
-        guideChannelsLayout->addWidget(emptyChannelLabel);
-
-        auto *emptyLabel = new QLabel("No channels matched the current guide filter.", guideContent_);
-        emptyLabel->setAlignment(Qt::AlignCenter);
-        emptyLabel->setStyleSheet(QString("QLabel { color: %1; }").arg(visualTheme.emptyText.name()));
-        emptyLabel->setMinimumHeight(kGuideRowHeight);
-        emptyLabel->setMaximumHeight(kGuideRowHeight);
-        guideRowsLayout->addWidget(emptyLabel);
-        rowsHeight = kGuideRowHeight;
-    }
-
-    guideHeaderContent_->setFixedSize(timelineWidth, kGuideHeaderHeight);
-    guideChannelsContent_->setFixedSize(kGuideChannelLabelWidth, rowsHeight);
-    guideContent_->setFixedSize(timelineWidth, rowsHeight);
-
-    if (guideScrollArea_ != nullptr) {
-        guideScrollArea_->horizontalScrollBar()->setSingleStep(std::max(12, currentGuideSlotPixelWidth_ / 8));
-        guideScrollArea_->horizontalScrollBar()->setPageStep(
-            guideScrollArea_->viewport() != nullptr
-                ? std::max(24, guideScrollArea_->viewport()->width() - 48)
-                : currentGuideSlotPixelWidth_ * kGuideVisibleColumnCount);
-        guideScrollArea_->horizontalScrollBar()->setValue(horizontalScroll);
-        guideScrollArea_->verticalScrollBar()->setValue(verticalScroll);
-    }
-    if (guideHeaderContent_ != nullptr) {
-        applyGuideHorizontalScroll(horizontalScroll);
-    }
-    if (guideChannelsContent_ != nullptr) {
-        guideChannelsContent_->move(0, -verticalScroll);
-    }
+    auto *guideView = static_cast<GuideCanvasWidget *>(guideView_);
+    guideView->setGuideData(visibleChannels,
+                            entriesByChannel_,
+                            favoriteShowRatings_,
+                            windowStartUtc_,
+                            slotMinutes_,
+                            slotCount_,
+                            visualTheme,
+                            [this](const QString &channelName, const TvGuideEntry &entry) {
+                                return isEntryScheduled(channelName, entry);
+                            },
+                            [this](const QString &channelName, const TvGuideEntry &entry, bool enabled) {
+                                emit scheduleSwitchRequested(channelName, entry, enabled);
+                            },
+                            [this](const QString &channelName, const TvGuideEntry &entry) {
+                                emit watchRequested(channelName, entry);
+                            });
+    currentGuideSlotPixelWidth_ = guideView->slotPixelWidth();
 
     if (pendingSyncToCurrentTime_) {
         pendingSyncToCurrentTime_ = false;
@@ -1707,42 +1893,8 @@ void TvGuideDialog::renderGuideTable()
 
 void TvGuideDialog::scrollGuideToCurrentTime(bool force)
 {
-    if (!windowStartUtc_.isValid()
-        || slotMinutes_ <= 0
-        || slotCount_ <= 0
-        || guideScrollArea_ == nullptr
-        || guideScrollArea_->viewport() == nullptr) {
+    if (guideView_ == nullptr) {
         return;
     }
-
-    QScrollBar *horizontalBar = guideScrollArea_->horizontalScrollBar();
-    if (horizontalBar == nullptr) {
-        return;
-    }
-
-    const qint64 totalSeconds = static_cast<qint64>(slotMinutes_) * slotCount_ * 60;
-    if (totalSeconds <= 0) {
-        return;
-    }
-
-    const qint64 nowOffset = windowStartUtc_.secsTo(QDateTime::currentDateTimeUtc());
-    if (nowOffset < 0 || nowOffset > totalSeconds) {
-        return;
-    }
-
-    const int timelineWidth = std::max(1, slotCount_) * std::max(1, currentGuideSlotPixelWidth_);
-    const int nowX = std::clamp(static_cast<int>(std::llround(static_cast<double>(nowOffset) * timelineWidth / totalSeconds)),
-                                0,
-                                std::max(0, timelineWidth - 1));
-    const int viewportWidth = guideScrollArea_->viewport()->width();
-    const int left = horizontalBar->value();
-    const int right = left + viewportWidth;
-    if (!force && nowX >= left && nowX <= right - std::max(1, currentGuideSlotPixelWidth_ / 2)) {
-        return;
-    }
-
-    const int target = std::clamp(nowX - std::max(1, currentGuideSlotPixelWidth_),
-                                  0,
-                                  horizontalBar->maximum());
-    horizontalBar->setValue(target);
+    static_cast<GuideCanvasWidget *>(guideView_)->scrollToCurrentTime(force);
 }

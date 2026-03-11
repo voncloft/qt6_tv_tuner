@@ -202,6 +202,7 @@ private:
     bool saveScheduledSwitches() const;
     bool loadScheduledSwitches();
     bool pruneExpiredScheduledSwitches(bool includeStartedSwitches = false);
+    bool hasActiveScheduledSwitchesNow() const;
     void refreshScheduledSwitchTimer();
     void processScheduledSwitches();
     void loadFavoriteShowRules();
@@ -368,6 +369,7 @@ private:
     int lastGuideSlotCount_{12};
     QString lastGuideCacheGeneratedUtc_;
     QString lastGuideStatusText_;
+    QString lastGuideDialogPresentationStamp_;
     QString lastAutoFavoriteScheduleStamp_;
     QSet<QString> noAutoCurrentShowLookupChannels_;
     int reconnectAttemptCount_{0};

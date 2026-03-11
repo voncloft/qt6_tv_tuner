@@ -51,6 +51,7 @@
 #include <QPushButton>
 #include <QRegularExpression>
 #include <QSaveFile>
+#include <QShortcut>
 #include <QScrollArea>
 #include <QScrollBar>
 #include <QSignalBlocker>
@@ -843,15 +844,6 @@ QString resolveGuideCachePath()
     return QDir(appDataPath).filePath("guide_cache.json");
 }
 
-QString resolveGuideCacheBetaPath()
-{
-    const QString appDataPath = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
-    if (appDataPath.isEmpty()) {
-        return {};
-    }
-    return QDir(appDataPath).filePath("guide_cache_beta.json");
-}
-
 QString resolveGuideSchedulePath()
 {
     const QString appDataPath = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
@@ -980,6 +972,50 @@ QString currentGuideCacheStamp(const QString &generatedUtc,
                          .arg(slotCount);
     }
     return cacheStamp;
+}
+
+QString guideDialogPresentationStamp(const QString &cacheStamp,
+                                     const QStringList &channelOrder,
+                                     const QStringList &favorites,
+                                     const QHash<QString, int> &favoriteShowRatings,
+                                     const QList<TvGuideScheduledSwitch> &scheduledSwitches,
+                                     const QString &statusText)
+{
+    QCryptographicHash hash(QCryptographicHash::Sha1);
+    auto addPart = [&hash](const QString &text) {
+        hash.addData(text.toUtf8());
+        hash.addData(QByteArrayView("\n", 1));
+    };
+
+    addPart(cacheStamp.trimmed());
+    addPart(statusText.trimmed());
+
+    for (const QString &channelName : channelOrder) {
+        addPart(QString("channel:%1").arg(channelName));
+    }
+    for (const QString &favorite : favorites) {
+        addPart(QString("favorite:%1").arg(favorite));
+    }
+
+    QStringList ratingKeys = favoriteShowRatings.keys();
+    std::sort(ratingKeys.begin(), ratingKeys.end(), [](const QString &left, const QString &right) {
+        return left.localeAwareCompare(right) < 0;
+    });
+    for (const QString &title : ratingKeys) {
+        addPart(QString("rating:%1=%2").arg(title).arg(favoriteShowRatings.value(title)));
+    }
+
+    for (const TvGuideScheduledSwitch &scheduledSwitch : scheduledSwitches) {
+        addPart(QString("switch:%1|%2|%3|%4|%5|%6")
+                    .arg(scheduledSwitch.channelName.trimmed(),
+                         scheduledSwitch.startUtc.toString(Qt::ISODateWithMs),
+                         scheduledSwitch.endUtc.toString(Qt::ISODateWithMs),
+                         scheduledSwitch.title.trimmed(),
+                         scheduledSwitch.episode.trimmed(),
+                         scheduledSwitch.synopsis.trimmed()));
+    }
+
+    return QString::fromLatin1(hash.result().toHex());
 }
 
 struct JsonRequestResult {
@@ -2835,13 +2871,6 @@ struct DemuxSectionReader {
 
 QSet<int> mappedProgramIdsFromParsedGuideData(const ParsedGuideData &parsed);
 bool hasCoverageForAllExpectedServices(const ParsedGuideData &parsed, const QSet<int> &expectedServiceIds);
-bool writeGuideCacheBetaFile(const QStringList &channelOrder,
-                             const QHash<QString, QList<TvGuideEntry>> &entriesByChannel,
-                             const QDateTime &windowStartUtc,
-                             int slotMinutes,
-                             int slotCount,
-                             const QString &statusText,
-                             const QJsonArray &extractions);
 void processGuideSectionForPid(int pid,
                                const QByteArray &section,
                                ParsedGuideData &parsed,
@@ -4261,8 +4290,18 @@ MainWindow::MainWindow(QWidget *parent)
         }
         setStatusBarStateMessage(lastStatusBarMessage_);
         restoreChannelSidebarSizing();
-        restoreLastPlayedChannel();
-        processScheduledSwitches();
+        const bool startupScheduledTuneAvailable = obeyScheduledSwitches_ && hasActiveScheduledSwitchesNow();
+        if (startupScheduledTuneAvailable) {
+            appendLog("startup: active scheduled tune available; using scheduled tuning path.");
+            processScheduledSwitches();
+            if (currentChannelName_.trimmed().isEmpty()) {
+                appendLog("startup: scheduled tuning did not start playback; restoring last channel.");
+                restoreLastPlayedChannel();
+            }
+        } else {
+            appendLog("startup: no active scheduled tune available; restoring last channel.");
+            restoreLastPlayedChannel();
+        }
         showStartupSwitchSummary();
     });
 }
@@ -4591,7 +4630,7 @@ void MainWindow::buildUi()
 
     QMenu *fileMenu = menuBar()->addMenu("File");
     QAction *aboutAction = fileMenu->addAction("About");
-    aboutAction->setShortcut(QKeySequence(Qt::Key_F1));
+    aboutAction->setShortcut(QKeySequence(Qt::CTRL | Qt::Key_F1));
     aboutAction->setShortcutContext(Qt::ApplicationShortcut);
     connect(aboutAction, &QAction::triggered, this, [this]() {
         showAboutDialog("About",
@@ -5139,6 +5178,17 @@ void MainWindow::buildUi()
         quickFavoriteButtons_[i]->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
         favoritesButtonsGrid->addWidget(quickFavoriteButtons_[i], i / 5, i % 5);
         connect(quickFavoriteButtons_[i], &QPushButton::clicked, this, &MainWindow::triggerQuickFavorite);
+
+        auto *favoriteShortcut =
+            new QShortcut(QKeySequence(QKeyCombination(Qt::NoModifier, static_cast<Qt::Key>(Qt::Key_F1 + i))), this);
+        favoriteShortcut->setContext(Qt::WindowShortcut);
+        connect(favoriteShortcut, &QShortcut::activated, this, [this, i]() {
+            auto *button = quickFavoriteButtons_[i];
+            if (button == nullptr || !button->isEnabled()) {
+                return;
+            }
+            button->click();
+        });
     }
 
     statusContainer_ = new QWidget(watchPage_);
@@ -7946,11 +7996,6 @@ bool MainWindow::purgeExpiredGuideCacheFiles(bool clearLoadedState, bool include
         removedAny = true;
     }
 
-    const QString betaCachePath = resolveGuideCacheBetaPath();
-    if (pruneGuideCacheFile(betaCachePath, nowUtc, retentionHours)) {
-        removedAny = true;
-    }
-
     if (includeSchedulesDirect) {
         const QString schedulesDirectExportPath = resolveSchedulesDirectExportPath();
         if (pruneGuideCacheFile(schedulesDirectExportPath, nowUtc, retentionHours)) {
@@ -8034,7 +8079,7 @@ bool MainWindow::loadScheduledSwitches()
 
     scheduledSwitches_ = scheduledSwitchesFromJsonArray(document.object().value("switches").toArray());
     appendLog(QString("schedule: loaded %1 switch(es) from disk").arg(scheduledSwitches_.size()));
-    const bool pruned = pruneExpiredScheduledSwitches(true);
+    const bool pruned = pruneExpiredScheduledSwitches(false);
     if (pruned) {
         saveScheduledSwitches();
         showTransientStatusBarMessage("Pruning scheduled tunes", 3000);
@@ -8091,6 +8136,22 @@ bool MainWindow::pruneExpiredScheduledSwitches(bool includeStartedSwitches)
     }
     scheduledSwitches_ = cleaned;
     return changed;
+}
+
+bool MainWindow::hasActiveScheduledSwitchesNow() const
+{
+    const QDateTime nowUtc = QDateTime::currentDateTimeUtc();
+    for (const TvGuideScheduledSwitch &scheduledSwitch : scheduledSwitches_) {
+        const QDateTime effectiveStartUtc = scheduledSwitchEffectiveStartUtc(scheduledSwitch);
+        const QDateTime effectiveEndUtc = scheduledSwitchEffectiveEndUtc(scheduledSwitch);
+        if (!effectiveStartUtc.isValid() || !effectiveEndUtc.isValid() || effectiveEndUtc <= effectiveStartUtc) {
+            continue;
+        }
+        if (effectiveStartUtc <= nowUtc && nowUtc < effectiveEndUtc) {
+            return true;
+        }
+    }
+    return false;
 }
 
 void MainWindow::refreshScheduledSwitchTimer()
@@ -9872,6 +9933,7 @@ bool MainWindow::refreshGuideData(bool interactive, bool updateDialog)
         statusMessage = "Collecting OTA guide data from the current multiplex...";
     }
     if (updateDialog && tvGuideDialog_ != nullptr) {
+        lastGuideDialogPresentationStamp_.clear();
         tvGuideDialog_->setLoadingState(loadingMessage);
     }
     if (interactive) {
@@ -9916,7 +9978,6 @@ bool MainWindow::refreshGuideData(bool interactive, bool updateDialog)
     int frequenciesWithData = 0;
     int decodedEvents = 0;
     QSet<int> observedPsipTableIds;
-    QJsonArray betaExtractions;
     QStringList muxSummaryLines;
     QStringList missingChannelNames;
 
@@ -9947,7 +10008,6 @@ bool MainWindow::refreshGuideData(bool interactive, bool updateDialog)
         }
 
         QList<RawGuideEvent> frequencyEvents;
-        QList<RawGuideSection> rawSections;
         QHash<int, int> atscSourceToProgram;
         QSet<int> psipTableIds;
         QString errorText;
@@ -9963,8 +10023,7 @@ bool MainWindow::refreshGuideData(bool interactive, bool updateDialog)
                                         atscSourceToProgram,
                                         psipTableIds,
                                         errorText,
-                                        kGuideCaptureMaxMs,
-                                        &rawSections);
+                                        kGuideCaptureMaxMs);
         } else {
             captureGuideEventsForChannel(channelsFilePath_,
                                          guideAdapter,
@@ -9975,8 +10034,7 @@ bool MainWindow::refreshGuideData(bool interactive, bool updateDialog)
                                          atscSourceToProgram,
                                          psipTableIds,
                                          errorText,
-                                         kGuideLookupTotalMaxMs,
-                                         &rawSections);
+                                         kGuideLookupTotalMaxMs);
         }
         appendLog(QString("guide: mux %1 tables=%2 decoded=%3 source-map=%4")
                       .arg(frequencyChannels.first().name,
@@ -10037,24 +10095,6 @@ bool MainWindow::refreshGuideData(bool interactive, bool updateDialog)
         }
         muxSummaryLines.append(muxSummary);
 
-        QJsonObject extractionObject;
-        extractionObject.insert("frequencyHz", QString::number(frequencyHz));
-        extractionObject.insert("frequencyMHz",
-                                QString::number(static_cast<double>(frequencyHz) / 1000000.0, 'f', 1));
-        extractionObject.insert("channels", guideChannelsToJsonArray(frequencyChannels));
-        extractionObject.insert("usedCurrentTunedMux", reuseCurrentTunedMux);
-        extractionObject.insert("decodedEventCount", frequencyEvents.size());
-        extractionObject.insert("mappedEventCount", mappedForFrequency);
-        extractionObject.insert("mappedChannelNames", stringSetToJsonArray(mappedChannelNamesForMux));
-        extractionObject.insert("psipTableIds", integerSetToJsonArray(psipTableIds));
-        extractionObject.insert("sourceToProgram", integerMapToJsonObject(atscSourceToProgram));
-        extractionObject.insert("rawEvents", rawGuideEventsToJsonArray(frequencyEvents, atscSourceToProgram));
-        extractionObject.insert("rawSectionCount", rawSections.size());
-        extractionObject.insert("rawSections", rawGuideSectionsToJsonArray(rawSections));
-        if (!errorText.trimmed().isEmpty()) {
-            extractionObject.insert("errorText", errorText.trimmed());
-        }
-        betaExtractions.append(extractionObject);
         setStatusBarStateMessage(progressStatusMessage(i + 1));
     }
     if (progress != nullptr) {
@@ -10154,15 +10194,6 @@ bool MainWindow::refreshGuideData(bool interactive, bool updateDialog)
         lastGuideStatusText_ = statusText;
     }
 
-    if (!writeGuideCacheBetaFile(channelOrder,
-                                 entriesByChannel,
-                                 windowStartUtc,
-                                 slotMinutes,
-                                 slotCount,
-                                 statusText,
-                                 betaExtractions)) {
-        appendLog("guide: failed to write beta guide cache file.");
-    }
     applyCurrentShowStatusFromGuideCache();
     if (updateDialog && tvGuideDialog_ != nullptr) {
         tvGuideDialog_->setGuideData(lastGuideChannelOrder_,
@@ -10237,60 +10268,6 @@ bool MainWindow::writeGuideCacheFile(const QStringList &channelOrder,
     return cacheFile.commit();
 }
 
-namespace {
-bool writeGuideCacheBetaFile(const QStringList &channelOrder,
-                             const QHash<QString, QList<TvGuideEntry>> &entriesByChannel,
-                             const QDateTime &windowStartUtc,
-                             int slotMinutes,
-                             int slotCount,
-                             const QString &statusText,
-                             const QJsonArray &extractions)
-{
-    const QString cachePath = resolveGuideCacheBetaPath();
-    if (cachePath.isEmpty()) {
-        return false;
-    }
-
-    QFileInfo cacheInfo(cachePath);
-    QDir cacheDir = cacheInfo.dir();
-    if (!cacheDir.exists() && !cacheDir.mkpath(".")) {
-        return false;
-    }
-
-    QJsonObject root;
-    root.insert("version", 2);
-    root.insert("generatedUtc", QDateTime::currentDateTimeUtc().toString(Qt::ISODateWithMs));
-    root.insert("windowStartUtc", windowStartUtc.toString(Qt::ISODateWithMs));
-    root.insert("slotMinutes", slotMinutes);
-    root.insert("slotCount", slotCount);
-    root.insert("statusText", statusText);
-
-    QJsonArray channelOrderArray;
-    for (const QString &channelName : channelOrder) {
-        channelOrderArray.append(channelName);
-    }
-    root.insert("channelOrder", channelOrderArray);
-
-    QJsonObject entriesObject;
-    for (auto it = entriesByChannel.cbegin(); it != entriesByChannel.cend(); ++it) {
-        entriesObject.insert(it.key(), guideEntriesToJsonArray(it.value()));
-    }
-    root.insert("entriesByChannel", entriesObject);
-    root.insert("extractions", extractions);
-
-    QSaveFile cacheFile(cachePath);
-    if (!cacheFile.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
-        return false;
-    }
-    const QByteArray payload = QJsonDocument(root).toJson(QJsonDocument::Indented);
-    if (cacheFile.write(payload) != payload.size()) {
-        cacheFile.cancelWriting();
-        return false;
-    }
-    return cacheFile.commit();
-}
-}
-
 bool MainWindow::refreshGuideDataFromSchedulesDirect(bool interactive, bool updateDialog)
 {
     if (guideEntriesCache_.isEmpty()) {
@@ -10318,6 +10295,7 @@ bool MainWindow::refreshGuideDataFromSchedulesDirect(bool interactive, bool upda
 
     const QString loadingMessage = "Downloading OTA schedule data from Schedules Direct...";
     if (updateDialog && tvGuideDialog_ != nullptr) {
+        lastGuideDialogPresentationStamp_.clear();
         tvGuideDialog_->setLoadingState(loadingMessage);
     }
     setStatusBarStateMessage("Downloading Schedules Direct guide data...");
@@ -10335,6 +10313,7 @@ bool MainWindow::refreshGuideDataFromSchedulesDirect(bool interactive, bool upda
                                        : exportError.trimmed();
         appendLog(QString("guide-sd: %1").arg(statusText));
         if (updateDialog && tvGuideDialog_ != nullptr) {
+            lastGuideDialogPresentationStamp_.clear();
             tvGuideDialog_->setLoadingState(statusText);
         }
         setStatusBarStateMessage(statusText.section('\n', 0, 0));
@@ -10354,6 +10333,7 @@ bool MainWindow::refreshGuideDataFromSchedulesDirect(bool interactive, bool upda
         const QString statusText = QString("Could not open %1 for Schedules Direct guide import.").arg(exportPath);
         appendLog(QString("guide-sd: %1").arg(statusText));
         if (updateDialog && tvGuideDialog_ != nullptr) {
+            lastGuideDialogPresentationStamp_.clear();
             tvGuideDialog_->setLoadingState(statusText);
         }
         setStatusBarStateMessage("Schedules Direct guide import failed");
@@ -10366,6 +10346,7 @@ bool MainWindow::refreshGuideDataFromSchedulesDirect(bool interactive, bool upda
         const QString statusText = QString("Could not parse %1 (%2).").arg(exportPath, parseError.errorString());
         appendLog(QString("guide-sd: %1").arg(statusText));
         if (updateDialog && tvGuideDialog_ != nullptr) {
+            lastGuideDialogPresentationStamp_.clear();
             tvGuideDialog_->setLoadingState(statusText);
         }
         setStatusBarStateMessage("Schedules Direct guide import failed");
@@ -10490,25 +10471,6 @@ bool MainWindow::refreshGuideDataFromSchedulesDirect(bool interactive, bool upda
         lastGuideStatusText_ = statusText;
     }
 
-    QJsonArray betaExtractions;
-    QJsonObject extractionObject;
-    extractionObject.insert("source", "Schedules Direct sdJSON");
-    extractionObject.insert("exportPath", exportPath);
-    extractionObject.insert("usedCachedExport", usedCachedExport);
-    extractionObject.insert("mappedEntryCount", mappedEntries);
-    extractionObject.insert("channelCount", channelOrder.size());
-    extractionObject.insert("statusText", statusText);
-    betaExtractions.append(extractionObject);
-    if (!writeGuideCacheBetaFile(channelOrder,
-                                 entriesByChannel,
-                                 windowStartUtc,
-                                 slotMinutes,
-                                 slotCount,
-                                 statusText,
-                                 betaExtractions)) {
-        appendLog("guide-sd: failed to write beta guide cache file.");
-    }
-
     applyCurrentShowStatusFromGuideCache();
     if (updateDialog && tvGuideDialog_ != nullptr) {
         tvGuideDialog_->setGuideData(lastGuideChannelOrder_,
@@ -10591,6 +10553,7 @@ bool MainWindow::loadGuideCacheFile()
                                                             lastGuideWindowStartUtc_,
                                                             lastGuideSlotMinutes_,
                                                             lastGuideSlotCount_);
+    const bool cacheStampChanged = !loadedCacheStamp.isEmpty() && loadedCacheStamp != previousCacheStamp;
 
     for (const QString &channelName : storedChannelOrder) {
         if (guideEntriesCache_.value(channelName).isEmpty()) {
@@ -10599,7 +10562,7 @@ bool MainWindow::loadGuideCacheFile()
             noAutoCurrentShowLookupChannels_.remove(channelName);
         }
     }
-    if (deferStartupAutoFavoriteScheduling_) {
+    if (cacheStampChanged && deferStartupAutoFavoriteScheduling_) {
         logInteraction("program",
                        "startup.favorite-show.auto-scan.defer",
                        QString("cache stamp=%1 favorites=%2")
@@ -10608,10 +10571,10 @@ bool MainWindow::loadGuideCacheFile()
                                                        lastGuideSlotMinutes_,
                                                        lastGuideSlotCount_),
                                 favoriteShowRules_.join(" | ")));
-    } else {
+    } else if (cacheStampChanged) {
         autoScheduleFavoriteShowsFromGuideCache(false, false);
     }
-    if (!guideRefreshInProgress_ && !loadedCacheStamp.isEmpty() && loadedCacheStamp != previousCacheStamp) {
+    if (!guideRefreshInProgress_ && cacheStampChanged) {
         showTransientStatusBarMessage(previousCacheStamp.isEmpty() ? "Guide cache loaded"
                                                                    : "Guide cache updated in background",
                                      4000);
@@ -11799,16 +11762,29 @@ void MainWindow::updateTvGuideDialogFromCurrentCache(bool showStatusMessage)
                                    : (useSchedulesDirectGuideSource()
                                           ? QString("No cached guide data loaded yet. Background Schedules Direct retrieval will update this window automatically.")
                                           : QString("No cached guide data loaded yet. Background EIT retrieval will update this window automatically."));
+    const QString cacheStamp = currentGuideCacheStamp(lastGuideCacheGeneratedUtc_,
+                                                      lastGuideWindowStartUtc_,
+                                                      lastGuideSlotMinutes_,
+                                                      lastGuideSlotCount_);
+    const QString presentationStamp = guideDialogPresentationStamp(cacheStamp,
+                                                                   lastGuideChannelOrder_,
+                                                                   favorites_,
+                                                                   favoriteShowRatings_,
+                                                                   scheduledSwitches_,
+                                                                   statusText);
 
-    tvGuideDialog_->setGuideData(lastGuideChannelOrder_,
-                                 favorites_,
-                                 favoriteShowRatings_,
-                                 guideEntriesCache_,
-                                 lastGuideWindowStartUtc_,
-                                 lastGuideSlotMinutes_,
-                                 lastGuideSlotCount_,
-                                 scheduledSwitches_,
-                                 statusText);
+    if (presentationStamp != lastGuideDialogPresentationStamp_) {
+        tvGuideDialog_->setGuideData(lastGuideChannelOrder_,
+                                     favorites_,
+                                     favoriteShowRatings_,
+                                     guideEntriesCache_,
+                                     lastGuideWindowStartUtc_,
+                                     lastGuideSlotMinutes_,
+                                     lastGuideSlotCount_,
+                                     scheduledSwitches_,
+                                     statusText);
+        lastGuideDialogPresentationStamp_ = presentationStamp;
+    }
 
     if (showStatusMessage) {
         setStatusBarStateMessage(hasGuideCache ? "Guide cache reloaded"

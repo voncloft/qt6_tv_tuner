@@ -12,7 +12,6 @@
 class QPlainTextEdit;
 class QPushButton;
 class QResizeEvent;
-class QScrollArea;
 class QShowEvent;
 class QTabWidget;
 class QTimer;
@@ -92,7 +91,6 @@ private:
     bool channelHasVisibleData(const QString &channel) const;
     bool isEntryScheduled(const QString &channelName, const TvGuideEntry &entry) const;
     int guideSlotPixelWidth() const;
-    void applyGuideHorizontalScroll(int value);
     void scrollGuideToCurrentTime(bool force);
     void rebuildSearchIndex();
     void updateSearchResults();
@@ -108,12 +106,7 @@ private:
     QPlainTextEdit *logsView_{};
     QPushButton *refreshButton_{};
     QTabWidget *tabs_{};
-    QWidget *guideHeaderViewport_{};
-    QWidget *guideHeaderContent_{};
-    QWidget *guideChannelsViewport_{};
-    QWidget *guideChannelsContent_{};
-    QScrollArea *guideScrollArea_{};
-    QWidget *guideContent_{};
+    QWidget *guideView_{};
     QStringList channelOrder_;
     QStringList favoriteChannels_;
     QHash<QString, int> favoriteShowRatings_;
