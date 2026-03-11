@@ -151,8 +151,11 @@ private:
     void scheduleReconnect(const QString &reason);
     bool tryDynamicBridgeFallback(const QString &reason);
     QString playbackStatusText() const;
+    QString playbackSeekLabelText(qint64 positionMs) const;
     bool processedPlaybackEnabled() const;
     void applyAudioOutputState();
+    void syncPlaybackSeekUi();
+    void applyPlaybackSeekPosition(qint64 positionMs);
     void armRecoveryAudioMute(const QString &reason);
     void beginRecoveryAudioMute(const QString &reason);
     void clearRecoveryAudioMute();
@@ -287,6 +290,7 @@ private:
     QPushButton *stopButton_{};
     QPushButton *watchButton_{};
     QPushButton *stopWatchButton_{};
+    QPushButton *pauseButton_{};
     QPushButton *openFileButton_{};
     QPushButton *addFavoriteButton_{};
     QPushButton *removeFavoriteButton_{};
@@ -303,12 +307,17 @@ private:
     QWidget *fullscreenOverlayContainer_{};
     QPushButton *fullscreenWatchButton_{};
     QPushButton *fullscreenStopWatchButton_{};
+    QPushButton *fullscreenPauseButton_{};
     QPushButton *fullscreenMuteButton_{};
     QSlider *fullscreenVolumeSlider_{};
+    QSlider *fullscreenSeekSlider_{};
     QLabel *fullscreenPlaybackStatusLabel_{};
     QLabel *fullscreenSignalMonitorLabel_{};
     QLabel *fullscreenCurrentShowLabel_{};
     QLabel *fullscreenCurrentShowSynopsisLabel_{};
+    QLabel *fullscreenSeekPositionLabel_{};
+    QLabel *fullscreenSeekDurationLabel_{};
+    QWidget *fullscreenSeekControlsContainer_{};
     QLabel *videoDetachedPlaceholderLabel_{};
     QWidget *pipWindow_{};
     QLabel *playbackStatusLabel_{};
@@ -316,6 +325,10 @@ private:
     QLabel *currentShowLabel_{};
     QLabel *currentShowSynopsisLabel_{};
     QSlider *volumeSlider_{};
+    QSlider *seekSlider_{};
+    QLabel *seekPositionLabel_{};
+    QLabel *seekDurationLabel_{};
+    QWidget *seekControlsContainer_{};
     QCheckBox *hideNoEitChannelsCheckBox_{};
     QCheckBox *showFavoritesOnlyCheckBox_{};
     QCheckBox *showTodayOnlyListingsCheckBox_{};

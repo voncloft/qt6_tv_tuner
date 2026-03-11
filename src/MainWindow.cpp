@@ -63,6 +63,8 @@
 #include <QSplitter>
 #include <QStandardPaths>
 #include <QStatusBar>
+#include <QStyle>
+#include <QStyleOptionSlider>
 #include <QTabBar>
 #include <QTabWidget>
 #include <QTableWidget>
@@ -134,6 +136,7 @@ constexpr int kDefaultGuideCacheRetentionHours = 24;
 constexpr int kDefaultFavoriteShowRating = 1;
 constexpr int kMaxFavoriteShowRating = 10;
 constexpr int kKeyBindingVolumeStep = 5;
+constexpr qint64 kKeyBindingSeekStepMs = 10 * 1000;
 constexpr int kQuickFavoriteBindingCount = 10;
 
 struct KeyBindingSpec {
@@ -142,6 +145,45 @@ struct KeyBindingSpec {
     QKeySequence defaultSequence;
     bool playbackOnly{false};
     bool allowAutoRepeat{false};
+};
+
+class JumpToClickSlider final : public QSlider
+{
+public:
+    explicit JumpToClickSlider(Qt::Orientation orientation, QWidget *parent = nullptr)
+        : QSlider(orientation, parent)
+    {
+    }
+
+protected:
+    void mousePressEvent(QMouseEvent *event) override
+    {
+        if (event != nullptr && event->button() == Qt::LeftButton) {
+            QStyleOptionSlider option;
+            initStyleOption(&option);
+            const QRect handleRect =
+                style()->subControlRect(QStyle::CC_Slider, &option, QStyle::SC_SliderHandle, this);
+            if (!handleRect.contains(event->position().toPoint())) {
+                const QRect grooveRect =
+                    style()->subControlRect(QStyle::CC_Slider, &option, QStyle::SC_SliderGroove, this);
+                const int sliderLength = orientation() == Qt::Horizontal ? handleRect.width() : handleRect.height();
+                const int sliderSpan =
+                    std::max(1,
+                             (orientation() == Qt::Horizontal ? grooveRect.width() : grooveRect.height())
+                                 - sliderLength);
+                const int clickOffset = orientation() == Qt::Horizontal
+                                            ? event->position().toPoint().x() - grooveRect.x() - (sliderLength / 2)
+                                            : event->position().toPoint().y() - grooveRect.y() - (sliderLength / 2);
+                const int boundedOffset = std::clamp(clickOffset, 0, sliderSpan);
+                const int sliderValue =
+                    QStyle::sliderValueFromPosition(minimum(), maximum(), boundedOffset, sliderSpan, option.upsideDown);
+                setSliderPosition(sliderValue);
+                setValue(sliderValue);
+            }
+        }
+
+        QSlider::mousePressEvent(event);
+    }
 };
 
 QString favoriteKeyBindingActionId(int index)
@@ -191,6 +233,16 @@ const QList<KeyBindingSpec> &keyBindingSpecs()
                       QKeySequence(QKeyCombination(Qt::NoModifier, Qt::Key_M)),
                       true,
                       false});
+        items.append({QStringLiteral("seekBackward"),
+                      QStringLiteral("Seek Backward"),
+                      QKeySequence(),
+                      true,
+                      true});
+        items.append({QStringLiteral("seekForward"),
+                      QStringLiteral("Seek Forward"),
+                      QKeySequence(),
+                      true,
+                      true});
         return items;
     }();
     return specs;
@@ -4296,6 +4348,15 @@ MainWindow::MainWindow(QWidget *parent)
     connect(mediaPlayer_, &QMediaPlayer::bufferProgressChanged, this, [this](float progress) {
         appendLog(QString("player: bufferProgress=%1").arg(progress, 0, 'f', 3));
     });
+    connect(mediaPlayer_, &QMediaPlayer::durationChanged, this, [this](qint64) {
+        syncPlaybackSeekUi();
+    });
+    connect(mediaPlayer_, &QMediaPlayer::positionChanged, this, [this](qint64) {
+        syncPlaybackSeekUi();
+    });
+    connect(mediaPlayer_, &QMediaPlayer::seekableChanged, this, [this](bool) {
+        syncPlaybackSeekUi();
+    });
     connect(reconnectTimer_, &QTimer::timeout, this, &MainWindow::triggerReconnect);
     connect(currentShowTimer_, &QTimer::timeout, this, &MainWindow::refreshCurrentShowStatus);
     connect(playbackAttachTimer_, &QTimer::timeout, this, [this]() {
@@ -4341,6 +4402,39 @@ MainWindow::MainWindow(QWidget *parent)
         }
     });
     connect(volumeSlider_, &QSlider::valueChanged, this, &MainWindow::handleVolumeChanged);
+    connect(seekSlider_, &QSlider::sliderMoved, this, [this](int value) {
+        if (fullscreenSeekSlider_ != nullptr) {
+            const QSignalBlocker blocker(fullscreenSeekSlider_);
+            fullscreenSeekSlider_->setValue(value);
+        }
+        if (seekPositionLabel_ != nullptr) {
+            seekPositionLabel_->setText(playbackSeekLabelText(value));
+        }
+        if (fullscreenSeekPositionLabel_ != nullptr) {
+            fullscreenSeekPositionLabel_->setText(playbackSeekLabelText(value));
+        }
+    });
+    connect(seekSlider_, &QSlider::valueChanged, this, [this](int value) {
+        if (fullscreenSeekSlider_ != nullptr && fullscreenSeekSlider_->value() != value) {
+            const QSignalBlocker blocker(fullscreenSeekSlider_);
+            fullscreenSeekSlider_->setValue(value);
+        }
+        if (seekPositionLabel_ != nullptr) {
+            seekPositionLabel_->setText(playbackSeekLabelText(value));
+        }
+        if (fullscreenSeekPositionLabel_ != nullptr) {
+            fullscreenSeekPositionLabel_->setText(playbackSeekLabelText(value));
+        }
+        if ((seekSlider_ != nullptr && seekSlider_->isSliderDown())
+            || (QApplication::mouseButtons() & Qt::LeftButton)) {
+            applyPlaybackSeekPosition(value);
+        }
+    });
+    connect(seekSlider_, &QSlider::sliderReleased, this, [this]() {
+        if (seekSlider_ != nullptr) {
+            applyPlaybackSeekPosition(seekSlider_->value());
+        }
+    });
     connect(muteButton_, &QPushButton::toggled, this, &MainWindow::handleMuteToggled);
     connect(logAutoScrollCheckBox_, &QCheckBox::toggled, this, [](bool checked) {
         QSettings settings("tv_tuner_gui", "watcher");
@@ -5230,25 +5324,33 @@ void MainWindow::buildUi()
     testingBugsLayout->addWidget(testingBugsGroup, 1);
 
     watchControlsContainer_ = new QWidget(watchPage_);
-    auto *watchControlsRow = new QHBoxLayout(watchControlsContainer_);
+    auto *watchControlsLayout = new QVBoxLayout(watchControlsContainer_);
+    watchControlsLayout->setContentsMargins(0, 0, 0, 0);
+    watchControlsLayout->setSpacing(6);
+    auto *watchControlsRow = new QHBoxLayout();
     watchControlsRow->setContentsMargins(0, 0, 0, 0);
     watchControlsRow->setSpacing(8);
-    watchButton_ = new QPushButton("Watch Selected", watchPage_);
-    stopWatchButton_ = new QPushButton("Stop Watching", watchPage_);
+    watchButton_ = new QPushButton(QStringLiteral("▶"), watchPage_);
+    stopWatchButton_ = new QPushButton(QStringLiteral("■"), watchPage_);
+    pauseButton_ = new QPushButton(QStringLiteral("||"), watchPage_);
     openFileButton_ = new QPushButton("Open File", watchPage_);
     pipToggleButton_ = new QPushButton("Pop Out Video", watchPage_);
     fullscreenButton_ = new QPushButton("Fullscreen", watchPage_);
     muteButton_ = new QPushButton("Mute", watchPage_);
-    volumeSlider_ = new QSlider(Qt::Horizontal, watchPage_);
+    volumeSlider_ = new JumpToClickSlider(Qt::Horizontal, watchPage_);
+    seekSlider_ = new JumpToClickSlider(Qt::Horizontal, watchPage_);
     playbackStatusLabel_ = new QLabel("Idle", watchPage_);
     signalMonitorLabel_ = new QLabel("Signal: n/a", watchPage_);
     currentShowLabel_ = new QLabel("NO EIT DATA", watchPage_);
     currentShowSynopsisLabel_ = new QLabel(watchPage_);
+    seekPositionLabel_ = new QLabel("Live", watchPage_);
+    seekDurationLabel_ = new QLabel("", watchPage_);
     addFavoriteButton_ = new QPushButton("Add Favorite", watchPage_);
     removeFavoriteButton_ = new QPushButton("Remove Favorite", watchPage_);
 
     stopButton_->setEnabled(false);
     stopWatchButton_->setEnabled(false);
+    pauseButton_->hide();
     pipToggleButton_->setEnabled(false);
     muteButton_->setCheckable(true);
     const auto setStableButtonWidth = [](QPushButton *button, const QStringList &labels) {
@@ -5263,8 +5365,9 @@ void MainWindow::buildUi()
         }
         button->setFixedWidth(width);
     };
-    setStableButtonWidth(watchButton_, {"Watch Selected"});
-    setStableButtonWidth(stopWatchButton_, {"Stop Watching"});
+    setStableButtonWidth(watchButton_, {QStringLiteral("▶")});
+    setStableButtonWidth(stopWatchButton_, {QStringLiteral("■")});
+    setStableButtonWidth(pauseButton_, {QStringLiteral("▶"), QStringLiteral("||")});
     setStableButtonWidth(openFileButton_, {"Open File"});
     setStableButtonWidth(pipToggleButton_, {"Pop Out Video"});
     setStableButtonWidth(fullscreenButton_, {"Fullscreen", "Exit Fullscreen"});
@@ -5273,6 +5376,7 @@ void MainWindow::buildUi()
     volumeSlider_->setValue(85);
     volumeSlider_->setMinimumWidth(120);
     volumeSlider_->setMaximumWidth(220);
+    seekSlider_->setEnabled(false);
     playbackStatusLabel_->setMinimumWidth(100);
     playbackStatusLabel_->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Preferred);
     playbackStatusLabel_->setAlignment(Qt::AlignLeft | Qt::AlignTop);
@@ -5291,6 +5395,23 @@ void MainWindow::buildUi()
     currentShowSynopsisLabel_->setVisible(false);
     currentShowSynopsisLabel_->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
     currentShowSynopsisLabel_->setStyleSheet("QLabel { color: #d4d4d4; }");
+    seekPositionLabel_->setMinimumWidth(52);
+    seekDurationLabel_->setMinimumWidth(52);
+    seekPositionLabel_->setAlignment(Qt::AlignLeft | Qt::AlignVCenter);
+    seekDurationLabel_->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+    seekControlsContainer_ = new QWidget(watchPage_);
+    seekControlsContainer_->hide();
+    auto *seekRow = new QHBoxLayout(seekControlsContainer_);
+    seekRow->setContentsMargins(0, 0, 0, 0);
+    seekRow->setSpacing(8);
+    seekRow->addWidget(new QLabel("Seek:", watchPage_));
+    seekRow->addWidget(seekPositionLabel_);
+    seekRow->addWidget(seekSlider_, 1);
+    seekRow->addWidget(seekDurationLabel_);
+
+    watchButton_->setToolTip("Watch selected channel");
+    stopWatchButton_->setToolTip("Stop playback");
+    pauseButton_->setToolTip("Pause is only available for local media");
 
     watchControlsRow->addWidget(watchButton_);
     watchControlsRow->addWidget(stopWatchButton_);
@@ -5302,6 +5423,8 @@ void MainWindow::buildUi()
     watchControlsRow->addWidget(volumeSlider_);
     watchControlsRow->addWidget(muteButton_);
     watchControlsRow->addStretch(1);
+    watchControlsLayout->addLayout(watchControlsRow);
+    watchControlsLayout->addWidget(seekControlsContainer_);
 
     contentSplitter_ = new QSplitter(Qt::Horizontal, watchPage_);
     videoWidget_ = new QVideoWidget(contentSplitter_);
@@ -5456,25 +5579,32 @@ void MainWindow::buildUi()
     auto *fullscreenControlsRow = new QHBoxLayout();
     fullscreenControlsRow->setContentsMargins(0, 0, 0, 0);
     fullscreenControlsRow->setSpacing(8);
-    fullscreenWatchButton_ = new QPushButton("Watch Selected", fullscreenOverlayContainer_);
-    fullscreenStopWatchButton_ = new QPushButton("Stop Watching", fullscreenOverlayContainer_);
+    fullscreenWatchButton_ = new QPushButton(QStringLiteral("▶"), fullscreenOverlayContainer_);
+    fullscreenStopWatchButton_ = new QPushButton(QStringLiteral("■"), fullscreenOverlayContainer_);
+    fullscreenPauseButton_ = new QPushButton(QStringLiteral("||"), fullscreenOverlayContainer_);
     fullscreenMuteButton_ = new QPushButton("Mute", fullscreenOverlayContainer_);
     fullscreenMuteButton_->setCheckable(true);
-    fullscreenVolumeSlider_ = new QSlider(Qt::Horizontal, fullscreenOverlayContainer_);
+    fullscreenVolumeSlider_ = new JumpToClickSlider(Qt::Horizontal, fullscreenOverlayContainer_);
+    fullscreenSeekSlider_ = new JumpToClickSlider(Qt::Horizontal, fullscreenOverlayContainer_);
     fullscreenVolumeSlider_->setRange(0, 100);
     fullscreenVolumeSlider_->setMinimumWidth(160);
     fullscreenVolumeSlider_->setMaximumWidth(260);
+    fullscreenSeekSlider_->setEnabled(false);
     fullscreenPlaybackStatusLabel_ = new QLabel("Idle", fullscreenOverlayContainer_);
     fullscreenSignalMonitorLabel_ = new QLabel("Signal: n/a", fullscreenOverlayContainer_);
+    fullscreenSeekPositionLabel_ = new QLabel("Live", fullscreenOverlayContainer_);
+    fullscreenSeekDurationLabel_ = new QLabel("", fullscreenOverlayContainer_);
     fullscreenPlaybackStatusLabel_->setAlignment(Qt::AlignRight | Qt::AlignTop);
     fullscreenPlaybackStatusLabel_->setMinimumWidth(220);
     fullscreenPlaybackStatusLabel_->setTextInteractionFlags(Qt::TextSelectableByMouse);
     fullscreenSignalMonitorLabel_->setAlignment(Qt::AlignRight | Qt::AlignTop);
     fullscreenSignalMonitorLabel_->setMinimumWidth(180);
     fullscreenSignalMonitorLabel_->setTextInteractionFlags(Qt::TextSelectableByMouse);
-    fullscreenControlsRow->addWidget(fullscreenWatchButton_);
-    fullscreenControlsRow->addWidget(fullscreenStopWatchButton_);
-    fullscreenControlsRow->addSpacing(12);
+    fullscreenSeekPositionLabel_->setMinimumWidth(52);
+    fullscreenSeekDurationLabel_->setMinimumWidth(52);
+    fullscreenSeekPositionLabel_->setAlignment(Qt::AlignLeft | Qt::AlignVCenter);
+    fullscreenSeekDurationLabel_->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+    fullscreenPauseButton_->hide();
     fullscreenControlsRow->addWidget(new QLabel("Volume:", fullscreenOverlayContainer_));
     fullscreenControlsRow->addWidget(fullscreenVolumeSlider_);
     fullscreenControlsRow->addWidget(fullscreenMuteButton_);
@@ -5486,6 +5616,18 @@ void MainWindow::buildUi()
     fullscreenStatusStackLayout->addWidget(fullscreenPlaybackStatusLabel_, 0, Qt::AlignRight | Qt::AlignTop);
     fullscreenStatusStackLayout->addWidget(fullscreenSignalMonitorLabel_, 0, Qt::AlignRight | Qt::AlignTop);
     fullscreenControlsRow->addWidget(fullscreenStatusStack, 0, Qt::AlignRight | Qt::AlignTop);
+    fullscreenSeekControlsContainer_ = new QWidget(fullscreenOverlayContainer_);
+    fullscreenSeekControlsContainer_->hide();
+    auto *fullscreenSeekRow = new QHBoxLayout(fullscreenSeekControlsContainer_);
+    fullscreenSeekRow->setContentsMargins(0, 0, 0, 0);
+    fullscreenSeekRow->setSpacing(8);
+    fullscreenSeekRow->addWidget(fullscreenWatchButton_);
+    fullscreenSeekRow->addWidget(fullscreenStopWatchButton_);
+    fullscreenSeekRow->addSpacing(12);
+    fullscreenSeekRow->addWidget(new QLabel("Seek:", fullscreenOverlayContainer_));
+    fullscreenSeekRow->addWidget(fullscreenSeekPositionLabel_);
+    fullscreenSeekRow->addWidget(fullscreenSeekSlider_, 1);
+    fullscreenSeekRow->addWidget(fullscreenSeekDurationLabel_);
 
     auto *fullscreenInfoRow = new QHBoxLayout();
     fullscreenInfoRow->setContentsMargins(0, 0, 0, 0);
@@ -5504,6 +5646,7 @@ void MainWindow::buildUi()
     fullscreenInfoRow->addWidget(fullscreenCurrentShowLabel_, 4);
 
     fullscreenOverlayLayout->addLayout(fullscreenControlsRow);
+    fullscreenOverlayLayout->addWidget(fullscreenSeekControlsContainer_);
     fullscreenOverlayLayout->addLayout(fullscreenInfoRow);
     fullscreenOverlayContainer_->hide();
     fullscreenWindow_->hide();
@@ -5554,10 +5697,24 @@ void MainWindow::buildUi()
         });
     });
 
-    setStableButtonWidth(fullscreenWatchButton_, {"Watch Selected"});
-    setStableButtonWidth(fullscreenStopWatchButton_, {"Stop Watching"});
+    setStableButtonWidth(fullscreenWatchButton_, {QStringLiteral("▶")});
+    setStableButtonWidth(fullscreenStopWatchButton_, {QStringLiteral("■")});
+    setStableButtonWidth(fullscreenPauseButton_, {QStringLiteral("▶"), QStringLiteral("||")});
     setStableButtonWidth(fullscreenMuteButton_, {"Mute", "Unmute"});
-    connect(fullscreenWatchButton_, &QPushButton::clicked, this, &MainWindow::watchSelectedChannel);
+    fullscreenWatchButton_->setToolTip("Watch selected channel");
+    fullscreenStopWatchButton_->setToolTip("Stop playback");
+    fullscreenPauseButton_->setToolTip("Pause is only available for local media");
+    connect(fullscreenWatchButton_, &QPushButton::clicked, this, [this]() {
+        if (mediaPlayer_ != nullptr && currentChannelName_.startsWith("File: ")) {
+            if (mediaPlayer_->playbackState() == QMediaPlayer::PlayingState) {
+                mediaPlayer_->pause();
+            } else {
+                mediaPlayer_->play();
+            }
+            return;
+        }
+        watchSelectedChannel();
+    });
     connect(fullscreenStopWatchButton_, &QPushButton::clicked, this, &MainWindow::stopWatching);
     connect(fullscreenMuteButton_, &QPushButton::toggled, this, [this](bool checked) {
         if (muteButton_ == nullptr) {
@@ -5579,6 +5736,39 @@ void MainWindow::buildUi()
             handleVolumeChanged(value);
         }
     });
+    connect(fullscreenSeekSlider_, &QSlider::sliderMoved, this, [this](int value) {
+        if (seekSlider_ != nullptr) {
+            const QSignalBlocker blocker(seekSlider_);
+            seekSlider_->setValue(value);
+        }
+        if (seekPositionLabel_ != nullptr) {
+            seekPositionLabel_->setText(playbackSeekLabelText(value));
+        }
+        if (fullscreenSeekPositionLabel_ != nullptr) {
+            fullscreenSeekPositionLabel_->setText(playbackSeekLabelText(value));
+        }
+    });
+    connect(fullscreenSeekSlider_, &QSlider::valueChanged, this, [this](int value) {
+        if (seekSlider_ != nullptr && seekSlider_->value() != value) {
+            const QSignalBlocker blocker(seekSlider_);
+            seekSlider_->setValue(value);
+        }
+        if (seekPositionLabel_ != nullptr) {
+            seekPositionLabel_->setText(playbackSeekLabelText(value));
+        }
+        if (fullscreenSeekPositionLabel_ != nullptr) {
+            fullscreenSeekPositionLabel_->setText(playbackSeekLabelText(value));
+        }
+        if ((fullscreenSeekSlider_ != nullptr && fullscreenSeekSlider_->isSliderDown())
+            || (QApplication::mouseButtons() & Qt::LeftButton)) {
+            applyPlaybackSeekPosition(value);
+        }
+    });
+    connect(fullscreenSeekSlider_, &QSlider::sliderReleased, this, [this]() {
+        if (fullscreenSeekSlider_ != nullptr) {
+            applyPlaybackSeekPosition(fullscreenSeekSlider_->value());
+        }
+    });
 
     setStatusBarStateMessage(QString());
     connect(statusBar(), &QStatusBar::messageChanged, this, [this](const QString &message) {
@@ -5596,7 +5786,17 @@ void MainWindow::buildUi()
 
     connect(startButton_, &QPushButton::clicked, this, &MainWindow::startScan);
     connect(stopButton_, &QPushButton::clicked, this, &MainWindow::stopScan);
-    connect(watchButton_, &QPushButton::clicked, this, &MainWindow::watchSelectedChannel);
+    connect(watchButton_, &QPushButton::clicked, this, [this]() {
+        if (mediaPlayer_ != nullptr && currentChannelName_.startsWith("File: ")) {
+            if (mediaPlayer_->playbackState() == QMediaPlayer::PlayingState) {
+                mediaPlayer_->pause();
+            } else {
+                mediaPlayer_->play();
+            }
+            return;
+        }
+        watchSelectedChannel();
+    });
     connect(stopWatchButton_, &QPushButton::clicked, this, &MainWindow::stopWatching);
     connect(openFileButton_, &QPushButton::clicked, this, &MainWindow::openMediaFile);
     connect(pipToggleButton_, &QPushButton::clicked, this, [this]() {
@@ -7779,8 +7979,11 @@ void MainWindow::loadKeyBindings()
 
 void MainWindow::applyKeyBindings()
 {
+    const bool keyBindingsPageActive =
+        tabs_ != nullptr && keyBindingsPage_ != nullptr && tabs_->currentWidget() == keyBindingsPage_;
     if (aboutAction_ != nullptr) {
-        aboutAction_->setShortcut(keyBindingSequence(QStringLiteral("about")));
+        aboutAction_->setShortcut(keyBindingsPageActive ? QKeySequence()
+                                                        : keyBindingSequence(QStringLiteral("about")));
     }
 
     for (const KeyBindingSpec &spec : keyBindingSpecs()) {
@@ -7800,7 +8003,7 @@ void MainWindow::applyKeyBindings()
 
         const QKeySequence sequence = keyBindingSequence(spec.id);
         shortcut->setKey(sequence);
-        shortcut->setEnabled(!sequence.isEmpty());
+        shortcut->setEnabled(!keyBindingsPageActive && !sequence.isEmpty());
     }
 }
 
@@ -7941,6 +8144,20 @@ bool MainWindow::triggerKeyBindingAction(const QString &actionId)
             muteButton_->toggle();
             return true;
         }
+    }
+    if (actionId == QStringLiteral("seekBackward")) {
+        if (mediaPlayer_ != nullptr) {
+            applyPlaybackSeekPosition(mediaPlayer_->position() - kKeyBindingSeekStepMs);
+            return true;
+        }
+        return false;
+    }
+    if (actionId == QStringLiteral("seekForward")) {
+        if (mediaPlayer_ != nullptr) {
+            applyPlaybackSeekPosition(mediaPlayer_->position() + kKeyBindingSeekStepMs);
+            return true;
+        }
+        return false;
     }
 
     return false;
@@ -8458,6 +8675,26 @@ void MainWindow::handleCurrentTabChanged(int index)
         return;
     }
 
+    applyKeyBindings();
+
+    if (tabs_->widget(index) == keyBindingsPage_) {
+        QTimer::singleShot(0, this, [this]() {
+            if (tabs_ == nullptr || tabs_->currentWidget() != keyBindingsPage_) {
+                return;
+            }
+            QWidget *focused = QApplication::focusWidget();
+            if (focused != nullptr && keyBindingsPage_->isAncestorOf(focused)) {
+                return;
+            }
+            for (const KeyBindingSpec &spec : keyBindingSpecs()) {
+                if (QKeySequenceEdit *editor = keyBindingEditors_.value(spec.id, nullptr)) {
+                    editor->setFocus(Qt::TabFocusReason);
+                    break;
+                }
+            }
+        });
+    }
+
     if (tabs_->widget(index) == configPage_) {
         QTimer::singleShot(0, this, [this]() {
             syncConfigGroupBoxHeights();
@@ -8860,6 +9097,20 @@ void MainWindow::processScheduledSwitches()
                       .arg(activeSwitches.size()));
         showTransientStatusBarMessage(QString("Scheduled switch expired during scan: %1")
                                           .arg(activeSwitches.first().channelName),
+                                      4000);
+        removeDueSwitches(activeSwitches);
+        refreshScheduledSwitchTimer();
+        return;
+    }
+
+    if (currentChannelName_.startsWith("File: ")) {
+        appendLog(QString("schedule: local file playback active; ignoring and pruning %1 due switch(es) -> %2")
+                      .arg(activeSwitches.size())
+                      .arg(summarizeScheduledSwitchesDebug(activeSwitches)));
+        showTransientStatusBarMessage(activeSwitches.size() == 1
+                                          ? QString("Local file playing; ignored scheduled tune: %1")
+                                                .arg(activeSwitches.first().channelName)
+                                          : "Local file playing; ignored due scheduled tunes",
                                       4000);
         removeDueSwitches(activeSwitches);
         refreshScheduledSwitchTimer();
@@ -10437,6 +10688,7 @@ void MainWindow::openMediaFile()
     appendLog("player: Opened local media file: " + filePath);
     stopWatchButton_->setEnabled(true);
     playbackStatusLabel_->setText(playbackStatusText());
+    syncPlaybackSeekUi();
     syncFullscreenOverlayState();
     setStatusBarStateMessage("Opening media file");
 }
@@ -11821,6 +12073,7 @@ bool MainWindow::startWatchingChannel(const QString &channelName,
 
     stopWatchButton_->setEnabled(true);
     playbackStatusLabel_->setText(playbackStatusText());
+    syncPlaybackSeekUi();
     syncFullscreenOverlayState();
     setStatusBarStateMessage("Buffering channel");
     return true;
@@ -11877,6 +12130,7 @@ void MainWindow::stopWatching()
 
     stopWatchButton_->setEnabled(false);
     playbackStatusLabel_->setText(playbackStatusText());
+    syncPlaybackSeekUi();
     setSignalMonitorStatus("Signal: n/a");
     setCurrentShowStatus("NO EIT DATA");
     syncFullscreenOverlayState();
@@ -12285,6 +12539,104 @@ QString MainWindow::playbackStatusText() const
     return QString("%1: %2").arg(stateText, currentChannelName_);
 }
 
+QString MainWindow::playbackSeekLabelText(qint64 positionMs) const
+{
+    const qint64 totalSeconds = std::max<qint64>(0, positionMs / 1000);
+    const qint64 hours = totalSeconds / 3600;
+    const qint64 minutes = (totalSeconds % 3600) / 60;
+    const qint64 seconds = totalSeconds % 60;
+    if (hours > 0) {
+        return QString("%1:%2:%3")
+            .arg(hours)
+            .arg(minutes, 2, 10, QChar('0'))
+            .arg(seconds, 2, 10, QChar('0'));
+    }
+    return QString("%1:%2")
+        .arg(minutes)
+        .arg(seconds, 2, 10, QChar('0'));
+}
+
+void MainWindow::syncPlaybackSeekUi()
+{
+    const bool isLocalFile = currentChannelName_.startsWith("File: ");
+    const bool showSeekControls = isLocalFile;
+    const bool seekable = mediaPlayer_ != nullptr && isLocalFile && mediaPlayer_->isSeekable();
+    const qint64 durationMs = mediaPlayer_ != nullptr ? std::max<qint64>(0, mediaPlayer_->duration()) : 0;
+    qint64 positionMs = mediaPlayer_ != nullptr ? std::max<qint64>(0, mediaPlayer_->position()) : 0;
+    if (durationMs > 0) {
+        positionMs = std::min(positionMs, durationMs);
+    }
+
+    qint64 previewPositionMs = positionMs;
+    if (seekSlider_ != nullptr && seekSlider_->isSliderDown()) {
+        previewPositionMs = seekSlider_->value();
+    } else if (fullscreenSeekSlider_ != nullptr && fullscreenSeekSlider_->isSliderDown()) {
+        previewPositionMs = fullscreenSeekSlider_->value();
+    }
+
+    const int sliderMaximum =
+        seekable && durationMs > 0 ? static_cast<int>(std::min<qint64>(durationMs, std::numeric_limits<int>::max())) : 0;
+    const int sliderValue = static_cast<int>(std::min<qint64>(previewPositionMs, sliderMaximum));
+    const QString positionText = seekable
+                                     ? playbackSeekLabelText(previewPositionMs)
+                                     : (currentChannelName_.isEmpty()
+                                            ? QString("0:00")
+                                            : (isLocalFile ? playbackSeekLabelText(previewPositionMs) : QString("Live")));
+    const QString durationText = seekable
+                                     ? playbackSeekLabelText(durationMs)
+                                     : (isLocalFile && durationMs > 0 ? playbackSeekLabelText(durationMs) : QString());
+
+    const auto syncSlider = [sliderMaximum, sliderValue, seekable](QSlider *slider) {
+        if (slider == nullptr) {
+            return;
+        }
+        const bool sliderDown = slider->isSliderDown();
+        const QSignalBlocker blocker(slider);
+        slider->setRange(0, sliderMaximum);
+        slider->setEnabled(seekable && sliderMaximum > 0);
+        if (!sliderDown) {
+            slider->setValue(sliderValue);
+        }
+    };
+
+    syncSlider(seekSlider_);
+    syncSlider(fullscreenSeekSlider_);
+    if (seekControlsContainer_ != nullptr) {
+        seekControlsContainer_->setVisible(showSeekControls);
+    }
+    if (fullscreenSeekControlsContainer_ != nullptr) {
+        fullscreenSeekControlsContainer_->setVisible(showSeekControls);
+    }
+    if (seekPositionLabel_ != nullptr) {
+        seekPositionLabel_->setText(positionText);
+    }
+    if (seekDurationLabel_ != nullptr) {
+        seekDurationLabel_->setText(durationText);
+    }
+    if (fullscreenSeekPositionLabel_ != nullptr) {
+        fullscreenSeekPositionLabel_->setText(positionText);
+    }
+    if (fullscreenSeekDurationLabel_ != nullptr) {
+        fullscreenSeekDurationLabel_->setText(durationText);
+    }
+    if (fullscreenActive_) {
+        positionFullscreenOverlay();
+    }
+}
+
+void MainWindow::applyPlaybackSeekPosition(qint64 positionMs)
+{
+    if (mediaPlayer_ == nullptr || currentChannelName_.startsWith("File: ") == false || !mediaPlayer_->isSeekable()) {
+        return;
+    }
+
+    const qint64 durationMs = std::max<qint64>(0, mediaPlayer_->duration());
+    const qint64 boundedPositionMs =
+        durationMs > 0 ? std::clamp<qint64>(positionMs, 0, durationMs) : std::max<qint64>(0, positionMs);
+    mediaPlayer_->setPosition(boundedPositionMs);
+    syncPlaybackSeekUi();
+}
+
 bool MainWindow::processedPlaybackEnabled() const
 {
     if (processedPlaybackCheckBox_ != nullptr) {
@@ -12486,9 +12838,10 @@ void MainWindow::handleMediaStatusChanged(QMediaPlayer::MediaStatus status)
 {
     appendLog(QString("player: mediaStatusChanged=%1").arg(static_cast<int>(status)));
     playbackStatusLabel_->setText(playbackStatusText());
+    syncPlaybackSeekUi();
     syncFullscreenOverlayState();
+    const bool isLocalFile = currentChannelName_.startsWith("File: ");
     if (!currentChannelName_.isEmpty()) {
-        const bool isLocalFile = currentChannelName_.startsWith("File: ");
         if (status == QMediaPlayer::InvalidMedia) {
             setStatusBarStateMessage(isLocalFile ? "Local file error" : "Playback error");
         } else if (mediaPlayer_->playbackState() == QMediaPlayer::PlayingState) {
@@ -12497,13 +12850,13 @@ void MainWindow::handleMediaStatusChanged(QMediaPlayer::MediaStatus status)
             setStatusBarStateMessage(isLocalFile ? "Opening media file" : "Buffering channel");
         }
     }
-    if (!currentChannelName_.isEmpty() && status == QMediaPlayer::InvalidMedia && !userStoppedWatching_) {
+    if (!currentChannelName_.isEmpty() && !isLocalFile && status == QMediaPlayer::InvalidMedia && !userStoppedWatching_) {
         if (tryDynamicBridgeFallback("Media stream became invalid")) {
             return;
         }
         scheduleReconnect("Media stream became invalid");
     }
-    if (!currentChannelName_.isEmpty() && status == QMediaPlayer::EndOfMedia && !userStoppedWatching_) {
+    if (!currentChannelName_.isEmpty() && !isLocalFile && status == QMediaPlayer::EndOfMedia && !userStoppedWatching_) {
         if (tryDynamicBridgeFallback("Media reached unexpected end")) {
             return;
         }
@@ -12524,7 +12877,7 @@ void MainWindow::handlePlayerError(const QString &errorText)
         return;
     }
     appendLog("player: " + errorText.trimmed());
-    if (!userStoppedWatching_ && !currentChannelName_.isEmpty()) {
+    if (!userStoppedWatching_ && !currentChannelName_.isEmpty() && !currentChannelName_.startsWith("File: ")) {
         if (tryDynamicBridgeFallback(QString("Player error: %1").arg(errorText.trimmed()))) {
             return;
         }
@@ -12534,7 +12887,7 @@ void MainWindow::handlePlayerError(const QString &errorText)
 
 bool MainWindow::tryDynamicBridgeFallback(const QString &reason)
 {
-    if (userStoppedWatching_ || currentChannelName_.isEmpty()) {
+    if (userStoppedWatching_ || currentChannelName_.isEmpty() || currentChannelName_.startsWith("File: ")) {
         return false;
     }
 
@@ -12597,7 +12950,7 @@ void MainWindow::triggerQuickFavorite()
 
 void MainWindow::scheduleReconnect(const QString &reason)
 {
-    if (currentChannelName_.isEmpty() || userStoppedWatching_) {
+    if (currentChannelName_.isEmpty() || userStoppedWatching_ || currentChannelName_.startsWith("File: ")) {
         return;
     }
     if (reconnectAttemptCount_ >= maxReconnectAttempts_) {
@@ -12624,7 +12977,7 @@ void MainWindow::scheduleReconnect(const QString &reason)
 
 void MainWindow::triggerReconnect()
 {
-    if (currentChannelName_.isEmpty() || userStoppedWatching_) {
+    if (currentChannelName_.isEmpty() || userStoppedWatching_ || currentChannelName_.startsWith("File: ")) {
         return;
     }
     startWatchingChannel(currentChannelName_, true, currentChannelLine_);
@@ -12841,14 +13194,38 @@ void MainWindow::syncFullscreenOverlayState()
         return;
     }
 
+    const bool isLocalFile = currentChannelName_.startsWith("File: ");
+    const bool localFilePlaying = isLocalFile && mediaPlayer_ != nullptr
+                                  && mediaPlayer_->playbackState() == QMediaPlayer::PlayingState;
+
     if (fullscreenWatchButton_ != nullptr && watchButton_ != nullptr) {
+        watchButton_->setText(isLocalFile && localFilePlaying ? QStringLiteral("||") : QStringLiteral("▶"));
+        watchButton_->setToolTip(isLocalFile
+                                     ? (localFilePlaying ? "Pause local media" : "Resume local media")
+                                     : "Watch selected channel");
         fullscreenWatchButton_->setEnabled(watchButton_->isEnabled());
+        fullscreenWatchButton_->setText(isLocalFile && localFilePlaying ? QStringLiteral("||") : QStringLiteral("▶"));
+        fullscreenWatchButton_->setToolTip(isLocalFile
+                                               ? (localFilePlaying ? "Pause local media" : "Resume local media")
+                                               : "Watch selected channel");
+    }
+    if (pauseButton_ != nullptr) {
+        pauseButton_->hide();
     }
     if (fullscreenStopWatchButton_ != nullptr) {
         const bool stopEnabled = stopWatchButton_ != nullptr
                                      ? stopWatchButton_->isEnabled()
                                      : !currentChannelName_.trimmed().isEmpty();
         fullscreenStopWatchButton_->setEnabled(stopEnabled);
+        fullscreenStopWatchButton_->setText(QStringLiteral("■"));
+        fullscreenStopWatchButton_->setToolTip(isLocalFile ? "Stop local media" : "Stop watching");
+    }
+    if (stopWatchButton_ != nullptr) {
+        stopWatchButton_->setText(QStringLiteral("■"));
+        stopWatchButton_->setToolTip(isLocalFile ? "Stop local media" : "Stop watching");
+    }
+    if (fullscreenPauseButton_ != nullptr) {
+        fullscreenPauseButton_->hide();
     }
     if (fullscreenMuteButton_ != nullptr && muteButton_ != nullptr) {
         const QSignalBlocker blocker(fullscreenMuteButton_);
@@ -12865,6 +13242,7 @@ void MainWindow::syncFullscreenOverlayState()
         fullscreenVolumeSlider_->setValue(volumeSlider_->value());
         fullscreenVolumeSlider_->setEnabled(volumeSlider_->isEnabled());
     }
+    syncPlaybackSeekUi();
     if (fullscreenPlaybackStatusLabel_ != nullptr && playbackStatusLabel_ != nullptr) {
         fullscreenPlaybackStatusLabel_->setText(playbackStatusLabel_->text());
         fullscreenPlaybackStatusLabel_->setToolTip(QString());
