@@ -89,7 +89,6 @@ private:
     QString entryLabel(const TvGuideEntry &entry) const;
     QString entryToolTip(const TvGuideEntry &entry) const;
     bool channelHasVisibleData(const QString &channel) const;
-    bool isEntryScheduled(const QString &channelName, const TvGuideEntry &entry) const;
     int guideSlotPixelWidth() const;
     void scrollGuideToCurrentTime(bool force);
     void rebuildSearchIndex();

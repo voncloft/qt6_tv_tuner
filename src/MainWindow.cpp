@@ -8543,6 +8543,7 @@ bool MainWindow::resolveScheduledSwitchChoices(const QList<TvGuideScheduledSwitc
                 break;
             }
         }
+        const bool hasDisplayedExistingChoice = defaultRow >= 0;
         if (defaultRow < 0) {
             defaultRow = 0;
         }
@@ -8555,10 +8556,10 @@ bool MainWindow::resolveScheduledSwitchChoices(const QList<TvGuideScheduledSwitc
         QPushButton *keepSelectedButton = buttons->button(QDialogButtonBox::Ok);
         QPushButton *cancelButton = buttons->button(QDialogButtonBox::Cancel);
         if (keepSelectedButton != nullptr) {
-            keepSelectedButton->setText("Keep Selected");
+            keepSelectedButton->setText("Tune Selected Now");
         }
         if (cancelButton != nullptr) {
-            cancelButton->setText(relevantExistingIndexSet.isEmpty() ? "Leave Unchanged" : "Keep Existing");
+            cancelButton->setText("Cancel");
         }
         layout->addWidget(buttons);
 
