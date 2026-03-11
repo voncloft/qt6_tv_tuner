@@ -5832,6 +5832,10 @@ void MainWindow::refreshDisplayThemeControls()
 
 void MainWindow::syncConfigGroupBoxHeights()
 {
+    if (configPage_ == nullptr || !configPage_->isVisibleTo(this)) {
+        return;
+    }
+
     const auto releaseHeightConstraint = [](QGroupBox *groupBox) {
         if (groupBox == nullptr) {
             return;
@@ -5845,14 +5849,25 @@ void MainWindow::syncConfigGroupBoxHeights()
         if (groupBox == nullptr) {
             return 0;
         }
-        if (QLayout *layout = groupBox->layout()) {
+        QLayout *layout = groupBox->layout();
+        if (layout != nullptr) {
             layout->activate();
         }
-        int height = std::max(groupBox->minimumSizeHint().height(), groupBox->sizeHint().height());
-        if (const int width = groupBox->width(); width > 0 && groupBox->hasHeightForWidth()) {
-            height = std::max(height, groupBox->heightForWidth(width));
+
+        int contentHeight = 0;
+        if (layout != nullptr) {
+            int contentWidth = 0;
+            if (const int width = groupBox->width(); width > 0) {
+                const QMargins boxMargins = groupBox->contentsMargins();
+                contentWidth = std::max(0, width - boxMargins.left() - boxMargins.right());
+            }
+            contentHeight = contentWidth > 0 && layout->hasHeightForWidth()
+                                ? layout->totalHeightForWidth(contentWidth)
+                                : layout->totalSizeHint().height();
         }
-        return height;
+
+        const int titleHeight = groupBox->fontMetrics().height();
+        return std::max(contentHeight + titleHeight, titleHeight + 8);
     };
 
     const auto syncRow = [&](QGroupBox *left, QGroupBox *right) {
@@ -7960,6 +7975,12 @@ void MainWindow::handleCurrentTabChanged(int index)
 {
     if (tabs_ == nullptr) {
         return;
+    }
+
+    if (tabs_->widget(index) == configPage_) {
+        QTimer::singleShot(0, this, [this]() {
+            syncConfigGroupBoxHeights();
+        });
     }
 
     if (scheduledSwitchListRefreshPending_ && scheduledSwitchesList_ != nullptr
