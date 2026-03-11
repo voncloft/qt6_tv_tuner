@@ -35,6 +35,7 @@ inline constexpr auto StatusText = "statusText";
 inline constexpr auto HeaderBackground = "headerBackground";
 inline constexpr auto HeaderText = "headerText";
 inline constexpr auto HeaderBorder = "headerBorder";
+inline constexpr auto ChannelListGridLine = "channelListGridLine";
 inline constexpr auto Highlight = "highlight";
 inline constexpr auto HighlightText = "highlightText";
 inline constexpr auto Accent = "accent";

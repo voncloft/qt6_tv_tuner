@@ -77,6 +77,7 @@ private slots:
     void handleCurrentTabChanged(int index);
     void handleGuideHideNoEitToggled(bool checked);
     void handleGuideShowFavoritesOnlyToggled(bool checked);
+    void handleGuideShowTodayOnlyListingsToggled(bool checked);
     void handleAutoFavoriteShowSchedulingToggled(bool checked);
     void handleAutoPictureInPictureToggled(bool checked);
     void handleHideStartupSwitchSummaryToggled(bool checked);
@@ -158,6 +159,8 @@ private:
     void setSignalMonitorStatus(const QString &text, const QString &toolTip = QString());
     void setStatusBarStateMessage(const QString &text);
     void showTransientStatusBarMessage(const QString &text, int timeoutMs = 3000);
+    QString channelTableShowText(const QString &channelName) const;
+    void refreshChannelTableShowColumn();
     void updateTvGuideDialogFromCurrentCache(bool showStatusMessage = false);
     QStringList makeArguments() const;
     QString selectedChannelNameFromTable() const;
@@ -214,6 +217,7 @@ private:
     void syncFavoriteShowRatingControls();
     void refreshScheduledSwitchList();
     bool useSchedulesDirectGuideSource() const;
+    bool guideShowTodayOnlyListingsEnabled() const;
     bool refreshGuideWhenCacheRunsOutEnabled() const;
     bool maybeRefreshGuideWhenCacheRunsOut(bool updateDialog);
     void updateSchedulesDirectControls();
@@ -250,6 +254,9 @@ private:
                                            QStringList *unmatchedChannels,
                                            QStringList *skippedChannels,
                                            int *importedEntryCount);
+    QHash<QString, QList<TvGuideEntry>>
+    filterGuideEntriesForConfiguredListingsScope(const QHash<QString, QList<TvGuideEntry>> &entriesByChannel,
+                                                 QDateTime *latestEndUtc = nullptr) const;
     void applyGuideFilterSettings();
     void applyGuideRefreshIntervalSetting();
     bool purgeExpiredGuideCacheFiles(bool clearLoadedState, bool includeSchedulesDirect = false);
@@ -296,6 +303,7 @@ private:
     QSlider *volumeSlider_{};
     QCheckBox *hideNoEitChannelsCheckBox_{};
     QCheckBox *showFavoritesOnlyCheckBox_{};
+    QCheckBox *showTodayOnlyListingsCheckBox_{};
     QCheckBox *obeyScheduledSwitchesCheckBox_{};
     QCheckBox *autoFavoriteShowSchedulingCheckBox_{};
     QCheckBox *favoriteShowRatingsOverrideCheckBox_{};

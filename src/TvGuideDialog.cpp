@@ -379,10 +379,10 @@ QString normalizeFavoriteShowRule(const QString &title)
     return title.simplified().toCaseFolded();
 }
 
-QString formatGuideTimelineLabel(const QDateTime &slotStartUtc, bool spansMultipleDays)
+QString formatGuideTimelineLabel(const QDateTime &slotStartUtc)
 {
     const QDateTime localStart = slotStartUtc.toLocalTime();
-    return spansMultipleDays ? localStart.toString("ddd HH:mm") : localStart.toString("h:mm AP");
+    return localStart.toString("MM/dd ddd hh:mm AP");
 }
 
 QString formatGuideSearchDateTime(const QDateTime &utcDateTime)
@@ -886,19 +886,12 @@ void renderGuideHeaderPixmap(QPixmap &pixmap,
 
     painter.setPen(visualTheme.text);
     painter.setFont(visualTheme.guideHeaderFont);
-    const QDateTime windowEndUtc =
-        windowStartUtc.addSecs(static_cast<qint64>(std::max(slotCount, 0)) * slotMinutes * 60);
-    const bool spansMultipleDays =
-        windowStartUtc.isValid()
-        && windowEndUtc.isValid()
-        && windowStartUtc.toLocalTime().date() != windowEndUtc.toLocalTime().date();
     for (int col = 0; col < slotCount; ++col) {
         const int left = std::lround(static_cast<double>(col) * logicalSize.width() / normalizedSlotCount);
         const int right = std::lround(static_cast<double>(col + 1) * logicalSize.width() / normalizedSlotCount);
         const QRect slotRect(left, 0, std::max(1, right - left), logicalSize.height());
         const QString label =
-            formatGuideTimelineLabel(windowStartUtc.addSecs(static_cast<qint64>(col) * slotMinutes * 60),
-                                     spansMultipleDays);
+            formatGuideTimelineLabel(windowStartUtc.addSecs(static_cast<qint64>(col) * slotMinutes * 60));
         painter.drawText(slotRect.adjusted(6, 0, -6, 0), Qt::AlignHCenter | Qt::AlignVCenter, label);
     }
 }
@@ -1956,7 +1949,7 @@ void TvGuideDialog::setGuideData(const QStringList &channelOrder,
     slotCount_ = slotCount;
     rebuildSearchIndex();
 
-    if (guideView_ == nullptr || guideView_->width() <= 0) {
+    if (guideView_ == nullptr || guideView_->width() <= 0 || !isVisible()) {
         pendingGuideRender_ = true;
         return;
     }

@@ -101,6 +101,7 @@ constexpr auto kLastPlayedChannelLineSetting = "watch/last_played_channel_line";
 constexpr auto kObeyScheduledSwitchesSetting = "tvGuide/obeyScheduledSwitches";
 constexpr auto kHideNoEitChannelsSetting = "tvGuide/hideChannelsWithoutEit";
 constexpr auto kShowFavoritesOnlySetting = "tvGuide/showOnlyFavorites";
+constexpr auto kShowTodayOnlyListingsSetting = "tvGuide/showTodayOnlyListings";
 constexpr auto kAutoFavoriteShowSchedulingSetting = "tvGuide/autoFavoriteShowScheduling";
 constexpr auto kFavoriteShowRulesSetting = "tvGuide/favoriteShowRules";
 constexpr auto kFavoriteShowRatingsSetting = "tvGuide/favoriteShowRatings";
@@ -979,6 +980,7 @@ QString guideDialogPresentationStamp(const QString &cacheStamp,
                                      const QStringList &favorites,
                                      const QHash<QString, int> &favoriteShowRatings,
                                      const QList<TvGuideScheduledSwitch> &scheduledSwitches,
+                                     bool showTodayOnlyListings,
                                      const QString &statusText)
 {
     QCryptographicHash hash(QCryptographicHash::Sha1);
@@ -989,6 +991,7 @@ QString guideDialogPresentationStamp(const QString &cacheStamp,
 
     addPart(cacheStamp.trimmed());
     addPart(statusText.trimmed());
+    addPart(showTodayOnlyListings ? "scope:24h" : "scope:all");
 
     for (const QString &channelName : channelOrder) {
         addPart(QString("channel:%1").arg(channelName));
@@ -2305,7 +2308,6 @@ int guideWindowSlotCount(const QDateTime &windowStartUtc,
                          int slotMinutes)
 {
     constexpr qint64 kMinimumGuideWindowSeconds = 6LL * 60LL * 60LL;
-    constexpr int kMaximumGuideWindowSlots = 32;
     if (!windowStartUtc.isValid() || slotMinutes <= 0) {
         return 12;
     }
@@ -2319,7 +2321,7 @@ int guideWindowSlotCount(const QDateTime &windowStartUtc,
 
     int slotCount = static_cast<int>(std::ceil(static_cast<double>(requestedWindowSeconds)
                                                / (slotMinutes * 60.0)));
-    return std::clamp(slotCount, 12, kMaximumGuideWindowSlots);
+    return std::max(slotCount, 12);
 }
 
 QJsonObject guideEntryToJson(const TvGuideEntry &entry)
@@ -2891,6 +2893,11 @@ constexpr int kGuideCapturePacketCount = 60000;
 constexpr int kGuideCachePollIntervalMs = 5000;
 constexpr int kVideoOnlyAudioRecoveryDelayMs = 12000;
 constexpr int kRecoveryAudioUnmuteStabilityMs = 2500;
+constexpr int kChannelTableNumberColumn = 0;
+constexpr int kChannelTableNameColumn = 1;
+constexpr int kChannelTableShowColumn = 2;
+constexpr int kChannelTableRawLineColumn = 3;
+constexpr auto kChannelTableNoShowText = "NO EIT DATA";
 
 quint8 byteAt(const QByteArray &data, int index)
 {
@@ -4007,6 +4014,10 @@ MainWindow::MainWindow(QWidget *parent)
         const QSignalBlocker blocker(showFavoritesOnlyCheckBox_);
         showFavoritesOnlyCheckBox_->setChecked(settings.value(kShowFavoritesOnlySetting, false).toBool());
     }
+    if (showTodayOnlyListingsCheckBox_ != nullptr) {
+        const QSignalBlocker blocker(showTodayOnlyListingsCheckBox_);
+        showTodayOnlyListingsCheckBox_->setChecked(settings.value(kShowTodayOnlyListingsSetting, false).toBool());
+    }
     if (obeyScheduledSwitchesCheckBox_ != nullptr) {
         const QSignalBlocker blocker(obeyScheduledSwitchesCheckBox_);
         obeyScheduledSwitchesCheckBox_->setChecked(obeyScheduledSwitches_);
@@ -4221,6 +4232,7 @@ MainWindow::MainWindow(QWidget *parent)
     connect(guideCachePollTimer_, &QTimer::timeout, this, [this]() {
         const bool guideDialogVisible = tvGuideDialog_ != nullptr && tvGuideDialog_->isVisible();
         const bool refreshedBecauseCacheRanOut = maybeRefreshGuideWhenCacheRunsOut(guideDialogVisible);
+        refreshChannelTableShowColumn();
         if (!guideDialogVisible || refreshedBecauseCacheRanOut) {
             return;
         }
@@ -4776,6 +4788,8 @@ void MainWindow::buildUi()
         new QCheckBox("Use Schedules Direct OTA data for guide refreshes", configGuideOptionsGroup_);
     hideNoEitChannelsCheckBox_ = new QCheckBox("Hide channels without EIT data", configGuideOptionsGroup_);
     showFavoritesOnlyCheckBox_ = new QCheckBox("Show only favorites in TV Guide", configGuideOptionsGroup_);
+    showTodayOnlyListingsCheckBox_ =
+        new QCheckBox("Only show the next 24 hours from guide JSON", configGuideOptionsGroup_);
     obeyScheduledSwitchesCheckBox_ = new QCheckBox("Obey scheduled tuner switches", configGuideOptionsGroup_);
     autoFavoriteShowSchedulingCheckBox_ =
         new QCheckBox("Automatically schedule favorite show matches", configGuideOptionsGroup_);
@@ -4784,6 +4798,7 @@ void MainWindow::buildUi()
     guideOptionsLayout->addWidget(useSchedulesDirectGuideCheckBox_);
     guideOptionsLayout->addWidget(hideNoEitChannelsCheckBox_);
     guideOptionsLayout->addWidget(showFavoritesOnlyCheckBox_);
+    guideOptionsLayout->addWidget(showTodayOnlyListingsCheckBox_);
     guideOptionsLayout->addWidget(obeyScheduledSwitchesCheckBox_);
     guideOptionsLayout->addWidget(favoriteShowRatingsOverrideCheckBox_);
     guideOptionsLayout->addWidget(autoFavoriteShowSchedulingCheckBox_);
@@ -5137,13 +5152,15 @@ void MainWindow::buildUi()
     videoDetachedPlaceholderLabel_->hide();
 
     channelsTable_ = new QTableWidget(contentSplitter_);
-    channelsTable_->setColumnCount(3);
-    channelsTable_->setHorizontalHeaderLabels({"Number", "Channel", "Raw line"});
-    channelsTable_->horizontalHeader()->setSectionResizeMode(0, QHeaderView::ResizeToContents);
-    channelsTable_->horizontalHeader()->setSectionResizeMode(1, QHeaderView::Stretch);
-    channelsTable_->setColumnHidden(2, true);
+    channelsTable_->setObjectName("channelListingTable");
+    channelsTable_->setColumnCount(4);
+    channelsTable_->setHorizontalHeaderLabels({"Channel Number", "Channel", "TV Show", "Raw line"});
+    channelsTable_->horizontalHeader()->setSectionResizeMode(kChannelTableNumberColumn, QHeaderView::ResizeToContents);
+    channelsTable_->horizontalHeader()->setSectionResizeMode(kChannelTableNameColumn, QHeaderView::Stretch);
+    channelsTable_->horizontalHeader()->setSectionResizeMode(kChannelTableShowColumn, QHeaderView::Stretch);
+    channelsTable_->setColumnHidden(kChannelTableRawLineColumn, true);
     channelsTable_->setAlternatingRowColors(true);
-    channelsTable_->setShowGrid(false);
+    channelsTable_->setShowGrid(true);
     channelsTable_->verticalHeader()->setVisible(false);
     channelsTable_->setSelectionBehavior(QAbstractItemView::SelectRows);
     channelsTable_->setSelectionMode(QAbstractItemView::SingleSelection);
@@ -5457,6 +5474,10 @@ void MainWindow::buildUi()
     connect(tabs_, &QTabWidget::currentChanged, this, &MainWindow::handleCurrentTabChanged);
     connect(hideNoEitChannelsCheckBox_, &QCheckBox::toggled, this, &MainWindow::handleGuideHideNoEitToggled);
     connect(showFavoritesOnlyCheckBox_, &QCheckBox::toggled, this, &MainWindow::handleGuideShowFavoritesOnlyToggled);
+    connect(showTodayOnlyListingsCheckBox_,
+            &QCheckBox::toggled,
+            this,
+            &MainWindow::handleGuideShowTodayOnlyListingsToggled);
     connect(obeyScheduledSwitchesCheckBox_, &QCheckBox::toggled, this, &MainWindow::handleObeyScheduledSwitchesChanged);
     connect(autoFavoriteShowSchedulingCheckBox_,
             &QCheckBox::toggled,
@@ -5885,6 +5906,7 @@ void MainWindow::applyDisplayTheme(bool persistCurrentTheme)
             "QScrollArea, QScrollArea > QWidget > QWidget { background-color: %1; }"
             "QLineEdit, QComboBox, QListWidget, QPlainTextEdit, QTableWidget, QSpinBox, QFontComboBox {"
             " background-color: %9; color: %10; border: 1px solid %11; selection-background-color: %12; selection-color: %13; }"
+            "QTableWidget#channelListingTable { gridline-color: %22; }"
             "QHeaderView::section { background-color: %14; color: %15; border: 1px solid %16; padding: 4px; }"
             "QLabel { color: %17; }"
             "QToolTip { background-color: %1; color: %2; border: 1px solid %3; }")
@@ -5908,7 +5930,8 @@ void MainWindow::applyDisplayTheme(bool persistCurrentTheme)
                  checkBoxFontCss,
                  color(DisplayThemeKeys::CheckBoxIndicatorBackground),
                  color(DisplayThemeKeys::CheckBoxIndicatorBorder),
-                 color(DisplayThemeKeys::CheckBoxIndicatorChecked));
+                 color(DisplayThemeKeys::CheckBoxIndicatorChecked),
+                 color(DisplayThemeKeys::ChannelListGridLine));
 
     if (tabs_ != nullptr) {
         tabs_->setStyleSheet(
@@ -6269,6 +6292,19 @@ void MainWindow::handleGuideShowFavoritesOnlyToggled(bool checked)
     applyGuideFilterSettings();
 }
 
+void MainWindow::handleGuideShowTodayOnlyListingsToggled(bool checked)
+{
+    QSettings settings("tv_tuner_gui", "watcher");
+    settings.setValue(kShowTodayOnlyListingsSetting, checked);
+    if (!loadGuideCacheFile()) {
+        appendLog(QString("guide: %1 listings scope requested, but guide cache reload failed.")
+                      .arg(checked ? "next-24-hours" : "full"));
+    }
+    applyCurrentShowStatusFromGuideCache();
+    updateTvGuideDialogFromCurrentCache(false);
+    refreshChannelTableShowColumn();
+}
+
 void MainWindow::handleAutoFavoriteShowSchedulingToggled(bool checked)
 {
     autoFavoriteShowSchedulingEnabled_ = checked;
@@ -6373,6 +6409,15 @@ bool MainWindow::useSchedulesDirectGuideSource() const
     }
     QSettings settings("tv_tuner_gui", "watcher");
     return settings.value(kUseSchedulesDirectGuideSetting, false).toBool();
+}
+
+bool MainWindow::guideShowTodayOnlyListingsEnabled() const
+{
+    if (showTodayOnlyListingsCheckBox_ != nullptr) {
+        return showTodayOnlyListingsCheckBox_->isChecked();
+    }
+    QSettings settings("tv_tuner_gui", "watcher");
+    return settings.value(kShowTodayOnlyListingsSetting, false).toBool();
 }
 
 bool MainWindow::refreshGuideWhenCacheRunsOutEnabled() const
@@ -7411,6 +7456,47 @@ bool MainWindow::applySchedulesDirectGuideFallback(QHash<QString, QList<TvGuideE
     return matchedChannels > 0;
 }
 
+QHash<QString, QList<TvGuideEntry>>
+MainWindow::filterGuideEntriesForConfiguredListingsScope(
+    const QHash<QString, QList<TvGuideEntry>> &entriesByChannel,
+    QDateTime *latestEndUtc) const
+{
+    if (latestEndUtc != nullptr) {
+        *latestEndUtc = QDateTime();
+    }
+
+    if (!guideShowTodayOnlyListingsEnabled()) {
+        if (latestEndUtc != nullptr) {
+            *latestEndUtc = latestGuideEntryEndUtc(entriesByChannel);
+        }
+        return entriesByChannel;
+    }
+
+    const QDateTime nowUtc = QDateTime::currentDateTimeUtc();
+    const QDateTime horizonUtc = nowUtc.addSecs(24 * 60 * 60);
+    QHash<QString, QList<TvGuideEntry>> filteredEntriesByChannel;
+    filteredEntriesByChannel.reserve(entriesByChannel.size());
+    for (auto it = entriesByChannel.cbegin(); it != entriesByChannel.cend(); ++it) {
+        QList<TvGuideEntry> filteredEntries;
+        filteredEntries.reserve(it.value().size());
+        for (const TvGuideEntry &entry : it.value()) {
+            if (!entry.startUtc.isValid() || !entry.endUtc.isValid() || entry.endUtc <= entry.startUtc) {
+                continue;
+            }
+            if (entry.endUtc > nowUtc && entry.startUtc < horizonUtc) {
+                filteredEntries.append(entry);
+                const QDateTime clampedDisplayEnd = std::min(entry.endUtc, horizonUtc);
+                if (latestEndUtc != nullptr && (!latestEndUtc->isValid() || clampedDisplayEnd > *latestEndUtc)) {
+                    *latestEndUtc = clampedDisplayEnd;
+                }
+            }
+        }
+        filteredEntriesByChannel.insert(it.key(), filteredEntries);
+    }
+
+    return filteredEntriesByChannel;
+}
+
 void MainWindow::applyGuideFilterSettings()
 {
     if (tvGuideDialog_ == nullptr) {
@@ -7456,6 +7542,7 @@ void MainWindow::clearLoadedGuideCache()
     // guide stamp does not re-prompt the user for the same overlap.
     showTransientStatusBarMessage("Guide cache expired and was removed.", 4000);
     noAutoCurrentShowLookupChannels_.clear();
+    refreshChannelTableShowColumn();
 }
 
 void MainWindow::loadFavoriteShowRules()
@@ -9518,9 +9605,10 @@ void MainWindow::parseAndStoreLine(const QString &line)
 
     const int row = channelsTable_->rowCount();
     channelsTable_->insertRow(row);
-    channelsTable_->setItem(row, 0, new QTableWidgetItem(channelNumber));
-    channelsTable_->setItem(row, 1, new QTableWidgetItem(displayLabel));
-    channelsTable_->setItem(row, 2, new QTableWidgetItem(normalizedLine));
+    channelsTable_->setItem(row, kChannelTableNumberColumn, new QTableWidgetItem(channelNumber));
+    channelsTable_->setItem(row, kChannelTableNameColumn, new QTableWidgetItem(displayLabel));
+    channelsTable_->setItem(row, kChannelTableShowColumn, new QTableWidgetItem(channelTableShowText(displayLabel)));
+    channelsTable_->setItem(row, kChannelTableRawLineColumn, new QTableWidgetItem(normalizedLine));
 
     xspfProgramByChannel_.insert(channelName, parts[5].trimmed());
     if (displayLabel != channelName) {
@@ -9567,6 +9655,84 @@ bool MainWindow::persistChannelsFile()
     return true;
 }
 
+QString MainWindow::channelTableShowText(const QString &channelName) const
+{
+    const QString trimmedChannelName = normalizeDisplayedChannelLabel(channelName);
+    if (trimmedChannelName.isEmpty()) {
+        return kChannelTableNoShowText;
+    }
+
+    QList<TvGuideEntry> entries = guideEntriesCache_.value(trimmedChannelName);
+    if (entries.isEmpty()) {
+        for (auto it = guideEntriesCache_.cbegin(); it != guideEntriesCache_.cend(); ++it) {
+            if (channelDisplayLabelsEqual(it.key(), trimmedChannelName)) {
+                entries = it.value();
+                break;
+            }
+        }
+    }
+    if (entries.isEmpty()) {
+        return kChannelTableNoShowText;
+    }
+
+    const QDateTime nowUtc = QDateTime::currentDateTimeUtc();
+    TvGuideEntry currentEntry;
+    bool foundCurrent = false;
+    for (const TvGuideEntry &entry : entries) {
+        if (!entry.startUtc.isValid() || !entry.endUtc.isValid() || entry.endUtc <= entry.startUtc) {
+            continue;
+        }
+        if (entry.startUtc <= nowUtc && nowUtc < entry.endUtc) {
+            if (!foundCurrent || entry.startUtc > currentEntry.startUtc) {
+                currentEntry = entry;
+                foundCurrent = true;
+            }
+        }
+    }
+    if (!foundCurrent) {
+        return kChannelTableNoShowText;
+    }
+
+    const GuideEntryDisplayParts parts = displayPartsForGuideEntry(currentEntry);
+    const QString title = parts.title.simplified();
+    return title.isEmpty() ? kChannelTableNoShowText : title;
+}
+
+void MainWindow::refreshChannelTableShowColumn()
+{
+    if (channelsTable_ == nullptr) {
+        return;
+    }
+
+    const bool sortingEnabled = channelsTable_->isSortingEnabled();
+    const int sortColumn = channelsTable_->horizontalHeader()->sortIndicatorSection();
+    const Qt::SortOrder sortOrder = channelsTable_->horizontalHeader()->sortIndicatorOrder();
+    if (sortingEnabled) {
+        channelsTable_->setSortingEnabled(false);
+    }
+
+    for (int row = 0; row < channelsTable_->rowCount(); ++row) {
+        const QTableWidgetItem *channelItem = channelsTable_->item(row, kChannelTableNameColumn);
+        if (channelItem == nullptr) {
+            continue;
+        }
+
+        const QString showText = channelTableShowText(channelItem->text());
+        QTableWidgetItem *showItem = channelsTable_->item(row, kChannelTableShowColumn);
+        if (showItem == nullptr) {
+            showItem = new QTableWidgetItem(showText);
+            channelsTable_->setItem(row, kChannelTableShowColumn, showItem);
+        } else if (showItem->text() != showText) {
+            showItem->setText(showText);
+        }
+    }
+
+    if (sortingEnabled) {
+        channelsTable_->setSortingEnabled(true);
+        channelsTable_->sortItems(sortColumn >= 0 ? sortColumn : kChannelTableNumberColumn, sortOrder);
+    }
+}
+
 QString MainWindow::selectedChannelNameFromTable() const
 {
     const auto rows = channelsTable_->selectionModel()->selectedRows();
@@ -9574,7 +9740,7 @@ QString MainWindow::selectedChannelNameFromTable() const
         return {};
     }
     const int row = rows.first().row();
-    const auto *item = channelsTable_->item(row, 1);
+    const auto *item = channelsTable_->item(row, kChannelTableNameColumn);
     if (item == nullptr) {
         return {};
     }
@@ -9588,7 +9754,7 @@ QString MainWindow::selectedChannelLineFromTable() const
         return {};
     }
     const int row = rows.first().row();
-    const auto *item = channelsTable_->item(row, 2);
+    const auto *item = channelsTable_->item(row, kChannelTableRawLineColumn);
     if (item == nullptr) {
         return {};
     }
@@ -9638,13 +9804,13 @@ bool MainWindow::highlightChannelInTable(const QString &channelName)
     }
 
     for (int row = 0; row < channelsTable_->rowCount(); ++row) {
-        QTableWidgetItem *channelItem = channelsTable_->item(row, 1);
+        QTableWidgetItem *channelItem = channelsTable_->item(row, kChannelTableNameColumn);
         if (channelItem == nullptr || channelItem->text().trimmed() != channelName.trimmed()) {
             continue;
         }
 
         channelsTable_->selectRow(row);
-        channelsTable_->setCurrentCell(row, 1);
+        channelsTable_->setCurrentCell(row, kChannelTableNameColumn);
         channelsTable_->scrollToItem(channelItem, QAbstractItemView::PositionAtCenter);
         return true;
     }
@@ -9660,13 +9826,13 @@ bool MainWindow::highlightChannelLineInTable(const QString &channelLine)
 
     const QString normalizedChannelLine = normalizeZapLine(channelLine).trimmed();
     for (int row = 0; row < channelsTable_->rowCount(); ++row) {
-        QTableWidgetItem *rawLineItem = channelsTable_->item(row, 2);
+        QTableWidgetItem *rawLineItem = channelsTable_->item(row, kChannelTableRawLineColumn);
         if (rawLineItem == nullptr || normalizeZapLine(rawLineItem->text()).trimmed() != normalizedChannelLine) {
             continue;
         }
 
         channelsTable_->selectRow(row);
-        channelsTable_->setCurrentCell(row, 1);
+        channelsTable_->setCurrentCell(row, kChannelTableNameColumn);
         channelsTable_->scrollToItem(rawLineItem, QAbstractItemView::PositionAtCenter);
         return true;
     }
@@ -10177,21 +10343,31 @@ bool MainWindow::refreshGuideData(bool interactive, bool updateDialog)
         statusText = liveStatus + "\n" + statusText;
     }
 
+    QDateTime displayedLatestEndUtc;
+    const QHash<QString, QList<TvGuideEntry>> displayedEntriesByChannel =
+        filterGuideEntriesForConfiguredListingsScope(entriesByChannel, &displayedLatestEndUtc);
     lastGuideChannelOrder_ = channelOrder;
     lastGuideWindowStartUtc_ = windowStartUtc;
     lastGuideSlotMinutes_ = slotMinutes;
-    lastGuideSlotCount_ = slotCount;
+    lastGuideSlotCount_ = guideWindowSlotCount(lastGuideWindowStartUtc_, displayedLatestEndUtc, lastGuideSlotMinutes_);
     lastGuideStatusText_ = statusText;
-    guideEntriesCache_ = entriesByChannel;
+    guideEntriesCache_ = displayedEntriesByChannel;
+    for (const QString &channelName : channelOrder) {
+        if (guideEntriesCache_.value(channelName).isEmpty()) {
+            noAutoCurrentShowLookupChannels_.insert(channelName);
+        } else {
+            noAutoCurrentShowLookupChannels_.remove(channelName);
+        }
+    }
     if (!writeGuideCacheFile(channelOrder, entriesByChannel, windowStartUtc, slotMinutes, slotCount, statusText)) {
         appendLog("guide: failed to write guide cache file.");
     } else if (!loadGuideCacheFile()) {
         appendLog("guide: failed to reload guide cache file after refresh; using in-memory cache.");
-        guideEntriesCache_ = entriesByChannel;
+        guideEntriesCache_ = displayedEntriesByChannel;
         lastGuideChannelOrder_ = channelOrder;
         lastGuideWindowStartUtc_ = windowStartUtc;
         lastGuideSlotMinutes_ = slotMinutes;
-        lastGuideSlotCount_ = slotCount;
+        lastGuideSlotCount_ = guideWindowSlotCount(lastGuideWindowStartUtc_, displayedLatestEndUtc, lastGuideSlotMinutes_);
         lastGuideStatusText_ = statusText;
     }
 
@@ -10454,21 +10630,31 @@ bool MainWindow::refreshGuideDataFromSchedulesDirect(bool interactive, bool upda
         statusText = "Using cached Schedules Direct JSON.\n" + statusText;
     }
 
+    QDateTime displayedLatestEndUtc;
+    const QHash<QString, QList<TvGuideEntry>> displayedEntriesByChannel =
+        filterGuideEntriesForConfiguredListingsScope(entriesByChannel, &displayedLatestEndUtc);
     lastGuideChannelOrder_ = channelOrder;
     lastGuideWindowStartUtc_ = windowStartUtc;
     lastGuideSlotMinutes_ = slotMinutes;
-    lastGuideSlotCount_ = slotCount;
+    lastGuideSlotCount_ = guideWindowSlotCount(lastGuideWindowStartUtc_, displayedLatestEndUtc, lastGuideSlotMinutes_);
     lastGuideStatusText_ = statusText;
-    guideEntriesCache_ = entriesByChannel;
+    guideEntriesCache_ = displayedEntriesByChannel;
+    for (const QString &channelName : channelOrder) {
+        if (guideEntriesCache_.value(channelName).isEmpty()) {
+            noAutoCurrentShowLookupChannels_.insert(channelName);
+        } else {
+            noAutoCurrentShowLookupChannels_.remove(channelName);
+        }
+    }
     if (!writeGuideCacheFile(channelOrder, entriesByChannel, windowStartUtc, slotMinutes, slotCount, statusText)) {
         appendLog("guide-sd: failed to write guide cache file.");
     } else if (!loadGuideCacheFile()) {
         appendLog("guide-sd: failed to reload guide cache file after refresh; using in-memory cache.");
-        guideEntriesCache_ = entriesByChannel;
+        guideEntriesCache_ = displayedEntriesByChannel;
         lastGuideChannelOrder_ = channelOrder;
         lastGuideWindowStartUtc_ = windowStartUtc;
         lastGuideSlotMinutes_ = slotMinutes;
-        lastGuideSlotCount_ = slotCount;
+        lastGuideSlotCount_ = guideWindowSlotCount(lastGuideWindowStartUtc_, displayedLatestEndUtc, lastGuideSlotMinutes_);
         lastGuideStatusText_ = statusText;
     }
 
@@ -10538,14 +10724,13 @@ bool MainWindow::loadGuideCacheFile()
         loadedEntries.insert(normalizeDisplayedChannelLabel(it.key()), cleaned);
     }
 
-    guideEntriesCache_ = loadedEntries;
+    QDateTime filteredLatestEndUtc;
+    guideEntriesCache_ = filterGuideEntriesForConfiguredListingsScope(loadedEntries, &filteredLatestEndUtc);
     lastGuideChannelOrder_ = storedChannelOrder;
     lastGuideCacheGeneratedUtc_ = root.value("generatedUtc").toString().trimmed();
     lastGuideSlotMinutes_ = std::clamp(root.value("slotMinutes").toInt(30), 15, 120);
     lastGuideWindowStartUtc_ = alignedGuideWindowStartUtc(nowUtc);
-    lastGuideSlotCount_ = guideWindowSlotCount(lastGuideWindowStartUtc_,
-                                               latestGuideEntryEndUtc(guideEntriesCache_),
-                                               lastGuideSlotMinutes_);
+    lastGuideSlotCount_ = guideWindowSlotCount(lastGuideWindowStartUtc_, filteredLatestEndUtc, lastGuideSlotMinutes_);
     lastGuideStatusText_ = root.value("statusText").toString().trimmed();
     if (guideCacheHasEntriesForNow(guideEntriesCache_, nowUtc)) {
         guideCacheRunoutRefreshRetryUtc_ = QDateTime();
@@ -10580,6 +10765,7 @@ bool MainWindow::loadGuideCacheFile()
                                                                    : "Guide cache updated in background",
                                      4000);
     }
+    refreshChannelTableShowColumn();
     return true;
 }
 
@@ -11772,6 +11958,7 @@ void MainWindow::updateTvGuideDialogFromCurrentCache(bool showStatusMessage)
                                                                    favorites_,
                                                                    favoriteShowRatings_,
                                                                    scheduledSwitches_,
+                                                                   guideShowTodayOnlyListingsEnabled(),
                                                                    statusText);
 
     if (presentationStamp != lastGuideDialogPresentationStamp_) {
