@@ -8284,8 +8284,8 @@ void MainWindow::processScheduledSwitches()
                                                             "runtime schedule:",
                                                             !favoriteShowRatingsOverrideEnabled_);
         if (!resolved) {
-            appendLog("schedule: runtime conflict left unresolved after airtime; removing due switches.");
-            showTransientStatusBarMessage("Runtime schedule conflict expired without a choice", 4000);
+            appendLog("schedule: runtime conflict canceled; keeping current playback and pruning due switches.");
+            showTransientStatusBarMessage("Runtime schedule conflict canceled; due switches removed", 4000);
             removeDueSwitches(activeSwitches);
             refreshScheduledSwitchTimer();
             return;
@@ -8585,7 +8585,8 @@ bool MainWindow::resolveScheduledSwitchChoices(const QList<TvGuideScheduledSwitc
 
         if (execModalDialog(&dialog, "Schedule conflict") != QDialog::Accepted
             || choicesList->currentRow() < 0) {
-            appendLog(QString("%1 left overlapping scheduled shows unchanged.").arg(sourceDescription));
+            appendLog(QString("%1 conflict dialog canceled; no tune will occur and due switches will be pruned.")
+                          .arg(sourceDescription));
             return false;
         }
 
