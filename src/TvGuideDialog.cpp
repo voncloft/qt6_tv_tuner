@@ -32,6 +32,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 
 namespace {
 
@@ -900,23 +901,6 @@ void renderGuideHeaderPixmap(QPixmap &pixmap,
                                      spansMultipleDays);
         painter.drawText(slotRect.adjusted(6, 0, -6, 0), Qt::AlignHCenter | Qt::AlignVCenter, label);
     }
-
-    const qint64 totalSeconds = static_cast<qint64>(slotMinutes) * slotCount * 60;
-    if (totalSeconds <= 0) {
-        return;
-    }
-
-    const qint64 nowOffset = windowStartUtc.secsTo(QDateTime::currentDateTimeUtc());
-    if (nowOffset < 0 || nowOffset > totalSeconds) {
-        return;
-    }
-
-    const int nowX =
-        std::clamp(static_cast<int>(std::llround(static_cast<double>(nowOffset) * logicalSize.width() / totalSeconds)),
-                   0,
-                   logicalSize.width() - 1);
-    painter.setPen(QPen(visualTheme.nowLine, 2));
-    painter.drawLine(nowX, 0, nowX, logicalSize.height());
 }
 
 void renderGuideRowPixmap(GuidePreparedRow &row,
@@ -1061,17 +1045,6 @@ void renderGuideRowPixmap(GuidePreparedRow &row,
         painter.setPen(visualTheme.emptyText);
         painter.drawText(QRect(QPoint(0, 0), logicalSize).adjusted(10, 0, -10, 0), Qt::AlignCenter, "NO GUIDE DATA");
     }
-
-    const qint64 nowOffset = windowStartUtc.secsTo(QDateTime::currentDateTimeUtc());
-    if (nowOffset >= 0 && nowOffset <= totalSeconds) {
-        const int nowX =
-            std::clamp(static_cast<int>(std::llround(static_cast<double>(nowOffset) * totalTimelineWidth / totalSeconds))
-                           - horizontalOffset,
-                       0,
-                       logicalSize.width() - 1);
-        painter.setPen(QPen(visualTheme.nowLine, 2));
-        painter.drawLine(nowX, 0, nowX, logicalSize.height());
-    }
 }
 
 class GuideCanvasWidget final : public QAbstractScrollArea
@@ -1088,6 +1061,11 @@ public:
         connect(&prewarmTimer_, &QTimer::timeout, this, [this]() {
             prewarmNextBatch();
         });
+        nowLineTimer_.setInterval(100);
+        connect(&nowLineTimer_, &QTimer::timeout, this, [this]() {
+            tickNowLine();
+        });
+        nowLineTimer_.start();
     }
 
     void setGuideData(const QStringList &visibleChannels,
@@ -1119,6 +1097,7 @@ public:
         toggleSchedule_ = std::move(toggleSchedule);
         watchNow_ = std::move(watchNow);
         headerPixmap_ = QPixmap();
+        resetNowLineTracking();
         rebuildLayout(true);
     }
 
@@ -1174,10 +1153,10 @@ public:
 protected:
     void paintEvent(QPaintEvent *event) override
     {
-        Q_UNUSED(event);
-
+        const QRect dirtyRect = event != nullptr ? event->rect() : viewport()->rect();
         QPainter painter(viewport());
-        painter.fillRect(viewport()->rect(), visualTheme_.background);
+        painter.setClipRect(dirtyRect);
+        painter.fillRect(dirtyRect, visualTheme_.background);
 
         const QRect cornerRect(0, 0, std::min(kGuideChannelLabelWidth, viewport()->width()), kGuideHeaderHeight);
         painter.setPen(QPen(visualTheme_.border, kGuideGridLineWidth));
@@ -1223,6 +1202,7 @@ protected:
                                  Qt::AlignCenter,
                                  "No channels matched the current guide filter.");
             }
+            drawNowLineOverlay(painter);
             return;
         }
 
@@ -1274,6 +1254,7 @@ protected:
                                QRect(0, 0, timelineViewportWidth, row.rowHeight));
         }
         painter.restore();
+        drawNowLineOverlay(painter);
     }
 
     void resizeEvent(QResizeEvent *event) override
@@ -1333,14 +1314,93 @@ protected:
         if (dx != 0) {
             schedulePrewarm(true);
         }
+        lastNowLineViewportX_ = currentNowLineViewportX();
         viewport()->update();
     }
 
 private:
+    static constexpr int kNoNowLineViewportX = std::numeric_limits<int>::min();
+
     struct HitTestResult {
         const GuidePreparedRow *row{nullptr};
         const GuideEntryActionTarget *target{nullptr};
     };
+
+    int currentNowLineViewportX() const
+    {
+        if (viewport() == nullptr || !windowStartUtc_.isValid() || slotMinutes_ <= 0 || slotCount_ <= 0
+            || timelineWidth_ <= 0 || visibleTimelineWidth() <= 0) {
+            return kNoNowLineViewportX;
+        }
+
+        const qint64 totalMs = static_cast<qint64>(slotMinutes_) * slotCount_ * 60 * 1000;
+        if (totalMs <= 0) {
+            return kNoNowLineViewportX;
+        }
+
+        const qint64 nowOffsetMs = windowStartUtc_.msecsTo(QDateTime::currentDateTimeUtc());
+        if (nowOffsetMs < 0 || nowOffsetMs > totalMs) {
+            return kNoNowLineViewportX;
+        }
+
+        const int timelineNowX =
+            std::clamp(static_cast<int>(std::llround(static_cast<double>(nowOffsetMs) * timelineWidth_ / totalMs))
+                           - horizontalScrollBar()->value(),
+                       0,
+                       std::max(0, visibleTimelineWidth() - 1));
+        return kGuideChannelLabelWidth + timelineNowX;
+    }
+
+    void updateNowLineRegion(int viewportX)
+    {
+        if (viewport() == nullptr || viewportX == kNoNowLineViewportX) {
+            return;
+        }
+
+        const QRect dirtyRect =
+            QRect(viewportX - 4, 0, 8, viewport()->height()).intersected(viewport()->rect());
+        if (!dirtyRect.isEmpty()) {
+            viewport()->update(dirtyRect);
+        }
+    }
+
+    void resetNowLineTracking()
+    {
+        lastNowLineViewportX_ = kNoNowLineViewportX;
+    }
+
+    void tickNowLine()
+    {
+        if (viewport() == nullptr) {
+            return;
+        }
+
+        const int nowLineViewportX = currentNowLineViewportX();
+        if (!isVisible()) {
+            lastNowLineViewportX_ = nowLineViewportX;
+            return;
+        }
+        if (nowLineViewportX == lastNowLineViewportX_) {
+            return;
+        }
+
+        updateNowLineRegion(lastNowLineViewportX_);
+        lastNowLineViewportX_ = nowLineViewportX;
+        updateNowLineRegion(lastNowLineViewportX_);
+    }
+
+    void drawNowLineOverlay(QPainter &painter)
+    {
+        const int nowLineViewportX = currentNowLineViewportX();
+        lastNowLineViewportX_ = nowLineViewportX;
+        if (nowLineViewportX == kNoNowLineViewportX) {
+            return;
+        }
+
+        painter.setPen(QPen(visualTheme_.nowLine, 2));
+        painter.drawLine(QPointF(nowLineViewportX + 0.5, 0.0),
+                         QPointF(nowLineViewportX + 0.5, viewport()->height()));
+    }
 
     void schedulePrewarm(bool reset)
     {
@@ -1427,6 +1487,7 @@ private:
     {
         headerPixmap_ = QPixmap();
         prewarmRowIndex_ = 0;
+        resetNowLineTracking();
         for (GuidePreparedRow &row : rows_) {
             row.timelinePixmap = QPixmap();
             row.actionTargets.clear();
@@ -1495,6 +1556,7 @@ private:
             verticalScrollBar()->setValue(0);
         }
 
+        lastNowLineViewportX_ = currentNowLineViewportX();
         schedulePrewarm(true);
         viewport()->update();
     }
@@ -1564,7 +1626,9 @@ private:
     std::function<void(const QString &, const TvGuideEntry &, bool)> toggleSchedule_;
     std::function<void(const QString &, const TvGuideEntry &)> watchNow_;
     QTimer prewarmTimer_;
+    QTimer nowLineTimer_;
     int prewarmRowIndex_{0};
+    int lastNowLineViewportX_{kNoNowLineViewportX};
 };
 
 }
@@ -1892,7 +1956,7 @@ void TvGuideDialog::setGuideData(const QStringList &channelOrder,
     slotCount_ = slotCount;
     rebuildSearchIndex();
 
-    if (guideView_ == nullptr) {
+    if (guideView_ == nullptr || guideView_->width() <= 0) {
         pendingGuideRender_ = true;
         return;
     }

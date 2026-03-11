@@ -8225,7 +8225,6 @@ void MainWindow::processScheduledSwitches()
         }
         activeSwitches.append(scheduledSwitch);
     }
-
     if (activeSwitches.isEmpty()) {
         refreshScheduledSwitchTimer();
         return;
