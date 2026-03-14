@@ -162,6 +162,13 @@ cmake --build build -j
 ./build/tv_tuner_gui
 ```
 
+## Taskbar Pinning
+
+- CMake now generates a launcher at `build/tv_tuner_gui.desktop` that points at the current build output and sets `StartupWMClass=tv_tuner_gui`.
+- On Plasma or other Linux desktop shells, install that launcher to `~/.local/share/applications/` and start the app from the launcher before pinning it to the taskbar.
+- For a normal local install, configure with `cmake -S . -B build -DCMAKE_INSTALL_PREFIX="$HOME/.local"` and then run `cmake --build build -j && cmake --install build`.
+- The installed launcher is exported as `tv_tuner_gui.desktop`, and the app advertises the matching desktop file name through Qt at startup.
+
 ## Stored Data
 
 - `channels.conf`, guide cache JSON, scheduled-switch JSON, Schedules Direct export JSON, and channel hints are stored under the app-data location returned by `QStandardPaths::AppDataLocation`.

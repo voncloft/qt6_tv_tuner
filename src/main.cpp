@@ -91,6 +91,9 @@ int main(int argc, char *argv[])
         "qt.qpa.*=true\n"));
 
     QCoreApplication::setAttribute(Qt::AA_UseSoftwareOpenGL);
+    QCoreApplication::setApplicationName(QStringLiteral("tv_tuner_gui"));
+    QGuiApplication::setApplicationDisplayName(QStringLiteral("Voncloft TV Tuner"));
+    QGuiApplication::setDesktopFileName(QStringLiteral("tv_tuner_gui"));
     QApplication app(argc, argv);
     const QIcon appIcon(":/assets/tv-icon.svg");
     app.setWindowIcon(appIcon);

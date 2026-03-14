@@ -1,0 +1,12 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Voncloft TV Tuner
+GenericName=TV Tuner
+Comment=Watch and manage live TV channels
+Exec=@TV_TUNER_GUI_EXEC@
+Icon=@TV_TUNER_GUI_ICON@
+Terminal=false
+Categories=AudioVideo;Video;TV;
+StartupNotify=false
+StartupWMClass=tv_tuner_gui
