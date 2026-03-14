@@ -4532,8 +4532,10 @@ MainWindow::MainWindow(QWidget *parent)
     QTimer::singleShot(0, this, [this]() {
         const QDateTime nowUtc = QDateTime::currentDateTimeUtc();
         if (guideCacheLooksCurrentForStartup(guideEntriesCache_, lastGuideWindowStartUtc_, nowUtc)) {
+            const QDateTime cacheCoverageEndUtc =
+                guideCacheCoverageEndUtc_.isValid() ? guideCacheCoverageEndUtc_ : latestGuideEntryEndUtc(guideEntriesCache_);
             appendLog(QString("guide-bg: startup guide refresh skipped; cache already covers current time through %1")
-                          .arg(latestGuideEntryEndUtc(guideEntriesCache_).toLocalTime().toString("ddd h:mm AP")));
+                          .arg(cacheCoverageEndUtc.toLocalTime().toString("ddd h:mm AP")));
         } else {
             appendLog("guide-bg: building initial guide cache at startup.");
             if (refreshGuideData(false, false)) {
@@ -6785,6 +6787,7 @@ void MainWindow::handleGuideShowTodayOnlyListingsToggled(bool checked)
     applyCurrentShowStatusFromGuideCache();
     updateTvGuideDialogFromCurrentCache(false);
     refreshChannelTableShowColumn();
+    setStatusBarStateMessage(lastStatusBarMessage_);
 }
 
 void MainWindow::handleAutoFavoriteShowSchedulingToggled(bool checked)
@@ -8014,6 +8017,7 @@ void MainWindow::applyGuideRefreshIntervalSetting()
 void MainWindow::clearLoadedGuideCache()
 {
     guideEntriesCache_.clear();
+    guideCacheCoverageEndUtc_ = QDateTime();
     lastGuideChannelOrder_.clear();
     lastGuideWindowStartUtc_ = QDateTime();
     lastGuideSlotMinutes_ = 30;
@@ -11197,6 +11201,7 @@ bool MainWindow::refreshGuideData(bool interactive, bool updateDialog)
         statusText = liveStatus + "\n" + statusText;
     }
 
+    const QDateTime cacheCoverageEndUtc = latestGuideEntryEndUtc(entriesByChannel);
     QDateTime displayedLatestEndUtc;
     const QHash<QString, QList<TvGuideEntry>> displayedEntriesByChannel =
         filterGuideEntriesForConfiguredListingsScope(entriesByChannel, &displayedLatestEndUtc);
@@ -11205,6 +11210,7 @@ bool MainWindow::refreshGuideData(bool interactive, bool updateDialog)
     lastGuideSlotMinutes_ = slotMinutes;
     lastGuideSlotCount_ = guideWindowSlotCount(lastGuideWindowStartUtc_, displayedLatestEndUtc, lastGuideSlotMinutes_);
     lastGuideStatusText_ = statusText;
+    guideCacheCoverageEndUtc_ = cacheCoverageEndUtc;
     guideEntriesCache_ = displayedEntriesByChannel;
     for (const QString &channelName : channelOrder) {
         if (guideEntriesCache_.value(channelName).isEmpty()) {
@@ -11218,6 +11224,7 @@ bool MainWindow::refreshGuideData(bool interactive, bool updateDialog)
     } else if (!loadGuideCacheFile()) {
         appendLog("guide: failed to reload guide cache file after refresh; using in-memory cache.");
         guideEntriesCache_ = displayedEntriesByChannel;
+        guideCacheCoverageEndUtc_ = cacheCoverageEndUtc;
         lastGuideChannelOrder_ = channelOrder;
         lastGuideWindowStartUtc_ = windowStartUtc;
         lastGuideSlotMinutes_ = slotMinutes;
@@ -11484,6 +11491,7 @@ bool MainWindow::refreshGuideDataFromSchedulesDirect(bool interactive, bool upda
         statusText = "Using cached Schedules Direct JSON.\n" + statusText;
     }
 
+    const QDateTime cacheCoverageEndUtc = latestGuideEntryEndUtc(entriesByChannel);
     QDateTime displayedLatestEndUtc;
     const QHash<QString, QList<TvGuideEntry>> displayedEntriesByChannel =
         filterGuideEntriesForConfiguredListingsScope(entriesByChannel, &displayedLatestEndUtc);
@@ -11492,6 +11500,7 @@ bool MainWindow::refreshGuideDataFromSchedulesDirect(bool interactive, bool upda
     lastGuideSlotMinutes_ = slotMinutes;
     lastGuideSlotCount_ = guideWindowSlotCount(lastGuideWindowStartUtc_, displayedLatestEndUtc, lastGuideSlotMinutes_);
     lastGuideStatusText_ = statusText;
+    guideCacheCoverageEndUtc_ = cacheCoverageEndUtc;
     guideEntriesCache_ = displayedEntriesByChannel;
     for (const QString &channelName : channelOrder) {
         if (guideEntriesCache_.value(channelName).isEmpty()) {
@@ -11505,6 +11514,7 @@ bool MainWindow::refreshGuideDataFromSchedulesDirect(bool interactive, bool upda
     } else if (!loadGuideCacheFile()) {
         appendLog("guide-sd: failed to reload guide cache file after refresh; using in-memory cache.");
         guideEntriesCache_ = displayedEntriesByChannel;
+        guideCacheCoverageEndUtc_ = cacheCoverageEndUtc;
         lastGuideChannelOrder_ = channelOrder;
         lastGuideWindowStartUtc_ = windowStartUtc;
         lastGuideSlotMinutes_ = slotMinutes;
@@ -11578,6 +11588,7 @@ bool MainWindow::loadGuideCacheFile()
         loadedEntries.insert(normalizeDisplayedChannelLabel(it.key()), cleaned);
     }
 
+    guideCacheCoverageEndUtc_ = latestGuideEntryEndUtc(loadedEntries);
     QDateTime filteredLatestEndUtc;
     guideEntriesCache_ = filterGuideEntriesForConfiguredListingsScope(loadedEntries, &filteredLatestEndUtc);
     lastGuideChannelOrder_ = storedChannelOrder;
@@ -12903,7 +12914,8 @@ void MainWindow::setStatusBarStateMessage(const QString &text)
             message += QString("JSON retry %1")
                            .arg(guideRefreshDateTimeText(guideCacheRunoutRefreshRetryUtc_.toLocalTime()));
         } else {
-            const QDateTime latestEndUtc = latestGuideEntryEndUtc(guideEntriesCache_);
+            const QDateTime latestEndUtc =
+                guideCacheCoverageEndUtc_.isValid() ? guideCacheCoverageEndUtc_ : latestGuideEntryEndUtc(guideEntriesCache_);
             if (latestEndUtc.isValid()) {
                 if (!message.isEmpty()) {
                     message += " | ";
