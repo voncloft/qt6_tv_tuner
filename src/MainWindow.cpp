@@ -4558,12 +4558,19 @@ MainWindow::MainWindow(QWidget *parent)
         restoreChannelSidebarSizing();
         const bool startupScheduledTuneAvailable = obeyScheduledSwitches_ && hasActiveScheduledSwitchesNow();
         if (startupScheduledTuneAvailable) {
-            appendLog("startup: active scheduled tune available; using scheduled tuning path.");
-            processScheduledSwitches();
-            if (currentChannelName_.trimmed().isEmpty()) {
+            appendLog("startup: active scheduled tune available; deferring to scheduled-switch timer to avoid duplicate prompts.");
+            QTimer::singleShot(0, this, [this]() {
+                if (!currentChannelName_.trimmed().isEmpty()) {
+                    appendLog("startup: scheduled tuning already started playback before fallback check.");
+                    return;
+                }
+                if (obeyScheduledSwitches_ && hasActiveScheduledSwitchesNow()) {
+                    appendLog("startup: scheduled tuning still pending after startup deferral; leaving last channel restore skipped.");
+                    return;
+                }
                 appendLog("startup: scheduled tuning did not start playback; restoring last channel.");
                 restoreLastPlayedChannel();
-            }
+            });
         } else {
             appendLog("startup: no active scheduled tune available; restoring last channel.");
             restoreLastPlayedChannel();
