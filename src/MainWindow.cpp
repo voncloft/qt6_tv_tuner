@@ -1040,6 +1040,42 @@ QString resolveProjectLogPath()
     return cwdDir.filePath("tv_tuner_gui.log");
 }
 
+bool appendDirectLineToLogFile(const QString &logPath, const QString &line)
+{
+    if (logPath.isEmpty()) {
+        return false;
+    }
+
+    const QByteArray encodedPath = QFile::encodeName(logPath);
+    const int fd = ::open(encodedPath.constData(), O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0664);
+    if (fd < 0) {
+        return false;
+    }
+
+    QByteArray payload = line.toUtf8();
+    payload.append('\n');
+
+    qsizetype totalWritten = 0;
+    while (totalWritten < payload.size()) {
+        const ssize_t written =
+            ::write(fd, payload.constData() + totalWritten, static_cast<size_t>(payload.size() - totalWritten));
+        if (written <= 0) {
+            ::close(fd);
+            return false;
+        }
+        totalWritten += written;
+    }
+
+    ::close(fd);
+    return true;
+}
+
+bool verboseQtLoggingEnabled()
+{
+    const QByteArray value = qgetenv("TV_TUNER_GUI_VERBOSE_QT_LOGS").trimmed().toLower();
+    return value == "1" || value == "true" || value == "yes" || value == "on";
+}
+
 QString resolveGuideCachePath()
 {
     const QString appDataPath = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
@@ -3097,6 +3133,10 @@ constexpr int kGuideCapturePacketCount = 60000;
 constexpr int kGuideCachePollIntervalMs = 5000;
 constexpr int kVideoOnlyAudioRecoveryDelayMs = 12000;
 constexpr int kRecoveryAudioUnmuteStabilityMs = 2500;
+constexpr int kLivePlaybackAttachDelayMs = 900;
+constexpr int kLivePlaybackUdpBufferSizeBytes = 4 * 1024 * 1024;
+constexpr int kLivePlaybackUdpReceiveFifoPackets = 131072;
+constexpr int kLivePlaybackInputQueuePackets = 8192;
 constexpr int kChannelTableNumberColumn = 0;
 constexpr int kChannelTableNameColumn = 1;
 constexpr int kChannelTableShowColumn = 2;
@@ -4393,7 +4433,23 @@ MainWindow::MainWindow(QWidget *parent)
         refreshRecoveryAudioMuteGate();
     });
     connect(mediaPlayer_, &QMediaPlayer::hasAudioChanged, this, [this](bool hasAudio) {
-        appendLog(QString("player: hasAudioChanged=%1").arg(hasAudio ? "true" : "false"));
+        const QString playbackMode = useVideoOnlyBridgeMode_
+                                         ? "video-only"
+                                         : (useResilientBridgeMode_
+                                                ? "resilient"
+                                                : (processedPlaybackActive_ ? "processed" : "normal"));
+        appendLog(QString("player: hasAudioChanged=%1 (playbackState=%2, mediaStatus=%3, mode=%4, hasVideo=%5)")
+                      .arg(hasAudio ? "true" : "false")
+                      .arg(static_cast<int>(mediaPlayer_->playbackState()))
+                      .arg(static_cast<int>(mediaPlayer_->mediaStatus()))
+                      .arg(playbackMode)
+                      .arg(mediaPlayer_->hasVideo() ? "true" : "false"));
+        if (!hasAudio
+            && !currentChannelName_.isEmpty()
+            && !currentChannelName_.startsWith("File: ")
+            && mediaPlayer_->playbackState() == QMediaPlayer::PlayingState) {
+            appendLog("player: live audio disappeared while playback continued; monitoring bridge/buffer state.");
+        }
         if (hasAudio && mediaPlayer_->hasVideo()) {
             bridgeSawCodecParameterFailure_ = false;
         }
@@ -5090,10 +5146,10 @@ void MainWindow::buildUi()
     autoPictureInPictureCheckBox_ =
         new QCheckBox("Pop video out when leaving the Video tab", configPlaybackOptionsGroup_);
     processedPlaybackCheckBox_ =
-        new QCheckBox("Always process live audio/video before playback", configPlaybackOptionsGroup_);
+        new QCheckBox("Always deinterlace live video before playback", configPlaybackOptionsGroup_);
     processedPlaybackCheckBox_->setToolTip(
-        "Deinterlaces video and rebuilds audio/video before playback. This can smooth motion and sanitize messy "
-        "streams, but it adds latency and disables raw passthrough.");
+        "Deinterlaces live video before playback while preserving channel audio unless audio recovery is needed. "
+        "This can smooth motion, but it adds latency and disables raw video passthrough.");
     hideStartupSwitchSummaryCheckBox_ =
         new QCheckBox("Hide the scheduled switches summary at startup", configPlaybackOptionsGroup_);
     disableTooltipsCheckBox_ = new QCheckBox("Disable tooltips", configPlaybackOptionsGroup_);
@@ -5964,7 +6020,7 @@ void MainWindow::buildUi()
         appendLog(checked
                       ? (liveChannelActive
                              ? "player: processed live playback enabled; restarting the current live channel now."
-                             : "player: processed live playback enabled; the next live channel tune will deinterlace video and rebuild audio/video.")
+                             : "player: processed live playback enabled; the next live channel tune will deinterlace video while preserving channel audio unless recovery is needed.")
                       : (liveChannelActive
                              ? "player: processed live playback disabled; restarting the current live channel now."
                              : "player: processed live playback disabled; the next live channel tune will use passthrough unless recovery is needed."));
@@ -10393,12 +10449,7 @@ void MainWindow::appendLog(const QString &line)
         scrollBar->setValue(previousScrollValue);
     }
 
-    if (!logFilePath_.isEmpty()) {
-        QFile logFile(logFilePath_);
-        if (logFile.open(QIODevice::WriteOnly | QIODevice::Text | QIODevice::Append)) {
-            logFile.write((entry + '\n').toUtf8());
-        }
-    }
+    appendDirectLineToLogFile(logFilePath_, entry);
 }
 
 void MainWindow::logInteraction(const QString &actor, const QString &action, const QString &details)
@@ -12314,15 +12365,22 @@ void MainWindow::startPlaybackFromDvr(const QString &dvrPath)
     const bool processedPlaybackRequested = processedPlaybackEnabled();
     const bool useProcessedPlayback = processedPlaybackRequested && !useVideoOnlyBridgeMode_ && !useResilientBridgeMode_;
     const QString deinterlaceFilter = "bwdif=mode=send_frame:parity=auto:deint=all";
+    const QString ffmpegLogLevel = verboseQtLoggingEnabled() ? "warning" : "error";
+    const int udpPort = 23000 + adapterSpin_->value();
+    const QString liveBridgeOutputUrl =
+        QString("udp://127.0.0.1:%1?pkt_size=1316&buffer_size=%2")
+            .arg(udpPort)
+            .arg(kLivePlaybackUdpBufferSizeBytes);
     processedPlaybackActive_ = useProcessedPlayback;
     if (useVideoOnlyBridgeMode_) {
         ffmpegArgs << "-hide_banner"
                    << "-nostdin"
-                   << "-loglevel" << "warning"
+                   << "-loglevel" << ffmpegLogLevel
                    << "-fflags" << "+genpts+discardcorrupt"
                    << "-err_detect" << "ignore_err"
                    << "-analyzeduration" << "12M"
                    << "-probesize" << "12M"
+                   << "-thread_queue_size" << QString::number(kLivePlaybackInputQueuePackets)
                    << "-f" << "mpegts"
                    << "-i" << dvrPath;
         if (!currentProgramId_.isEmpty()) {
@@ -12341,15 +12399,16 @@ void MainWindow::startPlaybackFromDvr(const QString &dvrPath)
                    << "-mpegts_flags" << "+resend_headers+pat_pmt_at_frames"
                    << "-flush_packets" << "1"
                    << "-f" << "mpegts"
-                   << QString("udp://127.0.0.1:%1?pkt_size=1316").arg(23000 + adapterSpin_->value());
+                   << liveBridgeOutputUrl;
     } else if (useResilientBridgeMode_) {
         ffmpegArgs << "-hide_banner"
                    << "-nostdin"
-                   << "-loglevel" << "warning"
+                   << "-loglevel" << ffmpegLogLevel
                    << "-fflags" << "+genpts+discardcorrupt"
                    << "-err_detect" << "ignore_err"
                    << "-analyzeduration" << "4M"
                    << "-probesize" << "4M"
+                   << "-thread_queue_size" << QString::number(kLivePlaybackInputQueuePackets)
                    << "-f" << "mpegts"
                    << "-i" << dvrPath;
         if (!currentProgramId_.isEmpty()) {
@@ -12372,15 +12431,16 @@ void MainWindow::startPlaybackFromDvr(const QString &dvrPath)
                    << "-mpegts_flags" << "+resend_headers+pat_pmt_at_frames"
                    << "-flush_packets" << "1"
                    << "-f" << "mpegts"
-                   << QString("udp://127.0.0.1:%1?pkt_size=1316").arg(23000 + adapterSpin_->value());
+                   << liveBridgeOutputUrl;
     } else if (useProcessedPlayback) {
         ffmpegArgs << "-hide_banner"
                    << "-nostdin"
-                   << "-loglevel" << "warning"
+                   << "-loglevel" << ffmpegLogLevel
                    << "-fflags" << "+genpts+discardcorrupt"
                    << "-err_detect" << "ignore_err"
                    << "-analyzeduration" << "4M"
                    << "-probesize" << "4M"
+                   << "-thread_queue_size" << QString::number(kLivePlaybackInputQueuePackets)
                    << "-f" << "mpegts"
                    << "-i" << dvrPath;
         if (!currentProgramId_.isEmpty()) {
@@ -12394,22 +12454,20 @@ void MainWindow::startPlaybackFromDvr(const QString &dvrPath)
                    << "-dn"
                    << "-c:v" << "mpeg2video"
                    << "-q:v" << "2"
-                   << "-c:a" << "aac"
-                   << "-b:a" << "192k"
-                   << "-ac" << "2"
-                   << "-ar" << "48000"
+                   << "-c:a" << "copy"
                    << "-mpegts_flags" << "+resend_headers+pat_pmt_at_frames"
                    << "-flush_packets" << "1"
                    << "-f" << "mpegts"
-                   << QString("udp://127.0.0.1:%1?pkt_size=1316").arg(23000 + adapterSpin_->value());
+                   << liveBridgeOutputUrl;
     } else {
         ffmpegArgs << "-hide_banner"
                    << "-nostdin"
-                   << "-loglevel" << "warning"
+                   << "-loglevel" << ffmpegLogLevel
                    << "-fflags" << "+genpts+discardcorrupt"
                    << "-err_detect" << "ignore_err"
                    << "-analyzeduration" << "4M"
                    << "-probesize" << "4M"
+                   << "-thread_queue_size" << QString::number(kLivePlaybackInputQueuePackets)
                    << "-f" << "mpegts"
                    << "-i" << dvrPath;
         if (!currentProgramId_.isEmpty()) {
@@ -12424,7 +12482,7 @@ void MainWindow::startPlaybackFromDvr(const QString &dvrPath)
                    << "-mpegts_flags" << "+resend_headers+pat_pmt_at_frames"
                    << "-flush_packets" << "1"
                    << "-f" << "mpegts"
-                   << QString("udp://127.0.0.1:%1?pkt_size=1316").arg(23000 + adapterSpin_->value());
+                   << liveBridgeOutputUrl;
     }
 
     appendLog("ffmpeg bridge: launch " + formatCommandLine(ffmpegExe, ffmpegArgs));
@@ -12440,8 +12498,10 @@ void MainWindow::startPlaybackFromDvr(const QString &dvrPath)
     }
 
     const int attachSerial = playbackStartSerial_;
-    const int udpPort = 23000 + adapterSpin_->value();
-    const QUrl liveUrl(QString("udp://127.0.0.1:%1").arg(udpPort));
+    const QUrl liveUrl(QString("udp://127.0.0.1:%1?fifo_size=%2&overrun_nonfatal=1&buffer_size=%3")
+                           .arg(udpPort)
+                           .arg(kLivePlaybackUdpReceiveFifoPackets)
+                           .arg(kLivePlaybackUdpBufferSizeBytes));
     const QString playbackMode = useVideoOnlyBridgeMode_
                                      ? "video-only"
                                      : (useResilientBridgeMode_ ? "resilient" : (useProcessedPlayback ? "processed" : "normal"));
@@ -12450,6 +12510,12 @@ void MainWindow::startPlaybackFromDvr(const QString &dvrPath)
                        liveUrl.toString(),
                        playbackMode,
                        currentProgramId_.isEmpty() ? "unknown" : currentProgramId_));
+    appendLog(QString("player: live UDP bridge configured (send=%1, receive=%2, attachDelayMs=%3, rxFifoPackets=%4, ioBufferBytes=%5)")
+                  .arg(liveBridgeOutputUrl,
+                       liveUrl.toString())
+                  .arg(kLivePlaybackAttachDelayMs)
+                  .arg(kLivePlaybackUdpReceiveFifoPackets)
+                  .arg(kLivePlaybackUdpBufferSizeBytes));
     if (useResilientBridgeMode_) {
         setStatusBarStateMessage(recoveryAudioMuted_ ? "Retrying rebuilt audio (muted)..."
                                                      : "Recovering audio with rebuilt stream...");
@@ -12460,7 +12526,7 @@ void MainWindow::startPlaybackFromDvr(const QString &dvrPath)
                                      ? "Video-only recovery active; muted audio retry pending"
                                      : "Video-only recovery active");
     } else if (useProcessedPlayback) {
-        appendLog("player: processed live playback active (deinterlaced video, rebuilt audio).");
+        appendLog("player: processed live playback active (deinterlaced video, passthrough audio).");
         setStatusBarStateMessage("Processed live playback active");
     }
     if (useVideoOnlyBridgeMode_ && !videoOnlyAudioRecoveryTried_) {
@@ -12508,7 +12574,7 @@ void MainWindow::startPlaybackFromDvr(const QString &dvrPath)
             probeCurrentShowAfterTune(lookupChannelName, lookupSerial);
         });
     }
-    QTimer::singleShot(450, this, [this, liveUrl, attachSerial]() {
+    QTimer::singleShot(kLivePlaybackAttachDelayMs, this, [this, liveUrl, attachSerial]() {
         if (attachSerial != playbackStartSerial_) {
             return;
         }
@@ -12516,7 +12582,8 @@ void MainWindow::startPlaybackFromDvr(const QString &dvrPath)
             appendLog("player: ffmpeg bridge exited before media attach.");
             return;
         }
-        appendLog("player: Attaching UDP live stream to media player.");
+        appendLog(QString("player: Attaching UDP live stream to media player after %1 ms startup buffer.")
+                      .arg(kLivePlaybackAttachDelayMs));
         mediaPlayer_->setSource(liveUrl);
         mediaPlayer_->play();
     });
