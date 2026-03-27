@@ -8080,6 +8080,7 @@ void MainWindow::applyGuideRefreshIntervalSetting()
 void MainWindow::clearLoadedGuideCache()
 {
     guideEntriesCache_.clear();
+    guideEntriesFullCache_.clear();
     guideCacheCoverageEndUtc_ = QDateTime();
     lastGuideChannelOrder_.clear();
     lastGuideWindowStartUtc_ = QDateTime();
@@ -9763,6 +9764,8 @@ void MainWindow::scheduleMatchingGuideEntriesForTitle(const QString &favoriteSho
 {
     Q_UNUSED(promptForConflict);
 
+    const QHash<QString, QList<TvGuideEntry>> &guideEntriesForScheduling =
+        guideEntriesFullCache_.isEmpty() ? guideEntriesCache_ : guideEntriesFullCache_;
     const QString normalizedTitle = normalizeFavoriteShowRule(favoriteShowTitle);
     const QDateTime nowUtc = QDateTime::currentDateTimeUtc();
     QList<TvGuideScheduledSwitch> matchingCandidates;
@@ -9800,14 +9803,14 @@ void MainWindow::scheduleMatchingGuideEntriesForTitle(const QString &favoriteSho
 
     if (!normalizedTitle.isEmpty()) {
         QStringList orderedChannels = lastGuideChannelOrder_;
-        for (auto it = guideEntriesCache_.cbegin(); it != guideEntriesCache_.cend(); ++it) {
+        for (auto it = guideEntriesForScheduling.cbegin(); it != guideEntriesForScheduling.cend(); ++it) {
             if (!orderedChannels.contains(it.key())) {
                 orderedChannels.append(it.key());
             }
         }
 
         for (const QString &channelName : orderedChannels) {
-            const QList<TvGuideEntry> entries = guideEntriesCache_.value(channelName);
+            const QList<TvGuideEntry> entries = guideEntriesForScheduling.value(channelName);
             for (const TvGuideEntry &entry : entries) {
                 const TvGuideScheduledSwitch candidate = scheduledSwitchFromGuideEntry(channelName, entry);
                 if (!candidate.startUtc.isValid()
@@ -10043,9 +10046,11 @@ void MainWindow::removeSelectedScheduledSwitch()
 
 void MainWindow::autoScheduleFavoriteShowsFromGuideCache(bool promptForConflict, bool forceCurrentCacheSearch)
 {
+    const QHash<QString, QList<TvGuideEntry>> &guideEntriesForScheduling =
+        guideEntriesFullCache_.isEmpty() ? guideEntriesCache_ : guideEntriesFullCache_;
     if ((!autoFavoriteShowSchedulingEnabled_ && !forceCurrentCacheSearch)
         || favoriteShowRules_.isEmpty()
-        || guideEntriesCache_.isEmpty()) {
+        || guideEntriesForScheduling.isEmpty()) {
         return;
     }
 
@@ -10079,7 +10084,7 @@ void MainWindow::autoScheduleFavoriteShowsFromGuideCache(bool promptForConflict,
 
     const QDateTime nowUtc = QDateTime::currentDateTimeUtc();
     QStringList orderedChannels = lastGuideChannelOrder_;
-    for (auto it = guideEntriesCache_.cbegin(); it != guideEntriesCache_.cend(); ++it) {
+    for (auto it = guideEntriesForScheduling.cbegin(); it != guideEntriesForScheduling.cend(); ++it) {
         if (!orderedChannels.contains(it.key())) {
             orderedChannels.append(it.key());
         }
@@ -10112,7 +10117,7 @@ void MainWindow::autoScheduleFavoriteShowsFromGuideCache(bool promptForConflict,
         }
 
         for (const QString &channelName : orderedChannels) {
-            const QList<TvGuideEntry> entries = guideEntriesCache_.value(channelName);
+            const QList<TvGuideEntry> entries = guideEntriesForScheduling.value(channelName);
             for (const TvGuideEntry &entry : entries) {
                 const TvGuideScheduledSwitch candidate = scheduledSwitchFromGuideEntry(channelName, entry);
                 if (!candidate.startUtc.isValid()
@@ -10993,10 +10998,10 @@ bool MainWindow::refreshGuideData(bool interactive, bool updateDialog)
     };
 
     const bool liveMuxOnlyRefresh = livePlaybackActive && guideAdapter == playbackAdapter && liveFrequencyHz > 0;
-    if (guideEntriesCache_.isEmpty()) {
+    if (guideEntriesFullCache_.isEmpty()) {
         loadGuideCacheFile();
     }
-    const bool hadGuideCache = !guideEntriesCache_.isEmpty();
+    const bool hadGuideCache = !guideEntriesFullCache_.isEmpty();
     setGuideRefreshInProgress(true);
     GuideRefreshGuard guideRefreshGuard{[&setGuideRefreshInProgress]() {
         setGuideRefreshInProgress(false);
@@ -11269,6 +11274,7 @@ bool MainWindow::refreshGuideData(bool interactive, bool updateDialog)
     lastGuideSlotCount_ = guideWindowSlotCount(lastGuideWindowStartUtc_, displayedLatestEndUtc, lastGuideSlotMinutes_);
     lastGuideStatusText_ = statusText;
     guideCacheCoverageEndUtc_ = cacheCoverageEndUtc;
+    guideEntriesFullCache_ = entriesByChannel;
     guideEntriesCache_ = displayedEntriesByChannel;
     for (const QString &channelName : channelOrder) {
         if (guideEntriesCache_.value(channelName).isEmpty()) {
@@ -11281,6 +11287,7 @@ bool MainWindow::refreshGuideData(bool interactive, bool updateDialog)
         appendLog("guide: failed to write guide cache file.");
     } else if (!loadGuideCacheFile()) {
         appendLog("guide: failed to reload guide cache file after refresh; using in-memory cache.");
+        guideEntriesFullCache_ = entriesByChannel;
         guideEntriesCache_ = displayedEntriesByChannel;
         guideCacheCoverageEndUtc_ = cacheCoverageEndUtc;
         lastGuideChannelOrder_ = channelOrder;
@@ -11366,7 +11373,7 @@ bool MainWindow::writeGuideCacheFile(const QStringList &channelOrder,
 
 bool MainWindow::refreshGuideDataFromSchedulesDirect(bool interactive, bool updateDialog)
 {
-    if (guideEntriesCache_.isEmpty()) {
+    if (guideEntriesFullCache_.isEmpty()) {
         loadGuideCacheFile();
     }
 
@@ -11559,6 +11566,7 @@ bool MainWindow::refreshGuideDataFromSchedulesDirect(bool interactive, bool upda
     lastGuideSlotCount_ = guideWindowSlotCount(lastGuideWindowStartUtc_, displayedLatestEndUtc, lastGuideSlotMinutes_);
     lastGuideStatusText_ = statusText;
     guideCacheCoverageEndUtc_ = cacheCoverageEndUtc;
+    guideEntriesFullCache_ = entriesByChannel;
     guideEntriesCache_ = displayedEntriesByChannel;
     for (const QString &channelName : channelOrder) {
         if (guideEntriesCache_.value(channelName).isEmpty()) {
@@ -11571,6 +11579,7 @@ bool MainWindow::refreshGuideDataFromSchedulesDirect(bool interactive, bool upda
         appendLog("guide-sd: failed to write guide cache file.");
     } else if (!loadGuideCacheFile()) {
         appendLog("guide-sd: failed to reload guide cache file after refresh; using in-memory cache.");
+        guideEntriesFullCache_ = entriesByChannel;
         guideEntriesCache_ = displayedEntriesByChannel;
         guideCacheCoverageEndUtc_ = cacheCoverageEndUtc;
         lastGuideChannelOrder_ = channelOrder;
@@ -11646,9 +11655,10 @@ bool MainWindow::loadGuideCacheFile()
         loadedEntries.insert(normalizeDisplayedChannelLabel(it.key()), cleaned);
     }
 
-    guideCacheCoverageEndUtc_ = latestGuideEntryEndUtc(loadedEntries);
+    guideEntriesFullCache_ = loadedEntries;
+    guideCacheCoverageEndUtc_ = latestGuideEntryEndUtc(guideEntriesFullCache_);
     QDateTime filteredLatestEndUtc;
-    guideEntriesCache_ = filterGuideEntriesForConfiguredListingsScope(loadedEntries, &filteredLatestEndUtc);
+    guideEntriesCache_ = filterGuideEntriesForConfiguredListingsScope(guideEntriesFullCache_, &filteredLatestEndUtc);
     lastGuideChannelOrder_ = storedChannelOrder;
     lastGuideCacheGeneratedUtc_ = root.value("generatedUtc").toString().trimmed();
     lastGuideSlotMinutes_ = std::clamp(root.value("slotMinutes").toInt(30), 15, 120);

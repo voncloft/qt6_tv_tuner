@@ -402,6 +402,7 @@ private:
     QString currentProgramId_;
     QString pendingDvrPath_;
     QHash<QString, QList<TvGuideEntry>> guideEntriesCache_;
+    QHash<QString, QList<TvGuideEntry>> guideEntriesFullCache_;
     QDateTime guideCacheCoverageEndUtc_;
     QStringList lastGuideChannelOrder_;
     QDateTime lastGuideWindowStartUtc_;
